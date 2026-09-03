@@ -299,124 +299,115 @@ void printComponentProgress(const string& label, double percent, const string& e
 }
 
 bool downloadFile(const string& url, const string& destFile, const string& label = "") {
-    HINTERNET hInternet = InternetOpenW(L"MR-CLI-FOR-FFMPEG/1.0.0", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
-    if (!hInternet) return false;
+    HINTERNET hSession = InternetOpenW(
+        L"Mozilla/5.0 (compatible; MRCLI/1.0)",
+        INTERNET_OPEN_TYPE_PRECONFIG,
+        NULL, NULL, 0
+    );
+    if (!hSession) return false;
 
-    DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_DONT_CACHE | INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_SECURE;
     wstring wUrl = utf8ToWstring(url);
-    HINTERNET hUrl = InternetOpenUrlW(hInternet, wUrl.c_str(), NULL, 0, flags, 0);
-    if (!hUrl) {
-        InternetCloseHandle(hInternet);
+    DWORD httpFlags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_DONT_CACHE | INTERNET_FLAG_NO_UI;
+    HINTERNET hReq = InternetOpenUrlW(hSession, wUrl.c_str(), NULL, 0, httpFlags, 0);
+    if (!hReq) {
+        InternetCloseHandle(hSession);
         return false;
     }
 
-    // Query Content-Length
     DWORD contentLength = 0;
     DWORD clLen = sizeof(contentLength);
-    DWORD index = 0;
-    HttpQueryInfoW(hUrl, HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER, &contentLength, &clLen, &index);
+    DWORD idx = 0;
+    HttpQueryInfoW(hReq, HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER, &contentLength, &clLen, &idx);
 
-    ofstream outFile(fs::u8path(destFile), ios::binary);
-    if (!outFile.is_open()) {
-        InternetCloseHandle(hUrl);
-        InternetCloseHandle(hInternet);
+    char tmpPath[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmpPath);
+    string tmpFile = string(tmpPath) + "mrcli_dl.tmp";
+
+    HANDLE hFile = CreateFileA(
+        tmpFile.c_str(), GENERIC_WRITE, 0, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL
+    );
+    if (hFile == INVALID_HANDLE_VALUE) {
+        InternetCloseHandle(hReq);
+        InternetCloseHandle(hSession);
         return false;
     }
 
-    DWORD bytesRead = 0;
-    DWORD totalDownloaded = 0;
-    char buffer[65536];
+    char buf[32768];
+    DWORD dwRead = 0;
+    DWORD totalRead = 0;
 
-    while (InternetReadFile(hUrl, buffer, sizeof(buffer), &bytesRead) && bytesRead > 0) {
-        outFile.write(buffer, bytesRead);
-        totalDownloaded += bytesRead;
+    while (InternetReadFile(hReq, buf, sizeof(buf), &dwRead) && dwRead > 0) {
+        DWORD dwWritten = 0;
+        WriteFile(hFile, buf, dwRead, &dwWritten, NULL);
+        totalRead += dwRead;
         if (contentLength > 0) {
-            double pct = ((double)totalDownloaded / (double)contentLength) * 100.0;
-            double curMB = (double)totalDownloaded / (1024.0 * 1024.0);
-            double totMB = (double)contentLength / (1024.0 * 1024.0);
+            double pct = (double)totalRead / (double)contentLength * 100.0;
+            double curMB = (double)totalRead / (1048576.0);
+            double totMB = (double)contentLength / (1048576.0);
             char info[64];
             snprintf(info, sizeof(info), "(%.1f / %.1f MB)", curMB, totMB);
             printComponentProgress(label, pct, info);
-        } else {
-            double curMB = (double)totalDownloaded / (1024.0 * 1024.0);
-            char info[64];
-            snprintf(info, sizeof(info), "(%.1f MB)", curMB);
-            printComponentProgress(label, 0, info);
         }
     }
 
-    outFile.close();
-    InternetCloseHandle(hUrl);
-    InternetCloseHandle(hInternet);
+    CloseHandle(hFile);
+    InternetCloseHandle(hReq);
+    InternetCloseHandle(hSession);
+
+    // Move temp file to destination
+    wstring wTmp = utf8ToWstring(tmpFile);
+    wstring wDst = utf8ToWstring(destFile);
+    MoveFileExW(wTmp.c_str(), wDst.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
+
     cout << "\n";
-    return fileExists(destFile) && (totalDownloaded > 1000);
+    return fileExists(destFile) && (totalRead > 1000);
 }
 
 bool extractZip(const string& zipPath, const string& destDir) {
     if (!fileExists(zipPath) || !dirExists(destDir)) return false;
 
-    // 1. Fast native Windows tar.exe (System32 bsdtar on Windows 10/11)
     wchar_t sysDir[MAX_PATH];
-    if (GetSystemDirectoryW(sysDir, MAX_PATH) > 0) {
-        wstring tarExe = wstring(sysDir) + L"\\tar.exe";
-        if (GetFileAttributesW(tarExe.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            wstring wDest = utf8ToWstring(destDir);
-            while (!wDest.empty() && (wDest.back() == L'\\' || wDest.back() == L'/')) wDest.pop_back();
+    if (GetSystemDirectoryW(sysDir, MAX_PATH) <= 0) return false;
 
-            wstring wZip = utf8ToWstring(zipPath);
-            while (!wZip.empty() && (wZip.back() == L'\\' || wZip.back() == L'/')) wZip.pop_back();
+    wstring tarExe = wstring(sysDir) + L"\\tar.exe";
+    if (GetFileAttributesW(tarExe.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
 
-            wstring cmd = L"\"" + tarExe + L"\" -xf \"" + wZip + L"\" -C \"" + wDest + L"\"";
-            if (runProcessWait(cmd) == 0) {
-                return true;
-            }
-        }
-    }
-
-    // 2. Fallback to PowerShell Expand-Archive
     wstring wDest = utf8ToWstring(destDir);
+    while (!wDest.empty() && (wDest.back() == L'\\' || wDest.back() == L'/')) wDest.pop_back();
+
     wstring wZip = utf8ToWstring(zipPath);
-    wstring psCmd = L"powershell.exe -NoProfile -NonInteractive -Command \"Expand-Archive -LiteralPath '" + wZip + L"' -DestinationPath '" + wDest + L"' -Force\"";
-    return (runProcessWait(psCmd) == 0);
+    while (!wZip.empty() && (wZip.back() == L'\\' || wZip.back() == L'/')) wZip.pop_back();
+
+    wstring cmd = L"\"" + tarExe + L"\" -xf \"" + wZip + L"\" -C \"" + wDest + L"\"";
+    return (runProcessWait(cmd) == 0);
 }
 
 void organizeExtractedTool(const string& targetExe, const string& destDir) {
     std::error_code ec;
     fs::path targetDir = fs::weakly_canonical(fs::u8path(destDir), ec);
-    if (ec || targetDir.empty()) {
-        targetDir = fs::u8path(destDir);
-        while (targetDir.has_filename() && targetDir.filename().empty()) {
-            targetDir = targetDir.parent_path();
-        }
-    }
+    if (ec || targetDir.empty()) targetDir = fs::u8path(destDir);
 
-    // 1. Search for targetExe in subdirectories of targetDir
-    fs::path foundExePath;
+    fs::path foundBinDir;
     for (const auto& entry : fs::recursive_directory_iterator(targetDir, fs::directory_options::skip_permission_denied, ec)) {
         if (!ec && entry.is_regular_file(ec)) {
-            if (entry.path().filename().u8string() == targetExe || entry.path().filename().string() == targetExe) {
+            if (entry.path().filename().u8string() == targetExe) {
                 if (entry.path().parent_path() != targetDir) {
-                    foundExePath = entry.path();
+                    foundBinDir = entry.path().parent_path();
                     break;
                 }
             }
         }
     }
 
-    if (foundExePath.empty()) {
-        return;
-    }
+    if (foundBinDir.empty()) return;
 
-    fs::path binDir = foundExePath.parent_path();
-
-    // 2. Copy all .exe / tool files from binDir into targetDir
-    for (const auto& entry : fs::directory_iterator(binDir, ec)) {
+    for (const auto& entry : fs::directory_iterator(foundBinDir, ec)) {
         if (!ec && entry.is_regular_file(ec)) {
             fs::copy_file(entry.path(), targetDir / entry.path().filename(), fs::copy_options::overwrite_existing, ec);
         }
     }
 
-    // 3. Delete any extracted subdirectories inside targetDir
     for (const auto& entry : fs::directory_iterator(targetDir, ec)) {
         if (!ec && entry.is_directory(ec)) {
             fs::remove_all(entry.path(), ec);
@@ -493,27 +484,22 @@ double getMediaDuration(const string& filePath) {
 
     string cmd = "\"" + FFPROBE_PATH + "\" -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \"" + filePath + "\"";
 
-    // Create pipe to read output
-    SECURITY_ATTRIBUTES sa;
+    SECURITY_ATTRIBUTES sa = {};
     sa.nLength = sizeof(SECURITY_ATTRIBUTES);
     sa.bInheritHandle = TRUE;
-    sa.lpSecurityDescriptor = NULL;
 
     HANDLE hReadPipe = NULL, hWritePipe = NULL;
     if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return 0;
     SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOW si;
-    ZeroMemory(&si, sizeof(si));
+    STARTUPINFOW si = {};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
     si.hStdOutput = hWritePipe;
     si.hStdError = hWritePipe;
     si.wShowWindow = SW_HIDE;
 
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&pi, sizeof(pi));
-
+    PROCESS_INFORMATION pi = {};
     wstring wcmd = utf8ToWstring(cmd);
     if (!CreateProcessW(NULL, &wcmd[0], NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         CloseHandle(hReadPipe);
@@ -524,7 +510,7 @@ double getMediaDuration(const string& filePath) {
 
     string output;
     char buf[256];
-    DWORD bytesRead;
+    DWORD bytesRead = 0;
     while (ReadFile(hReadPipe, buf, sizeof(buf) - 1, &bytesRead, NULL) && bytesRead > 0) {
         buf[bytesRead] = '\0';
         output += buf;
@@ -535,13 +521,9 @@ double getMediaDuration(const string& filePath) {
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 
-    // Parse duration
-    while (!output.empty() && (output.back() == '\r' || output.back() == '\n' || output.back() == ' ')) output.pop_back();
-    try {
-        return stod(output);
-    } catch (...) {
-        return 0;
-    }
+    while (!output.empty() && (output.back() == '\r' || output.back() == '\n' || output.back() == ' '))
+        output.pop_back();
+    try { return stod(output); } catch (...) { return 0; }
 }
 
 // ========== GET MEDIA INFO VIA FFPROBE ==========
@@ -550,26 +532,22 @@ string getMediaInfo(const string& filePath) {
 
     string cmd = "\"" + FFPROBE_PATH + "\" -v quiet -show_format -show_streams -of default \"" + filePath + "\"";
 
-    SECURITY_ATTRIBUTES sa;
+    SECURITY_ATTRIBUTES sa = {};
     sa.nLength = sizeof(SECURITY_ATTRIBUTES);
     sa.bInheritHandle = TRUE;
-    sa.lpSecurityDescriptor = NULL;
 
     HANDLE hReadPipe = NULL, hWritePipe = NULL;
     if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return "";
     SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOW si;
-    ZeroMemory(&si, sizeof(si));
+    STARTUPINFOW si = {};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
     si.hStdOutput = hWritePipe;
     si.hStdError = hWritePipe;
     si.wShowWindow = SW_HIDE;
 
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&pi, sizeof(pi));
-
+    PROCESS_INFORMATION pi = {};
     wstring wcmd = utf8ToWstring(cmd);
     if (!CreateProcessW(NULL, &wcmd[0], NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         CloseHandle(hReadPipe);
@@ -580,7 +558,7 @@ string getMediaInfo(const string& filePath) {
 
     string output;
     char buf[4096];
-    DWORD bytesRead;
+    DWORD bytesRead = 0;
     while (ReadFile(hReadPipe, buf, sizeof(buf) - 1, &bytesRead, NULL) && bytesRead > 0) {
         buf[bytesRead] = '\0';
         output += buf;
@@ -687,10 +665,9 @@ string formatMediaInfoDisplay(const string& rawInfo) {
 
 // ========== EXECUTE FFMPEG WITH LIVE PROGRESS ==========
 bool execFFmpegWithProgress(const wstring& cmdLine, double totalDuration = 0) {
-    SECURITY_ATTRIBUTES sa;
+    SECURITY_ATTRIBUTES sa = {};
     sa.nLength = sizeof(SECURITY_ATTRIBUTES);
     sa.bInheritHandle = TRUE;
-    sa.lpSecurityDescriptor = NULL;
 
     HANDLE hReadPipe = NULL, hWritePipe = NULL;
     if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
@@ -699,74 +676,53 @@ bool execFFmpegWithProgress(const wstring& cmdLine, double totalDuration = 0) {
     }
     SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOW si;
-    ZeroMemory(&si, sizeof(si));
+    STARTUPINFOW si = {};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = hWritePipe;
     si.hStdError = hWritePipe;
 
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&pi, sizeof(pi));
-
+    PROCESS_INFORMATION pi = {};
     wstring mutableCmd = cmdLine;
-    BOOL success = CreateProcessW(
-        NULL,
-        &mutableCmd[0],
-        NULL,
-        NULL,
-        TRUE,
-        0,
-        NULL,
-        NULL,
-        &si,
-        &pi
-    );
 
+    BOOL success = CreateProcessW(
+        NULL, &mutableCmd[0], NULL, NULL,
+        TRUE, 0, NULL, NULL, &si, &pi
+    );
     CloseHandle(hWritePipe);
 
     if (!success) {
         CloseHandle(hReadPipe);
-        printColor("[ERROR] Failed to launch FFmpeg! Error code: " + to_string(GetLastError()), RED);
+        printColor("[ERROR] Failed to launch FFmpeg!", RED);
         return false;
     }
 
     string line;
     bool progressActive = false;
-    bool hasError = false;
-    string errorMsg;
     char buffer[4096];
     DWORD bytesRead = 0;
 
     while (true) {
         if (_kbhit()) {
             int key = _getch();
-            if (key == 27) { // ESC
+            if (key == 27) {
                 if (progressActive) { cout << endl; progressActive = false; }
-                printColor("\n[INFO] Operation cancelled by user (ESC).", YELLOW);
+                printColor("\n[INFO] Operation cancelled by user.", YELLOW);
                 TerminateProcess(pi.hProcess, 1);
                 break;
             }
         }
 
-        DWORD bytesAvail = 0;
-        if (!PeekNamedPipe(hReadPipe, NULL, 0, NULL, &bytesAvail, NULL)) {
-            break;
-        }
-
-        if (bytesAvail == 0) {
-            DWORD waitRes = WaitForSingleObject(pi.hProcess, 50);
-            if (waitRes == WAIT_OBJECT_0) {
-                if (!PeekNamedPipe(hReadPipe, NULL, 0, NULL, &bytesAvail, NULL) || bytesAvail == 0) {
-                    break;
-                }
+        DWORD avail = 0;
+        if (!PeekNamedPipe(hReadPipe, NULL, 0, NULL, &avail, NULL) || avail == 0) {
+            if (WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0) {
+                PeekNamedPipe(hReadPipe, NULL, 0, NULL, &avail, NULL);
+                if (avail == 0) break;
             }
             continue;
         }
 
-        if (!ReadFile(hReadPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) || bytesRead == 0) {
-            break;
-        }
+        if (!ReadFile(hReadPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) || bytesRead == 0) break;
 
         for (DWORD i = 0; i < bytesRead; i++) {
             char c = buffer[i];
@@ -774,21 +730,15 @@ bool execFFmpegWithProgress(const wstring& cmdLine, double totalDuration = 0) {
                 if (!line.empty()) {
                     string timeStr, speed;
                     if (parseFFmpegProgress(line, timeStr, speed)) {
-                        double currentSec = timeToSeconds(timeStr);
-                        printFFmpegProgressBar(currentSec, totalDuration, speed);
+                        double cur = timeToSeconds(timeStr);
+                        printFFmpegProgressBar(cur, totalDuration, speed);
                         progressActive = true;
                     }
-                    else if (line.find("Error") != string::npos || line.find("error") != string::npos ||
-                             line.find("Invalid") != string::npos || line.find("No such file") != string::npos) {
-                        if (line.find("encoder") == string::npos || line.find("Error") != string::npos) {
-                            hasError = true;
-                            errorMsg = line;
+                    else if (line.find("Error") != string::npos || line.find("error") != string::npos) {
+                        if (line.find("encoder") == string::npos) {
                             if (progressActive) { cout << endl; progressActive = false; }
                             printColor("[ERROR] " + line, RED);
                         }
-                    }
-                    else if (line.find("Overwrite") != string::npos) {
-                        // Silently handled via -y flag
                     }
                     line.clear();
                 }
@@ -796,16 +746,6 @@ bool execFFmpegWithProgress(const wstring& cmdLine, double totalDuration = 0) {
             else {
                 line += c;
             }
-        }
-    }
-
-    // Process any remaining line
-    if (!line.empty()) {
-        string timeStr, speed;
-        if (parseFFmpegProgress(line, timeStr, speed)) {
-            double currentSec = timeToSeconds(timeStr);
-            printFFmpegProgressBar(currentSec, totalDuration, speed);
-            progressActive = true;
         }
     }
 
@@ -864,7 +804,6 @@ string openFileDialogMedia(const wchar_t* title = L"Select media file") {
 }
 
 string openMultiFileDialog(vector<string>& files) {
-    // For concat - uses manual multi-input
     files.clear();
     return "";
 }

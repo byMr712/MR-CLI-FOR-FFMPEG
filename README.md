@@ -55,5 +55,4 @@ msbuild mr-cli-ffmpeg.sln /p:Configuration=Release /p:Platform=x64
 При первом запуске программа предложит автоматически скачать и установить FFmpeg (~160 МБ).
 
 ## 📄 Лицензия
-
-Copyright (C) 2026 MR. All rights reserved.
+1. Лицензия [Apache 2.0](LICENSE) — пользуйтесь и изменяйте свободно!
