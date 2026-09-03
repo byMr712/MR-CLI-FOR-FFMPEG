@@ -20,6 +20,7 @@
 #pragma comment(lib, "Comdlg32.lib")
 #pragma comment(lib, "Wininet.lib")
 #pragma comment(lib, "User32.lib")
+#pragma comment(lib, "Advapi32.lib")
 
 using namespace std;
 namespace fs = std::filesystem;
@@ -36,15 +37,48 @@ string PRESET = "medium";
 string WATERMARK_PATH = "";
 string WATERMARK_POSITION = "bottom-right";
 bool FFMPEG_FOUND = false, FFPROBE_FOUND = false;
-bool OVERWRITE_FILES = true;
-bool HARDWARE_ACCEL = true;
+bool OVERWRITE_FILES = false;
 bool KEEP_METADATA = true;
 bool VIDEO_CODEC_ASK = true;
 bool AUDIO_CODEC_ASK = true;
+bool g_ffmpegEscaped = false;
+
+// ========== ACCELERATION & GPU MODES ==========
+enum AccelMode {
+    ACCEL_CPU_ONLY = 0,         // Программный CPU (libx264)
+    ACCEL_CPU_DEC_GPU_ENC = 1,  // Программный + Аппаратный (Декодирование CPU, Кодирование GPU)
+    ACCEL_NVIDIA = 2,           // Аппаратный NVIDIA (NVENC)
+    ACCEL_INTEL = 3,            // Аппаратный INTEL (QSV)
+    ACCEL_AMD = 4               // Аппаратный AMD (AMF)
+};
+
+bool CONFIG_LOADED = false;
+AccelMode ACCELERATION_MODE = ACCEL_CPU_ONLY;
+AccelMode HYBRID_GPU_CHOICE = ACCEL_CPU_ONLY; // Which GPU to use if ACCEL_CPU_DEC_GPU_ENC is chosen
+
+bool HAS_NVIDIA_DEVICE = false;
+bool HAS_INTEL_DEVICE = false;
+bool HAS_AMD_DEVICE = false;
+
+string DETECTED_GPU_NAME = "";
+string DETECTED_NVIDIA_NAME = "";
+string DETECTED_INTEL_NAME = "";
+string DETECTED_AMD_NAME = "";
+string DETECTED_CPU_NAME = "";
 
 // ========== LANGUAGE ==========
 enum Language { LANG_EN = 0, LANG_RU = 1 };
 Language CURRENT_LANG = LANG_EN;
+
+void initDefaultLanguage() {
+    WORD langId = GetUserDefaultUILanguage();
+    WORD primary = PRIMARYLANGID(langId);
+    if (primary == LANG_RUSSIAN || primary == LANG_BELARUSIAN || primary == LANG_UKRAINIAN) {
+        CURRENT_LANG = LANG_RU;
+    } else {
+        CURRENT_LANG = LANG_EN;
+    }
+}
 
 // ========== UTF-8 HELPERS ==========
 string wstringToUtf8(const wstring& wstr) {
@@ -64,6 +98,24 @@ wstring utf8ToWstring(const string& str) {
     MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, &result[0], size);
     if (!result.empty() && result.back() == L'\0') result.pop_back();
     return result;
+}
+
+// ========== SAFE PATH HELPERS ==========
+wstring getShortPathName(const wstring& longPath) {
+    if (longPath.empty()) return longPath;
+    DWORD size = GetShortPathNameW(longPath.c_str(), NULL, 0);
+    if (size == 0) return longPath;
+    wstring shortPath(size, 0);
+    DWORD result = GetShortPathNameW(longPath.c_str(), &shortPath[0], size);
+    if (result == 0 || result >= size) return longPath;
+    shortPath.resize(result);
+    return shortPath;
+}
+
+string getSafeFFmpegPath(const string& utf8Path) {
+    wstring wPath = utf8ToWstring(utf8Path);
+    wstring shortPath = getShortPathName(wPath);
+    return wstringToUtf8(shortPath);
 }
 
 // ========== COLORS ==========
@@ -125,6 +177,188 @@ string tr(const string& en, const string& ru) {
     return (CURRENT_LANG == LANG_RU) ? ru : en;
 }
 
+// ========== CPU & GPU DETECTION ==========
+void detectCPU() {
+    DETECTED_CPU_NAME = "";
+    HKEY hKey = NULL;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        wchar_t buf[256] = {};
+        DWORD bufSize = sizeof(buf);
+        DWORD type = 0;
+        if (RegQueryValueExW(hKey, L"ProcessorNameString", NULL, &type, (LPBYTE)buf, &bufSize) == ERROR_SUCCESS) {
+            string cpu = wstringToUtf8(buf);
+            while (!cpu.empty() && (cpu.front() == ' ' || cpu.front() == '\t')) cpu.erase(cpu.begin());
+            while (!cpu.empty() && (cpu.back() == ' ' || cpu.back() == '\t' || cpu.back() == '\r' || cpu.back() == '\n')) cpu.pop_back();
+            string res;
+            bool inSpace = false;
+            for (char c : cpu) {
+                if (c == ' ' || c == '\t') {
+                    if (!inSpace) {
+                        res += ' ';
+                        inSpace = true;
+                    }
+                } else {
+                    res += c;
+                    inSpace = false;
+                }
+            }
+            DETECTED_CPU_NAME = res;
+        }
+        RegCloseKey(hKey);
+    }
+}
+
+void detectGPU() {
+    detectCPU();
+    HAS_NVIDIA_DEVICE = false;
+    HAS_INTEL_DEVICE = false;
+    HAS_AMD_DEVICE = false;
+    DETECTED_GPU_NAME = "";
+    DETECTED_NVIDIA_NAME = "";
+    DETECTED_INTEL_NAME = "";
+    DETECTED_AMD_NAME = "";
+
+    DISPLAY_DEVICEW dd = {};
+    dd.cb = sizeof(dd);
+    for (int i = 0; EnumDisplayDevicesW(NULL, i, &dd, 0); i++) {
+        wstring name(dd.DeviceString);
+        string nameUtf8 = wstringToUtf8(name);
+        string lower = nameUtf8;
+        transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        if (lower.find("nvidia") != string::npos || lower.find("geforce") != string::npos || lower.find("rtx") != string::npos || lower.find("gtx") != string::npos) {
+            HAS_NVIDIA_DEVICE = true;
+            if (DETECTED_NVIDIA_NAME.empty()) DETECTED_NVIDIA_NAME = nameUtf8;
+        } else if (lower.find("amd") != string::npos || lower.find("radeon") != string::npos) {
+            HAS_AMD_DEVICE = true;
+            if (DETECTED_AMD_NAME.empty()) DETECTED_AMD_NAME = nameUtf8;
+        } else if (lower.find("intel") != string::npos) {
+            HAS_INTEL_DEVICE = true;
+            if (DETECTED_INTEL_NAME.empty()) DETECTED_INTEL_NAME = nameUtf8;
+        }
+        dd.cb = sizeof(dd);
+    }
+
+    if (FFPROBE_FOUND && !FFPROBE_PATH.empty()) {
+        string cmd = "\"" + FFPROBE_PATH + "\" -hide_banner -encoders 2>&1";
+        SECURITY_ATTRIBUTES sa = {};
+        sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+        sa.bInheritHandle = TRUE;
+
+        HANDLE hReadPipe = NULL, hWritePipe = NULL;
+        if (CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
+            SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+            STARTUPINFOW si = {};
+            si.cb = sizeof(si);
+            si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+            si.hStdOutput = hWritePipe;
+            si.hStdError = hWritePipe;
+            si.wShowWindow = SW_HIDE;
+
+            PROCESS_INFORMATION pi = {};
+            wstring wcmd = utf8ToWstring(cmd);
+            if (CreateProcessW(NULL, &wcmd[0], NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+                CloseHandle(hWritePipe);
+
+                string output;
+                char buf[4096];
+                DWORD bytesRead = 0;
+                while (ReadFile(hReadPipe, buf, sizeof(buf) - 1, &bytesRead, NULL) && bytesRead > 0) {
+                    buf[bytesRead] = '\0';
+                    output += buf;
+                }
+
+                WaitForSingleObject(pi.hProcess, INFINITE);
+                CloseHandle(hReadPipe);
+                CloseHandle(pi.hProcess);
+                CloseHandle(pi.hThread);
+
+                bool hasNvenc = (output.find("h264_nvenc") != string::npos) || (output.find("hevc_nvenc") != string::npos);
+                bool hasAmf = (output.find("h264_amf") != string::npos) || (output.find("hevc_amf") != string::npos);
+                bool hasQsv = (output.find("h264_qsv") != string::npos) || (output.find("hevc_qsv") != string::npos);
+
+                if (!hasNvenc) HAS_NVIDIA_DEVICE = false;
+                if (!hasAmf) HAS_AMD_DEVICE = false;
+                if (!hasQsv) HAS_INTEL_DEVICE = false;
+            } else {
+                CloseHandle(hReadPipe);
+                CloseHandle(hWritePipe);
+            }
+        }
+    }
+
+    if (HAS_NVIDIA_DEVICE && DETECTED_NVIDIA_NAME.empty()) DETECTED_NVIDIA_NAME = "NVIDIA (NVENC)";
+    if (HAS_INTEL_DEVICE && DETECTED_INTEL_NAME.empty()) DETECTED_INTEL_NAME = "Intel (QSV)";
+    if (HAS_AMD_DEVICE && DETECTED_AMD_NAME.empty()) DETECTED_AMD_NAME = "AMD (AMF)";
+
+    if (HAS_NVIDIA_DEVICE) DETECTED_GPU_NAME = DETECTED_NVIDIA_NAME;
+    else if (HAS_INTEL_DEVICE) DETECTED_GPU_NAME = DETECTED_INTEL_NAME;
+    else if (HAS_AMD_DEVICE) DETECTED_GPU_NAME = DETECTED_AMD_NAME;
+
+    int hwCount = (HAS_NVIDIA_DEVICE ? 1 : 0) + (HAS_INTEL_DEVICE ? 1 : 0) + (HAS_AMD_DEVICE ? 1 : 0);
+    AccelMode defaultHw = ACCEL_CPU_ONLY;
+    if (HAS_NVIDIA_DEVICE) defaultHw = ACCEL_NVIDIA;
+    else if (HAS_INTEL_DEVICE) defaultHw = ACCEL_INTEL;
+    else if (HAS_AMD_DEVICE) defaultHw = ACCEL_AMD;
+
+    if (!CONFIG_LOADED) {
+        ACCELERATION_MODE = defaultHw;
+        HYBRID_GPU_CHOICE = defaultHw;
+    } else {
+        // Validate current ACCELERATION_MODE against available devices
+        if (ACCELERATION_MODE == ACCEL_NVIDIA && !HAS_NVIDIA_DEVICE) ACCELERATION_MODE = defaultHw;
+        if (ACCELERATION_MODE == ACCEL_INTEL && !HAS_INTEL_DEVICE) ACCELERATION_MODE = defaultHw;
+        if (ACCELERATION_MODE == ACCEL_AMD && !HAS_AMD_DEVICE) ACCELERATION_MODE = defaultHw;
+        if (ACCELERATION_MODE == ACCEL_CPU_DEC_GPU_ENC && hwCount == 0) ACCELERATION_MODE = ACCEL_CPU_ONLY;
+
+        // Validate HYBRID_GPU_CHOICE
+        if (HYBRID_GPU_CHOICE == ACCEL_NVIDIA && !HAS_NVIDIA_DEVICE) HYBRID_GPU_CHOICE = defaultHw;
+        if (HYBRID_GPU_CHOICE == ACCEL_INTEL && !HAS_INTEL_DEVICE) HYBRID_GPU_CHOICE = defaultHw;
+        if (HYBRID_GPU_CHOICE == ACCEL_AMD && !HAS_AMD_DEVICE) HYBRID_GPU_CHOICE = defaultHw;
+        if (HYBRID_GPU_CHOICE == ACCEL_CPU_ONLY && hwCount > 0) HYBRID_GPU_CHOICE = defaultHw;
+    }
+}
+
+AccelMode getActiveGpuMode() {
+    if (ACCELERATION_MODE == ACCEL_CPU_DEC_GPU_ENC) {
+        return HYBRID_GPU_CHOICE;
+    }
+    return ACCELERATION_MODE;
+}
+
+string getAccelerationModeName() {
+    switch (ACCELERATION_MODE) {
+        case ACCEL_CPU_ONLY:
+            return tr("Software CPU (libx264)", "Программный CPU (libx264)");
+        case ACCEL_CPU_DEC_GPU_ENC: {
+            string gpuPart = "";
+            if (HYBRID_GPU_CHOICE == ACCEL_NVIDIA) gpuPart = " [NVIDIA]";
+            else if (HYBRID_GPU_CHOICE == ACCEL_INTEL) gpuPart = " [Intel]";
+            else if (HYBRID_GPU_CHOICE == ACCEL_AMD) gpuPart = " [AMD]";
+            return tr("CPU Decoding + GPU Encoding", "Программный + Аппаратный (Декодирование CPU, Кодирование GPU)") + gpuPart;
+        }
+        case ACCEL_NVIDIA:
+            return tr("Hardware NVIDIA (NVENC)", "Аппаратный NVIDIA (NVENC)");
+        case ACCEL_INTEL:
+            return tr("Hardware INTEL (QSV)", "Аппаратный INTEL (QSV)");
+        case ACCEL_AMD:
+            return tr("Hardware AMD (AMF)", "Аппаратный AMD (AMF)");
+        default:
+            return tr("Software CPU (libx264)", "Программный CPU (libx264)");
+    }
+}
+
+string getHWAccelArg(bool pureReencode = false) {
+    if (ACCELERATION_MODE == ACCEL_CPU_ONLY || ACCELERATION_MODE == ACCEL_CPU_DEC_GPU_ENC) {
+        return "";
+    }
+    if (pureReencode) {
+        if (ACCELERATION_MODE == ACCEL_NVIDIA) return " -hwaccel cuda";
+        if (ACCELERATION_MODE == ACCEL_INTEL) return " -hwaccel qsv";
+    }
+    return " -hwaccel auto";
+}
+
 // ========== CONSOLE & SCREEN HELPERS ==========
 void setUTF8() {
     SetConsoleCP(CP_UTF8);
@@ -137,7 +371,7 @@ void setUTF8() {
         dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
         SetConsoleMode(hOut, dwMode);
     }
-    SetConsoleTitleW(L"MR CLI FOR FFMPEG v1.1.0");
+    SetConsoleTitleW(L"MR CLI FOR FFMPEG v1.1.1");
 }
 
 void clearScreen() {
@@ -268,14 +502,28 @@ bool inputLineWithEscape(string& result, const string& prompt) {
 }
 
 // ========== FILE & DIRECTORY HELPERS ==========
+bool fileExistsW(const wstring& wp) {
+    if (wp.empty()) return false;
+    DWORD attrs = GetFileAttributesW(wp.c_str());
+    return (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY));
+}
+
+bool dirExistsW(const wstring& wp) {
+    if (wp.empty()) return false;
+    DWORD attrs = GetFileAttributesW(wp.c_str());
+    return (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY));
+}
+
 bool fileExists(const string& p) {
     if (p.empty()) return false;
+    if (fileExistsW(utf8ToWstring(p))) return true;
     std::error_code ec;
     return fs::is_regular_file(fs::u8path(p), ec);
 }
 
 bool dirExists(const string& p) {
     if (p.empty()) return false;
+    if (dirExistsW(utf8ToWstring(p))) return true;
     std::error_code ec;
     return fs::is_directory(fs::u8path(p), ec);
 }
@@ -520,7 +768,7 @@ void printFFmpegProgressBar(double currentSec, double totalSec, const string& sp
     line += "] ";
     line += pctBuf;
 
-    if (!speed.empty()) line += "  Speed: " + speed;
+    if (!speed.empty()) line += "  " + tr("Speed: ", "Скорость: ") + speed;
 
     // Show current time
     int cm = (int)(currentSec / 60);
@@ -630,7 +878,7 @@ string getMediaInfo(const string& filePath) {
 
 // ========== FORMAT MEDIA INFO FOR DISPLAY ==========
 string formatMediaInfoDisplay(const string& rawInfo) {
-    if (rawInfo.empty()) return "[No info available]";
+    if (rawInfo.empty()) return tr("[No info available]", "[Информация недоступна]");
 
     string result;
     string codec_name, codec_type, width, height, duration, bit_rate, r_frame_rate, sample_rate, channels;
@@ -647,11 +895,16 @@ string formatMediaInfoDisplay(const string& rawInfo) {
         if (line == "[STREAM]") { inStream = true; streamIdx++; continue; }
         if (line == "[/STREAM]") {
             if (!codec_name.empty()) {
-                result += "  Stream #" + to_string(streamIdx) + " [" + codec_type + "]: " + codec_name;
+                string localizedType = codec_type;
+                if (codec_type == "video") localizedType = tr("video", "видео");
+                else if (codec_type == "audio") localizedType = tr("audio", "аудио");
+                else if (codec_type == "subtitle") localizedType = tr("subtitle", "субтитры");
+
+                result += "  " + tr("Stream #", "Поток #") + to_string(streamIdx) + " [" + localizedType + "]: " + codec_name;
                 if (!width.empty() && !height.empty()) result += " " + width + "x" + height;
-                if (!r_frame_rate.empty() && codec_type == "video") result += " @ " + r_frame_rate + " fps";
-                if (!sample_rate.empty() && codec_type == "audio") result += " " + sample_rate + " Hz";
-                if (!channels.empty() && codec_type == "audio") result += " " + channels + "ch";
+                if (!r_frame_rate.empty() && codec_type == "video") result += " @ " + r_frame_rate + tr(" fps", " кадр/с");
+                if (!sample_rate.empty() && codec_type == "audio") result += " " + sample_rate + tr(" Hz", " Гц");
+                if (!channels.empty() && codec_type == "audio") result += " " + channels + tr("ch", "кан");
                 result += "\n";
             }
             codec_name.clear(); codec_type.clear(); width.clear(); height.clear();
@@ -682,15 +935,15 @@ string formatMediaInfoDisplay(const string& rawInfo) {
         }
     }
 
-    if (!fmt_name.empty()) result += "  Format: " + fmt_name + "\n";
+    if (!fmt_name.empty()) result += "  " + tr("Format: ", "Формат: ") + fmt_name + "\n";
     if (!fmt_duration.empty()) {
         try {
             double dur = stod(fmt_duration);
             int h = (int)(dur / 3600);
             int m = (int)((dur - h * 3600) / 60);
             int s = (int)(dur) % 60;
-            char buf[64];
-            snprintf(buf, sizeof(buf), "  Duration: %02d:%02d:%02d (%.1f sec)", h, m, s, dur);
+            char buf[128];
+            snprintf(buf, sizeof(buf), (CURRENT_LANG == LANG_RU) ? "  Длительность: %02d:%02d:%02d (%.1f сек)" : "  Duration: %02d:%02d:%02d (%.1f sec)", h, m, s, dur);
             result += buf;
             result += "\n";
         } catch (...) {}
@@ -699,9 +952,9 @@ string formatMediaInfoDisplay(const string& rawInfo) {
         try {
             double sz = stod(fmt_size);
             char buf[64];
-            if (sz > 1024 * 1024 * 1024) snprintf(buf, sizeof(buf), "  Size: %.2f GB", sz / (1024.0 * 1024.0 * 1024.0));
-            else if (sz > 1024 * 1024) snprintf(buf, sizeof(buf), "  Size: %.2f MB", sz / (1024.0 * 1024.0));
-            else snprintf(buf, sizeof(buf), "  Size: %.2f KB", sz / 1024.0);
+            if (sz > 1024 * 1024 * 1024) snprintf(buf, sizeof(buf), (CURRENT_LANG == LANG_RU) ? "  Размер: %.2f ГБ" : "  Size: %.2f GB", sz / (1024.0 * 1024.0 * 1024.0));
+            else if (sz > 1024 * 1024) snprintf(buf, sizeof(buf), (CURRENT_LANG == LANG_RU) ? "  Размер: %.2f МБ" : "  Size: %.2f MB", sz / (1024.0 * 1024.0));
+            else snprintf(buf, sizeof(buf), (CURRENT_LANG == LANG_RU) ? "  Размер: %.2f КБ" : "  Size: %.2f KB", sz / 1024.0);
             result += buf;
             result += "\n";
         } catch (...) {}
@@ -710,7 +963,7 @@ string formatMediaInfoDisplay(const string& rawInfo) {
         try {
             double br = stod(fmt_bit_rate);
             char buf[64];
-            snprintf(buf, sizeof(buf), "  Bitrate: %.0f kbps", br / 1000.0);
+            snprintf(buf, sizeof(buf), (CURRENT_LANG == LANG_RU) ? "  Битрейт: %.0f кбит/с" : "  Bitrate: %.0f kbps", br / 1000.0);
             result += buf;
             result += "\n";
         } catch (...) {}
@@ -721,13 +974,14 @@ string formatMediaInfoDisplay(const string& rawInfo) {
 
 // ========== EXECUTE FFMPEG WITH LIVE PROGRESS ==========
 bool execFFmpegWithProgress(const wstring& cmdLine, double totalDuration = 0) {
+    g_ffmpegEscaped = false;
     SECURITY_ATTRIBUTES sa = {};
     sa.nLength = sizeof(SECURITY_ATTRIBUTES);
     sa.bInheritHandle = TRUE;
 
     HANDLE hReadPipe = NULL, hWritePipe = NULL;
     if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
-        printColor("[ERROR] Failed to create process pipe!", RED);
+        printColor(tr("[ERROR] Failed to create process pipe!", "[ОШИБКА] Не удалось создать канал процесса!"), RED);
         return false;
     }
     SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
@@ -749,7 +1003,7 @@ bool execFFmpegWithProgress(const wstring& cmdLine, double totalDuration = 0) {
 
     if (!success) {
         CloseHandle(hReadPipe);
-        printColor("[ERROR] Failed to launch FFmpeg!", RED);
+        printColor(tr("[ERROR] Failed to launch FFmpeg!", "[ОШИБКА] Не удалось запустить FFmpeg!"), RED);
         return false;
     }
 
@@ -763,7 +1017,7 @@ bool execFFmpegWithProgress(const wstring& cmdLine, double totalDuration = 0) {
             int key = _getch();
             if (key == 27) {
                 if (progressActive) { cout << endl; progressActive = false; }
-                printColor("\n[INFO] Operation cancelled by user.", YELLOW);
+                g_ffmpegEscaped = true;
                 TerminateProcess(pi.hProcess, 1);
                 break;
             }
@@ -793,7 +1047,7 @@ bool execFFmpegWithProgress(const wstring& cmdLine, double totalDuration = 0) {
                     else if (line.find("Error") != string::npos || line.find("error") != string::npos) {
                         if (line.find("encoder") == string::npos) {
                             if (progressActive) { cout << endl; progressActive = false; }
-                            printColor("[ERROR] " + line, RED);
+                            printColor(tr("[ERROR] ", "[ОШИБКА] ") + line, RED);
                         }
                     }
                     line.clear();
@@ -850,12 +1104,18 @@ string openFolderDialog(const wchar_t* title = L"Select folder") {
     return wstringToUtf8(result);
 }
 
-string openFileDialogMedia(const wchar_t* title = L"Select media file") {
+string openFileDialogMedia(const wchar_t* title = nullptr) {
     OPENFILENAMEW ofn = { 0 };
     wchar_t fn[MAX_PATH] = L"";
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = GetConsoleWindow();
-    ofn.lpstrFilter = L"Media Files\0*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.ts;*.m4v;*.mp3;*.m4a;*.aac;*.wav;*.ogg;*.flac;*.opus;*.wma;*.gif;*.png;*.jpg;*.jpeg;*.bmp;*.tiff\0"
+    ofn.lpstrFilter = (CURRENT_LANG == LANG_RU) ?
+                      L"Медиа файлы\0*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.ts;*.m4v;*.mp3;*.m4a;*.aac;*.wav;*.ogg;*.flac;*.opus;*.wma;*.gif;*.png;*.jpg;*.jpeg;*.bmp;*.tiff\0"
+                      L"Видео файлы\0*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.ts;*.m4v\0"
+                      L"Аудио файлы\0*.mp3;*.m4a;*.aac;*.wav;*.ogg;*.flac;*.opus;*.wma\0"
+                      L"Изображения\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tiff\0"
+                      L"Все файлы (*.*)\0*.*\0" :
+                      L"Media Files\0*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.ts;*.m4v;*.mp3;*.m4a;*.aac;*.wav;*.ogg;*.flac;*.opus;*.wma;*.gif;*.png;*.jpg;*.jpeg;*.bmp;*.tiff\0"
                       L"Video Files\0*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.ts;*.m4v\0"
                       L"Audio Files\0*.mp3;*.m4a;*.aac;*.wav;*.ogg;*.flac;*.opus;*.wma\0"
                       L"Image Files\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tiff\0"
@@ -863,7 +1123,8 @@ string openFileDialogMedia(const wchar_t* title = L"Select media file") {
     ofn.lpstrFile = fn;
     ofn.nMaxFile = MAX_PATH;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
-    ofn.lpstrTitle = title;
+    wstring defaultTitle = (CURRENT_LANG == LANG_RU) ? L"Выберите медиафайл" : L"Select media file";
+    ofn.lpstrTitle = title ? title : defaultTitle.c_str();
 
     if (GetOpenFileNameW(&ofn)) {
         return wstringToUtf8(wstring(fn));
@@ -891,14 +1152,15 @@ void saveConfig() {
       << "VIDEO_BITRATE=" << VIDEO_BITRATE << "\n"
       << "CRF_VALUE=" << CRF_VALUE << "\n"
       << "PRESET=" << PRESET << "\n"
-      << "OVERWRITE_FILES=" << (!OVERWRITE_FILES ? "true" : "false") << "\n"
-      << "HARDWARE_ACCEL=" << (HARDWARE_ACCEL ? "true" : "false") << "\n"
+      << "OVERWRITE_FILES=" << (OVERWRITE_FILES ? "true" : "false") << "\n"
       << "KEEP_METADATA=" << (KEEP_METADATA ? "true" : "false") << "\n"
       << "VIDEO_CODEC_ASK=" << (VIDEO_CODEC_ASK ? "true" : "false") << "\n"
       << "AUDIO_CODEC_ASK=" << (AUDIO_CODEC_ASK ? "true" : "false") << "\n"
       << "LANGUAGE=" << (CURRENT_LANG == LANG_RU ? "ru" : "en") << "\n"
       << "WATERMARK_PATH=" << WATERMARK_PATH << "\n"
-      << "WATERMARK_POSITION=" << WATERMARK_POSITION << "\n";
+      << "WATERMARK_POSITION=" << WATERMARK_POSITION << "\n"
+      << "ACCELERATION_MODE=" << (int)ACCELERATION_MODE << "\n"
+      << "HYBRID_GPU_CHOICE=" << (int)HYBRID_GPU_CHOICE << "\n";
     f.close();
 }
 
@@ -908,6 +1170,7 @@ void loadConfig() {
     if (fileExists(configPath)) {
         ifstream f(configPath);
         if (f.is_open()) {
+            CONFIG_LOADED = true;
             string l;
             while (getline(f, l)) {
                 if (l.length() >= 3 && (unsigned char)l[0] == 0xEF &&
@@ -924,14 +1187,15 @@ void loadConfig() {
                 else if (l.find("VIDEO_BITRATE=") == 0) VIDEO_BITRATE = l.substr(14);
                 else if (l.find("CRF_VALUE=") == 0) CRF_VALUE = l.substr(10);
                 else if (l.find("PRESET=") == 0) PRESET = l.substr(7);
-                else if (l.find("OVERWRITE_FILES=") == 0) OVERWRITE_FILES = (l.substr(16) != "true");
-                else if (l.find("HARDWARE_ACCEL=") == 0) HARDWARE_ACCEL = (l.substr(15) == "true");
+                else if (l.find("OVERWRITE_FILES=") == 0) OVERWRITE_FILES = (l.substr(16) == "true");
                 else if (l.find("KEEP_METADATA=") == 0) KEEP_METADATA = (l.substr(14) == "true");
                 else if (l.find("VIDEO_CODEC_ASK=") == 0) VIDEO_CODEC_ASK = (l.substr(16) == "true");
                 else if (l.find("AUDIO_CODEC_ASK=") == 0) AUDIO_CODEC_ASK = (l.substr(16) == "true");
                 else if (l.find("LANGUAGE=") == 0) CURRENT_LANG = (l.substr(9) == "ru") ? LANG_RU : LANG_EN;
                 else if (l.find("WATERMARK_PATH=") == 0) WATERMARK_PATH = l.substr(15);
                 else if (l.find("WATERMARK_POSITION=") == 0) WATERMARK_POSITION = l.substr(19);
+                else if (l.find("ACCELERATION_MODE=") == 0) { try { ACCELERATION_MODE = (AccelMode)stoi(l.substr(18)); } catch (...) { ACCELERATION_MODE = ACCEL_CPU_ONLY; } }
+                else if (l.find("HYBRID_GPU_CHOICE=") == 0) { try { HYBRID_GPU_CHOICE = (AccelMode)stoi(l.substr(18)); } catch (...) { HYBRID_GPU_CHOICE = ACCEL_CPU_ONLY; } }
             }
             f.close();
         }
@@ -973,11 +1237,43 @@ string getOutputExtension() {
 }
 
 string getVideoCodecArgs() {
-    if (OUTPUT_FORMAT.find("H.264") != string::npos) return "-c:v libx264";
-    if (OUTPUT_FORMAT.find("H.265") != string::npos || OUTPUT_FORMAT.find("HEVC") != string::npos) return "-c:v libx265";
-    if (OUTPUT_FORMAT.find("AV1") != string::npos) return "-c:v libaom-av1";
+    AccelMode activeGpu = getActiveGpuMode();
+    string hwEncoder;
+    if (activeGpu == ACCEL_NVIDIA) {
+        hwEncoder = "nvenc";
+    } else if (activeGpu == ACCEL_AMD) {
+        hwEncoder = "amf";
+    } else if (activeGpu == ACCEL_INTEL) {
+        hwEncoder = "qsv";
+    } else {
+        hwEncoder = "";
+    }
+
+    if (OUTPUT_FORMAT.find("H.264") != string::npos) {
+        if (hwEncoder == "nvenc") return "-c:v h264_nvenc -rc:v constqp";
+        if (hwEncoder == "amf") return "-c:v h264_amf -quality:v balanced";
+        if (hwEncoder == "qsv") return "-c:v h264_qsv";
+        return "-c:v libx264";
+    }
+    if (OUTPUT_FORMAT.find("H.265") != string::npos || OUTPUT_FORMAT.find("HEVC") != string::npos) {
+        if (hwEncoder == "nvenc") return "-c:v hevc_nvenc -rc:v constqp";
+        if (hwEncoder == "amf") return "-c:v hevc_amf -quality:v balanced";
+        if (hwEncoder == "qsv") return "-c:v hevc_qsv";
+        return "-c:v libx265";
+    }
+    if (OUTPUT_FORMAT.find("AV1") != string::npos) {
+        if (hwEncoder == "nvenc") return "-c:v av1_nvenc -rc:v constqp";
+        if (hwEncoder == "qsv") return "-c:v av1_qsv";
+        return "-c:v libaom-av1";
+    }
     if (OUTPUT_FORMAT.find("VP9") != string::npos) return "-c:v libvpx-vp9";
     if (OUTPUT_FORMAT.find("MPEG4") != string::npos) return "-c:v mpeg4";
+
+    if (!hwEncoder.empty()) {
+        if (hwEncoder == "nvenc") return "-c:v h264_nvenc -rc:v constqp";
+        if (hwEncoder == "amf") return "-c:v h264_amf -quality:v balanced";
+        if (hwEncoder == "qsv") return "-c:v h264_qsv";
+    }
     return "-c:v libx264";
 }
 
@@ -992,15 +1288,59 @@ string getAudioCodecArgs() {
     return "-c:a aac";
 }
 
-string buildOutputPath(const string& inputPath, const string& suffix = "") {
+string getVideoQualityArgs(const string& crfVal) {
+    AccelMode activeGpu = getActiveGpuMode();
+    bool isHW = (activeGpu == ACCEL_NVIDIA || activeGpu == ACCEL_AMD || activeGpu == ACCEL_INTEL);
+    if (isHW) return "-qp " + crfVal;
+    return "-crf " + crfVal;
+}
+
+string getVideoPresetArgs(const string& overridePreset = "") {
+    const string& p = overridePreset.empty() ? PRESET : overridePreset;
+    AccelMode activeGpu = getActiveGpuMode();
+
+    if (activeGpu == ACCEL_NVIDIA) {
+        if (p == "ultrafast" || p == "superfast" || p == "veryfast") return "-preset p1";
+        if (p == "faster" || p == "fast") return "-preset p4";
+        if (p == "medium") return "-preset p5";
+        if (p == "slow" || p == "slower" || p == "veryslow") return "-preset p7";
+        return "-preset p5";
+    }
+    if (activeGpu == ACCEL_AMD) {
+        if (p == "ultrafast" || p == "superfast" || p == "veryfast" || p == "faster" || p == "fast") return "-preset speed";
+        if (p == "medium") return "-preset balanced";
+        if (p == "slow" || p == "slower" || p == "veryslow") return "-preset quality";
+        return "-preset balanced";
+    }
+    if (activeGpu == ACCEL_INTEL) {
+        if (p == "ultrafast" || p == "superfast") return "-preset veryfast";
+        if (p == "veryfast" || p == "faster") return "-preset faster";
+        if (p == "fast") return "-preset fast";
+        if (p == "medium") return "-preset medium";
+        if (p == "slow") return "-preset slow";
+        if (p == "slower" || p == "veryslow") return "-preset slower";
+        return "-preset medium";
+    }
+    return "-preset " + p;
+}
+
+string buildOutputPath(const string& inputPath, const string& suffix = "", const string& forceExt = "") {
     fs::path inPath = fs::u8path(inputPath);
     string stem = inPath.stem().u8string();
-    string ext = getOutputExtension();
-    string usedSuffix = OVERWRITE_FILES ? suffix : "";
+    string ext = forceExt.empty() ? getOutputExtension() : forceExt;
+    string usedSuffix = (!OVERWRITE_FILES) ? suffix : "";
     string outName = stem + usedSuffix + "." + ext;
     string outPath = OUTPUT_PATH + outName;
 
-    if (OVERWRITE_FILES) {
+    if (!OVERWRITE_FILES) {
+        std::error_code ec;
+        auto absOut = fs::weakly_canonical(fs::absolute(fs::u8path(outPath), ec), ec);
+        auto absIn = fs::weakly_canonical(fs::absolute(fs::u8path(inputPath), ec), ec);
+        if (!ec && absOut == absIn) {
+            outName = stem + (suffix.empty() ? "_converted" : suffix) + "." + ext;
+            outPath = OUTPUT_PATH + outName;
+        }
+
         int counter = 1;
         while (fileExists(outPath)) {
             outPath = OUTPUT_PATH + stem + usedSuffix + "_" + to_string(counter) + "." + ext;
@@ -1010,8 +1350,132 @@ string buildOutputPath(const string& inputPath, const string& suffix = "") {
     return outPath;
 }
 
+struct FFmpegTarget {
+    string targetPath;
+    string writePath;
+    bool isTemp = false;
+};
+
+FFmpegTarget prepareFFmpegTarget(const string& targetPath, const vector<string>& inputPaths) {
+    FFmpegTarget ft;
+    ft.targetPath = targetPath;
+    ft.writePath = targetPath;
+    ft.isTemp = false;
+
+    wstring wTarget = utf8ToWstring(targetPath);
+    if (wTarget.empty()) return ft;
+
+    bool conflictsWithInput = false;
+    for (const auto& inp : inputPaths) {
+        if (inp.empty()) continue;
+        wstring wInp = utf8ToWstring(inp);
+        if (_wcsicmp(wTarget.c_str(), wInp.c_str()) == 0) {
+            conflictsWithInput = true;
+            break;
+        }
+
+        std::error_code ec;
+        auto absTarget = fs::weakly_canonical(fs::u8path(targetPath), ec);
+        auto absIn = fs::weakly_canonical(fs::u8path(inp), ec);
+        if (!ec && absTarget == absIn) {
+            conflictsWithInput = true;
+            break;
+        }
+    }
+
+    if (conflictsWithInput) {
+        // Target is identical to one of the input files (in-place overwrite).
+        // Write to a temporary file first in the same directory, then replace atomically on success.
+        fs::path p = fs::u8path(targetPath);
+        wstring stemW = p.stem().wstring();
+        wstring extW = p.extension().wstring();
+        fs::path tempP = p.parent_path() / (stemW + L".~mr_tmp" + extW);
+        ft.writePath = wstringToUtf8(tempP.wstring());
+        ft.isTemp = true;
+    }
+
+    return ft;
+}
+
+bool finalizeFFmpegTarget(const FFmpegTarget& ft, bool success) {
+    if (!ft.isTemp) return success;
+
+    wstring wTemp = utf8ToWstring(ft.writePath);
+    wstring wTarget = utf8ToWstring(ft.targetPath);
+
+    if (success && fileExistsW(wTemp)) {
+        // Remove read-only attributes if present
+        DWORD targetAttrs = GetFileAttributesW(wTarget.c_str());
+        if (targetAttrs != INVALID_FILE_ATTRIBUTES && (targetAttrs & FILE_ATTRIBUTE_READONLY)) {
+            SetFileAttributesW(wTarget.c_str(), targetAttrs & ~FILE_ATTRIBUTE_READONLY);
+        }
+        DWORD tempAttrs = GetFileAttributesW(wTemp.c_str());
+        if (tempAttrs != INVALID_FILE_ATTRIBUTES && (tempAttrs & FILE_ATTRIBUTE_READONLY)) {
+            SetFileAttributesW(wTemp.c_str(), tempAttrs & ~FILE_ATTRIBUTE_READONLY);
+        }
+
+        bool replaced = false;
+
+        // Stage 1: MoveFileExW with MOVEFILE_REPLACE_EXISTING
+        for (int retry = 0; retry < 15; retry++) {
+            if (MoveFileExW(wTemp.c_str(), wTarget.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                replaced = true;
+                break;
+            }
+            Sleep(100);
+        }
+
+        // Stage 2: ReplaceFileW (standard Windows file replacement API)
+        if (!replaced) {
+            for (int retry = 0; retry < 10; retry++) {
+                if (ReplaceFileW(wTarget.c_str(), wTemp.c_str(), NULL, REPLACEFILE_IGNORE_MERGE_ERRORS, NULL, NULL)) {
+                    replaced = true;
+                    break;
+                }
+                Sleep(100);
+            }
+        }
+
+        // Stage 3: Delete target then MoveFileW
+        if (!replaced) {
+            DeleteFileW(wTarget.c_str());
+            for (int retry = 0; retry < 10; retry++) {
+                if (MoveFileExW(wTemp.c_str(), wTarget.c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)) {
+                    replaced = true;
+                    break;
+                }
+                Sleep(100);
+            }
+        }
+
+        // Stage 4: CopyFileW fallback (guaranteed to work across network SMB shares / FAT32)
+        if (!replaced) {
+            for (int retry = 0; retry < 10; retry++) {
+                if (CopyFileW(wTemp.c_str(), wTarget.c_str(), FALSE)) {
+                    DeleteFileW(wTemp.c_str());
+                    replaced = true;
+                    break;
+                }
+                Sleep(150);
+            }
+        }
+
+        if (!replaced) {
+            DWORD err = GetLastError();
+            printColor("\n[ERROR] Failed to replace target file (Win32 error code: " + to_string(err) + ")", RED);
+            DeleteFileW(wTemp.c_str());
+            return false;
+        }
+
+        return fileExistsW(wTarget);
+    } else {
+        DeleteFileW(wTemp.c_str());
+        return false;
+    }
+}
+
 // ========== ARROW-KEY SELECTION MENU ==========
-int arrowSelect(const string& title, const string& description, const vector<string>& options, int currentIdx) {
+int arrowSelect(const string& title, const string& description, const vector<string>& options, int currentIdx, const vector<string>& hints = {}) {
     int selected = (currentIdx >= 0 && currentIdx < (int)options.size()) ? currentIdx : 0;
     while (true) {
         clearScreen();
@@ -1030,6 +1494,14 @@ int arrowSelect(const string& title, const string& description, const vector<str
             } else {
                 cout << "   " << options[i] << endl;
             }
+        }
+        if (!hints.empty() && selected >= 0 && selected < (int)hints.size() && !hints[selected].empty()) {
+            cout << "\n";
+            printColor("----------------------------------------------------------------------", CYAN);
+            setColor(YELLOW);
+            cout << " [i] " << hints[selected] << "\n";
+            setColor(WHITE);
+            printColor("----------------------------------------------------------------------", CYAN);
         }
         cout << "\n" << tr("Arrow keys to select, Enter to confirm, ESC to cancel",
                            "Стрелки для выбора, Enter для подтверждения, ESC для отмены") << endl;
@@ -1056,8 +1528,7 @@ bool promptVideoCodecSettings() {
          << "  " << tr("CRF: ", "CRF: ") << CRF_VALUE << "\n"
          << "  " << tr("Preset: ", "Пресет: ") << PRESET << "\n"
          << "  " << tr("Resolution: ", "Разрешение: ") << OUTPUT_RESOLUTION << "\n"
-         << "  " << tr("FPS: ", "FPS: ") << OUTPUT_FPS << "\n"
-         << "  " << tr("Hardware accel: ", "Аппаратное ускорение: ") << (HARDWARE_ACCEL ? "ON" : "OFF") << "\n"
+         << "  " << tr("Program acceleration: ", "Программное ускорение: ") << getAccelerationModeName() << "\n"
          << "\n" << tr("Proceed with these settings? [Y/N]: ", "Продолжить с этими настройками? [Y/N]: ");
     char ch = getMenuChoice();
     if (ch == 27) return false;
@@ -1337,7 +1808,7 @@ void batchCompressVideo() {
          << "  " << tr("Format: ", "Формат: ") << OUTPUT_FORMAT << "\n"
          << "  CRF: " << CRF_VALUE << "\n"
          << "  " << tr("Preset: ", "Пресет: ") << PRESET << "\n"
-         << "  " << tr("Hardware accel: ", "Аппаратное ускорение: ") << (HARDWARE_ACCEL ? "ON" : "OFF") << "\n";
+         << "  " << tr("Program acceleration: ", "Программное ускорение: ") << getAccelerationModeName() << "\n";
 
     cout << "\n" << tr("Would you like to change any settings before proceeding? [Y/N]: ",
                        "Хотите изменить настройки перед началом? [Y/N]: ");
@@ -1352,15 +1823,19 @@ void batchCompressVideo() {
     }
     cout << "N\n";
 
-    cout << "\n" << tr("Delete original files after conversion? [Y/N]: ",
-                       "Удалить оригиналы после преобразования? [Y/N]: ");
-    char chDel = getMenuChoice();
-    if (chDel == 27) return;
-    bool deleteOrig = (chDel == 'y');
-    cout << (deleteOrig ? "Y\n" : "N\n");
+    bool deleteOrig = false;
+    if (!OVERWRITE_FILES) {
+        cout << "\n" << tr("Delete original files after conversion? [Y/N]: ",
+                           "Удалить оригиналы после преобразования? [Y/N]: ");
+        char chDel = getMenuChoice();
+        if (chDel == 27) return;
+        deleteOrig = (chDel == 'y');
+        cout << (deleteOrig ? "Y\n" : "N\n");
+    }
 
     int success = 0, fail = 0;
-    for (size_t i = 0; i < files.size(); i++) {
+    size_t i = 0;
+    while (i < files.size()) {
         cout << "\n";
         printColor("========================================", CYAN);
         char label[128];
@@ -1372,27 +1847,64 @@ void batchCompressVideo() {
 
         double duration = getMediaDuration(files[i]);
         string outPath = buildOutputPath(files[i], "_compressed");
+        auto ft = prepareFFmpegTarget(outPath, {files[i]});
 
-        wstring cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
-        if (HARDWARE_ACCEL) cmd += L" -hwaccel auto";
-        cmd += L" -i \"" + utf8ToWstring(files[i]) + L"\"";
+        wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
+        cmd += utf8ToWstring(getHWAccelArg(true));
+        cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(files[i])) + L"\"";
         cmd += L" " + utf8ToWstring(getVideoCodecArgs());
-        cmd += L" -crf " + utf8ToWstring(CRF_VALUE);
-        cmd += L" -preset " + utf8ToWstring(PRESET);
+        cmd += L" " + utf8ToWstring(getVideoQualityArgs(CRF_VALUE));
+        cmd += L" " + utf8ToWstring(getVideoPresetArgs());
         cmd += L" " + utf8ToWstring(getAudioCodecArgs()) + L" -b:a 128k";
-        if (!OVERWRITE_FILES) cmd += L" -y";
-        cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
+        if (OVERWRITE_FILES) cmd += L" -y";
+        cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(ft.writePath)) + L"\"";
 
         bool ok = execFFmpegWithProgress(cmd, duration);
+        ok = finalizeFFmpegTarget(ft, ok);
+
+        if (g_ffmpegEscaped) {
+            finalizeFFmpegTarget(ft, false);
+            cout << "\n";
+            printColor("========================================", YELLOW);
+            printColor(tr(" PAUSED - Batch Processing Interrupted", " ПАУЗА - Пакетная обработка прервана"), YELLOW);
+            printColor("========================================", YELLOW);
+            cout << "\n" << tr("File: ", "Файл: ") << fs::u8path(files[i]).filename().u8string()
+                 << " (" << (i + 1) << "/" << files.size() << ")\n";
+            cout << "\n 1. " << tr("Skip this file", "Пропустить этот файл")
+                 << "\n 2. " << tr("Cancel entire batch", "Отменить весь пакет")
+                 << "\n 3. " << tr("Retry this file", "Повторить этот файл")
+                 << "\n\n" << tr("Your choice: ", "Ваш выбор: ");
+
+            char pauseCh = getMenuChoice();
+            if (pauseCh == '2' || pauseCh == 27) {
+                cout << (pauseCh == 27 ? "ESC" : "2") << "\n";
+                printColor(tr("[INFO] Batch processing cancelled.", "[ИНФО] Пакетная обработка отменена."), YELLOW);
+                fail++;
+                break;
+            }
+            else if (pauseCh == '3') {
+                cout << "3\n";
+                continue;
+            }
+            else {
+                cout << "1\n";
+                printColor(tr("[INFO] File skipped.", "[ИНФО] Файл пропущен."), YELLOW);
+                fail++;
+                i++;
+                continue;
+            }
+        }
+
         if (ok) {
             success++;
             printColor(tr("[OK] Done", "[OK] Готово"), GREEN);
-            if (deleteOrig) {
+            if (deleteOrig && !ft.isTemp) {
                 std::error_code dec;
                 fs::remove(fs::u8path(files[i]), dec);
             }
         }
         else { fail++; printColor(tr("[ERROR] Failed", "[ОШИБКА] Не удалось"), RED); }
+        i++;
     }
 
     cout << "\n";
@@ -1467,15 +1979,19 @@ void batchCompressAudio() {
     }
     cout << "N\n";
 
-    cout << "\n" << tr("Delete original files after conversion? [Y/N]: ",
-                       "Удалить оригиналы после преобразования? [Y/N]: ");
-    char chDel = getMenuChoice();
-    if (chDel == 27) return;
-    bool deleteOrig = (chDel == 'y');
-    cout << (deleteOrig ? "Y\n" : "N\n");
+    bool deleteOrig = false;
+    if (!OVERWRITE_FILES) {
+        cout << "\n" << tr("Delete original files after conversion? [Y/N]: ",
+                           "Удалить оригиналы после преобразования? [Y/N]: ");
+        char chDel = getMenuChoice();
+        if (chDel == 27) return;
+        deleteOrig = (chDel == 'y');
+        cout << (deleteOrig ? "Y\n" : "N\n");
+    }
 
     int success = 0, fail = 0;
-    for (size_t i = 0; i < files.size(); i++) {
+    size_t i = 0;
+    while (i < files.size()) {
         cout << "\n";
         printColor("========================================", CYAN);
         char label[128];
@@ -1486,25 +2002,61 @@ void batchCompressAudio() {
         printColor("========================================", CYAN);
 
         double duration = getMediaDuration(files[i]);
-        fs::path inPath = fs::u8path(files[i]);
-        string outPath = OUTPUT_PATH + inPath.stem().u8string() + "_compressed.mp3";
+        string outPath = buildOutputPath(files[i], "_compressed", "mp3");
+        auto ft = prepareFFmpegTarget(outPath, {files[i]});
 
-        wstring cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
-        cmd += L" -i \"" + utf8ToWstring(files[i]) + L"\"";
+        wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
+        cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(files[i])) + L"\"";
         cmd += L" -c:a libmp3lame -b:a " + utf8ToWstring(AUDIO_BITRATE) + L"k";
-        if (!OVERWRITE_FILES) cmd += L" -y";
-        cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
+        if (OVERWRITE_FILES) cmd += L" -y";
+        cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(ft.writePath)) + L"\"";
 
         bool ok = execFFmpegWithProgress(cmd, duration);
+        ok = finalizeFFmpegTarget(ft, ok);
+
+        if (g_ffmpegEscaped) {
+            finalizeFFmpegTarget(ft, false);
+            cout << "\n";
+            printColor("========================================", YELLOW);
+            printColor(tr(" PAUSED - Batch Processing Interrupted", " ПАУЗА - Пакетная обработка прервана"), YELLOW);
+            printColor("========================================", YELLOW);
+            cout << "\n" << tr("File: ", "Файл: ") << fs::u8path(files[i]).filename().u8string()
+                 << " (" << (i + 1) << "/" << files.size() << ")\n";
+            cout << "\n 1. " << tr("Skip this file", "Пропустить этот файл")
+                 << "\n 2. " << tr("Cancel entire batch", "Отменить весь пакет")
+                 << "\n 3. " << tr("Retry this file", "Повторить этот файл")
+                 << "\n\n" << tr("Your choice: ", "Ваш выбор: ");
+
+            char pauseCh = getMenuChoice();
+            if (pauseCh == '2' || pauseCh == 27) {
+                cout << (pauseCh == 27 ? "ESC" : "2") << "\n";
+                printColor(tr("[INFO] Batch processing cancelled.", "[ИНФО] Пакетная обработка отменена."), YELLOW);
+                fail++;
+                break;
+            }
+            else if (pauseCh == '3') {
+                cout << "3\n";
+                continue;
+            }
+            else {
+                cout << "1\n";
+                printColor(tr("[INFO] File skipped.", "[ИНФО] Файл пропущен."), YELLOW);
+                fail++;
+                i++;
+                continue;
+            }
+        }
+
         if (ok) {
             success++;
             printColor(tr("[OK] Done", "[OK] Готово"), GREEN);
-            if (deleteOrig) {
+            if (deleteOrig && !ft.isTemp) {
                 std::error_code dec;
                 fs::remove(fs::u8path(files[i]), dec);
             }
         }
         else { fail++; printColor(tr("[ERROR] Failed", "[ОШИБКА] Не удалось"), RED); }
+        i++;
     }
 
     cout << "\n";
@@ -1532,37 +2084,38 @@ void convertFormat() {
     printColor("========================================", CYAN);
     cout << "\n" << tr("Select input file (or press ESC to cancel)...", "Выберите файл (или нажмите ESC для отмены)...") << "\n";
 
-    string inputFile = openFileDialogMedia(L"Select file to convert");
+    string inputFile = openFileDialogMedia(CURRENT_LANG == LANG_RU ? L"Выберите файл для конвертации" : L"Select file to convert");
     if (inputFile.empty()) {
         printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW);
         waitForKey();
         return;
     }
 
-    printColor("\nInput: " + inputFile, GREEN);
+    printColor("\n" + tr("Input: ", "Вход: ") + inputFile, GREEN);
 
     // Show file info
     string info = getMediaInfo(inputFile);
     if (!info.empty()) {
-        printColor("\n--- File Info ---", CYAN);
+        printColor("\n" + tr("--- File Info ---", "--- Информация о файле ---"), CYAN);
         cout << formatMediaInfoDisplay(info);
         printColor("-----------------", CYAN);
     }
 
     double duration = getMediaDuration(inputFile);
     string outPath = buildOutputPath(inputFile, "_converted");
+    auto ft = prepareFFmpegTarget(outPath, {inputFile});
 
-    printColor("\nOutput: " + outPath, GREEN);
-    printColor("Format: " + OUTPUT_FORMAT, GREEN);
+    printColor("\n" + tr("Output: ", "Выход: ") + outPath, GREEN);
+    printColor(tr("Format: ", "Формат: ") + OUTPUT_FORMAT, GREEN);
 
-    cout << "\n1. Start conversion\n0. Cancel (ESC)\n\nYour choice: ";
+    cout << "\n" << tr("1. Start conversion\n0. Cancel (ESC)\n\nYour choice: ", "1. Начать конвертацию\n0. Отмена (ESC)\n\nВаш выбор: ");
     char ch = getMenuChoice();
     if (ch == 27 || ch == '0') return;
     cout << ch << endl;
 
-    wstring cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
-    if (HARDWARE_ACCEL) cmd += L" -hwaccel auto";
-    cmd += L" -i \"" + utf8ToWstring(inputFile) + L"\"";
+    wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
+    cmd += utf8ToWstring(getHWAccelArg(true));
+    cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(inputFile)) + L"\"";
     cmd += L" " + utf8ToWstring(getVideoCodecArgs());
     cmd += L" " + utf8ToWstring(getAudioCodecArgs());
     cmd += L" -b:a " + utf8ToWstring(AUDIO_BITRATE) + L"k";
@@ -1570,10 +2123,10 @@ void convertFormat() {
     if (VIDEO_BITRATE != "auto") {
         cmd += L" -b:v " + utf8ToWstring(VIDEO_BITRATE) + L"k";
     } else {
-        cmd += L" -crf " + utf8ToWstring(CRF_VALUE);
+        cmd += L" " + utf8ToWstring(getVideoQualityArgs(CRF_VALUE));
     }
 
-    cmd += L" -preset " + utf8ToWstring(PRESET);
+    cmd += L" " + utf8ToWstring(getVideoPresetArgs());
 
     if (OUTPUT_RESOLUTION != "original") {
         cmd += L" -vf scale=-2:" + utf8ToWstring(OUTPUT_RESOLUTION);
@@ -1582,25 +2135,26 @@ void convertFormat() {
         cmd += L" -r " + utf8ToWstring(OUTPUT_FPS);
     }
     if (KEEP_METADATA) cmd += L" -map_metadata 0";
-    if (!OVERWRITE_FILES) cmd += L" -y";
-    cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
+    if (OVERWRITE_FILES) cmd += L" -y";
+    cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" CONVERTING...", CYAN);
+    printColor(tr(" CONVERTING...", " КОНВЕРТАЦИЯ..."), CYAN);
     printColor("========================================", CYAN);
     cout << endl;
 
     bool ok = execFFmpegWithProgress(cmd, duration);
+    ok = finalizeFFmpegTarget(ft, ok);
 
     if (ok) {
         printColor("\n========================================", GREEN);
-        printColor("[OK] Conversion completed successfully!", GREEN);
-        printColor("Output: " + outPath, GREEN);
+        printColor(tr("[OK] Conversion completed successfully!", "[OK] Конвертация успешно завершена!"), GREEN);
+        printColor(tr("Output: ", "Выход: ") + outPath, GREEN);
         printColor("========================================", GREEN);
     } else {
         printColor("\n========================================", RED);
-        printColor("[ERROR] Conversion failed!", RED);
+        printColor(tr("[ERROR] Conversion failed!", "[ОШИБКА] Ошибка конвертации!"), RED);
         printColor("========================================", RED);
     }
     waitForKey();
@@ -1615,58 +2169,60 @@ void trimVideo() {
     printColor("========================================", CYAN);
     cout << "\n" << tr("Select input file...", "Выберите файл...") << "\n";
 
-    string inputFile = openFileDialogMedia(L"Select file to trim");
-    if (inputFile.empty()) { printColor("[INFO] Cancelled", YELLOW); waitForKey(); return; }
+    string inputFile = openFileDialogMedia(CURRENT_LANG == LANG_RU ? L"Выберите файл для обрезки" : L"Select file to trim");
+    if (inputFile.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
 
-    printColor("\nInput: " + inputFile, GREEN);
+    printColor("\n" + tr("Input: ", "Вход: ") + inputFile, GREEN);
     double duration = getMediaDuration(inputFile);
     if (duration > 0) {
         int m = (int)(duration / 60), s = (int)duration % 60;
         char buf[64];
-        snprintf(buf, sizeof(buf), "Duration: %02d:%02d (%.1f sec)", m, s, duration);
+        snprintf(buf, sizeof(buf), (CURRENT_LANG == LANG_RU) ? "Длительность: %02d:%02d (%.1f сек)" : "Duration: %02d:%02d (%.1f sec)", m, s, duration);
         printColor(string(buf), CYAN);
     }
 
     string startTime, endTime;
-    cout << "\nStart time (HH:MM:SS or MM:SS or seconds, ESC to cancel):\n";
+    cout << "\n" << tr("Start time (HH:MM:SS or MM:SS or seconds, ESC to cancel):\n", "Время начала (ЧЧ:ММ:СС или ММ:СС или секунды, ESC для отмены):\n");
     if (!inputLineWithEscape(startTime, "> ")) { return; }
-    cout << "End time (HH:MM:SS or MM:SS or seconds, ESC to cancel):\n";
+    cout << tr("End time (HH:MM:SS or MM:SS or seconds, ESC to cancel):\n", "Время окончания (ЧЧ:ММ:СС или ММ:СС или секунды, ESC для отмены):\n");
     if (!inputLineWithEscape(endTime, "> ")) { return; }
 
     if (startTime.empty() || endTime.empty()) {
-        printColor("[ERROR] Both start and end times are required!", RED);
+        printColor(tr("[ERROR] Both start and end times are required!", "[ОШИБКА] Требуется указать время начала и окончания!"), RED);
         waitForKey();
         return;
     }
 
     string outPath = buildOutputPath(inputFile, "_trimmed");
-    printColor("\nOutput: " + outPath, GREEN);
+    auto ft = prepareFFmpegTarget(outPath, {inputFile});
+    printColor("\n" + tr("Output: ", "Выход: ") + outPath, GREEN);
 
-    wstring cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
+    wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
     cmd += L" -ss " + utf8ToWstring(startTime);
-    cmd += L" -i \"" + utf8ToWstring(inputFile) + L"\"";
+    cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(inputFile)) + L"\"";
     cmd += L" -to " + utf8ToWstring(endTime);
     cmd += L" -c copy";  // Stream copy for speed
-    if (!OVERWRITE_FILES) cmd += L" -y";
-    cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
+    if (OVERWRITE_FILES) cmd += L" -y";
+    cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" TRIMMING...", CYAN);
+    printColor(tr(" TRIMMING...", " ОБРЕЗКА..."), CYAN);
     printColor("========================================", CYAN);
-    printColor("From " + startTime + " to " + endTime, CYAN);
+    printColor(tr("From ", "С ") + startTime + tr(" to ", " по ") + endTime, CYAN);
     cout << endl;
 
     bool ok = execFFmpegWithProgress(cmd, 0);
+    ok = finalizeFFmpegTarget(ft, ok);
 
     if (ok) {
         printColor("\n========================================", GREEN);
-        printColor("[OK] Trim completed successfully!", GREEN);
-        printColor("Output: " + outPath, GREEN);
+        printColor(tr("[OK] Trim completed successfully!", "[OK] Обрезка успешно завершена!"), GREEN);
+        printColor(tr("Output: ", "Выход: ") + outPath, GREEN);
         printColor("========================================", GREEN);
     } else {
         printColor("\n========================================", RED);
-        printColor("[ERROR] Trim failed!", RED);
+        printColor(tr("[ERROR] Trim failed!", "[ОШИБКА] Ошибка обрезки!"), RED);
         printColor("========================================", RED);
     }
     waitForKey();
@@ -1681,13 +2237,14 @@ void extractAudio() {
     printColor("========================================", CYAN);
     cout << "\n" << tr("Select video file...", "Выберите видеофайл...") << "\n";
 
-    string inputFile = openFileDialogMedia(L"Select video to extract audio from");
+    string inputFile = openFileDialogMedia(CURRENT_LANG == LANG_RU ? L"Выберите видеофайл для извлечения звука" : L"Select video to extract audio from");
     if (inputFile.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
 
-    printColor("\nInput: " + inputFile, GREEN);
+    printColor("\n" + tr("Input: ", "Вход: ") + inputFile, GREEN);
     double duration = getMediaDuration(inputFile);
 
-    cout << "\nOutput audio format:\n1) MP3\n2) M4A (AAC)\n3) WAV\n4) FLAC\n5) OGG (Vorbis)\n0) Cancel (ESC)\n\nYour choice: ";
+    cout << "\n" << tr("Output audio format:\n1) MP3\n2) M4A (AAC)\n3) WAV\n4) FLAC\n5) OGG (Vorbis)\n0) Cancel (ESC)\n\nYour choice: ",
+                       "Формат аудио на выходе:\n1) MP3\n2) M4A (AAC)\n3) WAV\n4) FLAC\n5) OGG (Vorbis)\n0) Отмена (ESC)\n\nВаш выбор: ");
     char ch = getMenuChoice();
     if (ch == 27 || ch == '0') return;
     cout << ch << endl;
@@ -1699,34 +2256,35 @@ void extractAudio() {
         case '3': ext = "wav"; codecArgs = "-c:a pcm_s16le"; break;
         case '4': ext = "flac"; codecArgs = "-c:a flac"; break;
         case '5': ext = "ogg"; codecArgs = "-c:a libvorbis -b:a " + AUDIO_BITRATE + "k"; break;
-        default: printColor("[ERROR] Invalid choice!", RED); waitForKey(); return;
+        default: printColor(tr("[ERROR] Invalid choice!", "[ОШИБКА] Неверный выбор!"), RED); waitForKey(); return;
     }
 
-    fs::path inPath = fs::u8path(inputFile);
-    string outPath = OUTPUT_PATH + inPath.stem().u8string() + "_audio." + ext;
+    string outPath = buildOutputPath(inputFile, "_audio", ext);
+    auto ft = prepareFFmpegTarget(outPath, {inputFile});
 
-    wstring cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
-    cmd += L" -i \"" + utf8ToWstring(inputFile) + L"\"";
+    wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
+    cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(inputFile)) + L"\"";
     cmd += L" -vn " + utf8ToWstring(codecArgs);
-    if (!OVERWRITE_FILES) cmd += L" -y";
-    cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
+    if (OVERWRITE_FILES) cmd += L" -y";
+    cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" EXTRACTING AUDIO...", CYAN);
+    printColor(tr(" EXTRACTING AUDIO...", " ИЗВЛЕЧЕНИЕ АУДИО..."), CYAN);
     printColor("========================================", CYAN);
     cout << endl;
 
     bool ok = execFFmpegWithProgress(cmd, duration);
+    ok = finalizeFFmpegTarget(ft, ok);
 
     if (ok) {
         printColor("\n========================================", GREEN);
-        printColor("[OK] Audio extraction completed!", GREEN);
-        printColor("Output: " + outPath, GREEN);
+        printColor(tr("[OK] Audio extraction completed!", "[OK] Аудио успешно извлечено!"), GREEN);
+        printColor(tr("Output: ", "Выход: ") + outPath, GREEN);
         printColor("========================================", GREEN);
     } else {
         printColor("\n========================================", RED);
-        printColor("[ERROR] Audio extraction failed!", RED);
+        printColor(tr("[ERROR] Audio extraction failed!", "[ОШИБКА] Ошибка извлечения аудио!"), RED);
         printColor("========================================", RED);
     }
     waitForKey();
@@ -1736,46 +2294,48 @@ void extractAudio() {
 void mergeVideoAudio() {
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" MERGE VIDEO + AUDIO", CYAN);
+    printColor(tr(" MERGE VIDEO + AUDIO", " ОБЪЕДИНЕНИЕ ВИДЕО И АУДИО"), CYAN);
     printColor("========================================", CYAN);
 
-    cout << "\nSelect VIDEO file...\n";
-    string videoFile = openFileDialogMedia(L"Select video file");
-    if (videoFile.empty()) { printColor("[INFO] Cancelled", YELLOW); waitForKey(); return; }
-    printColor("Video: " + videoFile, GREEN);
+    cout << "\n" << tr("Select VIDEO file...\n", "Выберите ВИДЕОФАЙЛ...\n");
+    string videoFile = openFileDialogMedia(CURRENT_LANG == LANG_RU ? L"Выберите видеофайл" : L"Select video file");
+    if (videoFile.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+    printColor(tr("Video: ", "Видео: ") + videoFile, GREEN);
 
-    cout << "\nSelect AUDIO file...\n";
-    string audioFile = openFileDialogMedia(L"Select audio file");
-    if (audioFile.empty()) { printColor("[INFO] Cancelled", YELLOW); waitForKey(); return; }
-    printColor("Audio: " + audioFile, GREEN);
+    cout << "\n" << tr("Select AUDIO file...\n", "Выберите АУДИОФАЙЛ...\n");
+    string audioFile = openFileDialogMedia(CURRENT_LANG == LANG_RU ? L"Выберите аудиофайл" : L"Select audio file");
+    if (audioFile.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+    printColor(tr("Audio: ", "Аудио: ") + audioFile, GREEN);
 
     double duration = getMediaDuration(videoFile);
     string outPath = buildOutputPath(videoFile, "_merged");
+    auto ft = prepareFFmpegTarget(outPath, {videoFile, audioFile});
 
-    wstring cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
-    cmd += L" -i \"" + utf8ToWstring(videoFile) + L"\"";
-    cmd += L" -i \"" + utf8ToWstring(audioFile) + L"\"";
+    wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
+    cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(videoFile)) + L"\"";
+    cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(audioFile)) + L"\"";
     cmd += L" -c:v copy -c:a aac -b:a " + utf8ToWstring(AUDIO_BITRATE) + L"k";
     cmd += L" -map 0:v:0 -map 1:a:0 -shortest";
-    if (!OVERWRITE_FILES) cmd += L" -y";
-    cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
+    if (OVERWRITE_FILES) cmd += L" -y";
+    cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" MERGING VIDEO + AUDIO...", CYAN);
+    printColor(tr(" MERGING VIDEO + AUDIO...", " ОБЪЕДИНЕНИЕ ВИДЕО И АУДИО..."), CYAN);
     printColor("========================================", CYAN);
     cout << endl;
 
     bool ok = execFFmpegWithProgress(cmd, duration);
+    ok = finalizeFFmpegTarget(ft, ok);
 
     if (ok) {
         printColor("\n========================================", GREEN);
-        printColor("[OK] Merge completed successfully!", GREEN);
-        printColor("Output: " + outPath, GREEN);
+        printColor(tr("[OK] Merge completed successfully!", "[OK] Объединение успешно завершено!"), GREEN);
+        printColor(tr("Output: ", "Выход: ") + outPath, GREEN);
         printColor("========================================", GREEN);
     } else {
         printColor("\n========================================", RED);
-        printColor("[ERROR] Merge failed!", RED);
+        printColor(tr("[ERROR] Merge failed!", "[ОШИБКА] Ошибка объединения!"), RED);
         printColor("========================================", RED);
     }
     waitForKey();
@@ -1790,13 +2350,14 @@ void changeResolution() {
     printColor("========================================", CYAN);
 
     cout << "\n" << tr("Select video file...", "Выберите видеофайл...") << "\n";
-    string inputFile = openFileDialogMedia(L"Select video file");
+    string inputFile = openFileDialogMedia(CURRENT_LANG == LANG_RU ? L"Выберите видеофайл" : L"Select video file");
     if (inputFile.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
-    printColor("\nInput: " + inputFile, GREEN);
+    printColor("\n" + tr("Input: ", "Вход: ") + inputFile, GREEN);
 
     double duration = getMediaDuration(inputFile);
 
-    cout << "\nTarget resolution:\n1) 3840x2160 (4K)\n2) 2560x1440 (2K)\n3) 1920x1080 (FullHD)\n4) 1280x720 (HD)\n5) 854x480\n6) 640x360\n7) Custom\n0) Cancel (ESC)\n\nYour choice: ";
+    cout << "\n" << tr("Target resolution:\n1) 3840x2160 (4K)\n2) 2560x1440 (2K)\n3) 1920x1080 (FullHD)\n4) 1280x720 (HD)\n5) 854x480\n6) 640x360\n7) Custom\n0) Cancel (ESC)\n\nYour choice: ",
+                       "Целевое разрешение:\n1) 3840x2160 (4K)\n2) 2560x1440 (2K)\n3) 1920x1080 (FullHD)\n4) 1280x720 (HD)\n5) 854x480\n6) 640x360\n7) Своё разрешение\n0) Отмена (ESC)\n\nВаш выбор: ");
     char ch = getMenuChoice();
     if (ch == 27 || ch == '0') return;
     cout << ch << endl;
@@ -1811,51 +2372,48 @@ void changeResolution() {
         case '6': scale = "640:360"; break;
         case '7': {
             string w, h;
-            cout << "Width: ";
+            cout << tr("Width: ", "Ширина: ");
             if (!inputLineWithEscape(w, "")) return;
-            cout << "Height: ";
+            cout << tr("Height: ", "Высота: ");
             if (!inputLineWithEscape(h, "")) return;
             scale = w + ":" + h;
             break;
         }
-        default: printColor("[ERROR] Invalid choice!", RED); waitForKey(); return;
+        default: printColor(tr("[ERROR] Invalid choice!", "[ОШИБКА] Неверный выбор!"), RED); waitForKey(); return;
     }
 
-    string outPath = buildOutputPath(inputFile, "_" + scale);
-    // Clean colons from filename
-    for (auto& c2 : outPath) { /* scale is in path only via buildOutputPath suffix */ }
-
-    // Build a safe suffix
     string safeSuffix = "_resized";
-    outPath = buildOutputPath(inputFile, safeSuffix);
+    string outPath = buildOutputPath(inputFile, safeSuffix);
+    auto ft = prepareFFmpegTarget(outPath, {inputFile});
 
-    wstring cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
-    if (HARDWARE_ACCEL) cmd += L" -hwaccel auto";
-    cmd += L" -i \"" + utf8ToWstring(inputFile) + L"\"";
+    wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
+    cmd += utf8ToWstring(getHWAccelArg());
+    cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(inputFile)) + L"\"";
     cmd += L" -vf \"scale=" + utf8ToWstring(scale) + L":flags=lanczos\"";
     cmd += L" " + utf8ToWstring(getVideoCodecArgs());
-    cmd += L" -crf " + utf8ToWstring(CRF_VALUE);
-    cmd += L" -preset " + utf8ToWstring(PRESET);
+    cmd += L" " + utf8ToWstring(getVideoQualityArgs(CRF_VALUE));
+    cmd += L" " + utf8ToWstring(getVideoPresetArgs());
     cmd += L" " + utf8ToWstring(getAudioCodecArgs()) + L" -b:a " + utf8ToWstring(AUDIO_BITRATE) + L"k";
-    if (!OVERWRITE_FILES) cmd += L" -y";
-    cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
+    if (OVERWRITE_FILES) cmd += L" -y";
+    cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" CHANGING RESOLUTION TO " + scale + "...", CYAN);
+    printColor(tr(" CHANGING RESOLUTION TO ", " ИЗМЕНЕНИЕ РАЗРЕШЕНИЯ НА ") + scale + "...", CYAN);
     printColor("========================================", CYAN);
     cout << endl;
 
     bool ok = execFFmpegWithProgress(cmd, duration);
+    ok = finalizeFFmpegTarget(ft, ok);
 
     if (ok) {
         printColor("\n========================================", GREEN);
-        printColor("[OK] Resolution changed successfully!", GREEN);
-        printColor("Output: " + outPath, GREEN);
+        printColor(tr("[OK] Resolution changed successfully!", "[OK] Разрешение успешно изменено!"), GREEN);
+        printColor(tr("Output: ", "Выход: ") + outPath, GREEN);
         printColor("========================================", GREEN);
     } else {
         printColor("\n========================================", RED);
-        printColor("[ERROR] Resolution change failed!", RED);
+        printColor(tr("[ERROR] Resolution change failed!", "[ОШИБКА] Ошибка изменения разрешения!"), RED);
         printColor("========================================", RED);
     }
     waitForKey();
@@ -1865,17 +2423,18 @@ void changeResolution() {
 void changeSpeed() {
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" CHANGE VIDEO SPEED", CYAN);
+    printColor(tr(" CHANGE VIDEO SPEED", " ИЗМЕНЕНИЕ СКОРОСТИ ВИДЕО"), CYAN);
     printColor("========================================", CYAN);
 
-    cout << "\nSelect video file...\n";
-    string inputFile = openFileDialogMedia(L"Select video file");
-    if (inputFile.empty()) { printColor("[INFO] Cancelled", YELLOW); waitForKey(); return; }
-    printColor("\nInput: " + inputFile, GREEN);
+    cout << "\n" << tr("Select video file...\n", "Выберите видеофайл...\n");
+    string inputFile = openFileDialogMedia(CURRENT_LANG == LANG_RU ? L"Выберите видеофайл" : L"Select video file");
+    if (inputFile.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+    printColor("\n" + tr("Input: ", "Вход: ") + inputFile, GREEN);
 
     double duration = getMediaDuration(inputFile);
 
-    cout << "\nSpeed multiplier:\n1) 0.25x (very slow)\n2) 0.5x (slow)\n3) 0.75x\n4) 1.5x\n5) 2x (fast)\n6) 4x (very fast)\n7) Custom\n0) Cancel (ESC)\n\nYour choice: ";
+    cout << "\n" << tr("Speed multiplier:\n1) 0.25x (very slow)\n2) 0.5x (slow)\n3) 0.75x\n4) 1.5x\n5) 2x (fast)\n6) 4x (very fast)\n7) Custom\n0) Cancel (ESC)\n\nYour choice: ",
+                       "Коэффициент скорости:\n1) 0.25x (очень медленно)\n2) 0.5x (медленно)\n3) 0.75x\n4) 1.5x\n5) 2x (быстро)\n6) 4x (очень быстро)\n7) Своя скорость\n0) Отмена (ESC)\n\nВаш выбор: ");
     char ch = getMenuChoice();
     if (ch == 27 || ch == '0') return;
     cout << ch << endl;
@@ -1890,18 +2449,18 @@ void changeSpeed() {
         case '6': speed = 4.0; break;
         case '7': {
             string s;
-            cout << "Enter speed multiplier (e.g. 1.5): ";
+            cout << tr("Enter speed multiplier (e.g. 1.5): ", "Введите коэффициент скорости (например 1.5): ");
             if (!inputLineWithEscape(s, "")) return;
             try { speed = stod(s); } catch (...) {
-                printColor("[ERROR] Invalid number!", RED); waitForKey(); return;
+                printColor(tr("[ERROR] Invalid number!", "[ОШИБКА] Некорректное число!"), RED); waitForKey(); return;
             }
             break;
         }
-        default: printColor("[ERROR] Invalid choice!", RED); waitForKey(); return;
+        default: printColor(tr("[ERROR] Invalid choice!", "[ОШИБКА] Неверный выбор!"), RED); waitForKey(); return;
     }
 
     if (speed <= 0 || speed > 100) {
-        printColor("[ERROR] Speed must be between 0.01 and 100!", RED);
+        printColor(tr("[ERROR] Speed must be between 0.01 and 100!", "[ОШИБКА] Скорость должна быть от 0.01 до 100!"), RED);
         waitForKey();
         return;
     }
@@ -1909,6 +2468,7 @@ void changeSpeed() {
     char speedBuf[32];
     snprintf(speedBuf, sizeof(speedBuf), "%.2f", speed);
     string outPath = buildOutputPath(inputFile, "_speed" + string(speedBuf));
+    auto ft = prepareFFmpegTarget(outPath, {inputFile});
 
     // Video: setpts=PTS/speed, Audio: atempo=speed (atempo only supports 0.5-2.0 range, chain for wider)
     double videoFactor = 1.0 / speed;
@@ -1933,35 +2493,36 @@ void changeSpeed() {
     if (!atempoChain.empty()) atempoChain += ",";
     atempoChain += atBuf;
 
-    wstring cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
-    cmd += L" -i \"" + utf8ToWstring(inputFile) + L"\"";
+    wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
+    cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(inputFile)) + L"\"";
     cmd += L" -vf \"" + utf8ToWstring(string(vfBuf)) + L"\"";
     cmd += L" -af \"" + utf8ToWstring(atempoChain) + L"\"";
     cmd += L" " + utf8ToWstring(getVideoCodecArgs());
-    cmd += L" -crf " + utf8ToWstring(CRF_VALUE);
-    cmd += L" -preset " + utf8ToWstring(PRESET);
+    cmd += L" " + utf8ToWstring(getVideoQualityArgs(CRF_VALUE));
+    cmd += L" " + utf8ToWstring(getVideoPresetArgs());
     cmd += L" " + utf8ToWstring(getAudioCodecArgs()) + L" -b:a " + utf8ToWstring(AUDIO_BITRATE) + L"k";
-    if (!OVERWRITE_FILES) cmd += L" -y";
-    cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
+    if (OVERWRITE_FILES) cmd += L" -y";
+    cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     clearScreen();
     printColor("========================================", CYAN);
     char speedLabel[64];
-    snprintf(speedLabel, sizeof(speedLabel), " CHANGING SPEED TO %.2fx...", speed);
+    snprintf(speedLabel, sizeof(speedLabel), (CURRENT_LANG == LANG_RU) ? " ИЗМЕНЕНИЕ СКОРОСТИ НА %.2fx..." : " CHANGING SPEED TO %.2fx...", speed);
     printColor(speedLabel, CYAN);
     printColor("========================================", CYAN);
     cout << endl;
 
     bool ok = execFFmpegWithProgress(cmd, duration / speed);
+    ok = finalizeFFmpegTarget(ft, ok);
 
     if (ok) {
         printColor("\n========================================", GREEN);
-        printColor("[OK] Speed change completed!", GREEN);
-        printColor("Output: " + outPath, GREEN);
+        printColor(tr("[OK] Speed change completed!", "[OK] Скорость успешно изменена!"), GREEN);
+        printColor(tr("Output: ", "Выход: ") + outPath, GREEN);
         printColor("========================================", GREEN);
     } else {
         printColor("\n========================================", RED);
-        printColor("[ERROR] Speed change failed!", RED);
+        printColor(tr("[ERROR] Speed change failed!", "[ОШИБКА] Ошибка изменения скорости!"), RED);
         printColor("========================================", RED);
     }
     waitForKey();
@@ -1971,22 +2532,23 @@ void changeSpeed() {
 void addWatermark() {
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" ADD WATERMARK / OVERLAY", CYAN);
+    printColor(tr(" ADD WATERMARK / OVERLAY", " ДОБАВЛЕНИЕ ВОДЯНОГО ЗНАКА"), CYAN);
     printColor("========================================", CYAN);
 
-    cout << "\nSelect video file...\n";
-    string inputFile = openFileDialogMedia(L"Select video file");
-    if (inputFile.empty()) { printColor("[INFO] Cancelled", YELLOW); waitForKey(); return; }
-    printColor("Video: " + inputFile, GREEN);
+    cout << "\n" << tr("Select video file...\n", "Выберите видеофайл...\n");
+    string inputFile = openFileDialogMedia(CURRENT_LANG == LANG_RU ? L"Выберите видеофайл" : L"Select video file");
+    if (inputFile.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+    printColor(tr("Video: ", "Видео: ") + inputFile, GREEN);
 
-    cout << "\nSelect watermark image (PNG recommended)...\n";
-    string wmFile = openFileDialogMedia(L"Select watermark image");
-    if (wmFile.empty()) { printColor("[INFO] Cancelled", YELLOW); waitForKey(); return; }
-    printColor("Watermark: " + wmFile, GREEN);
+    cout << "\n" << tr("Select watermark image (PNG recommended)...\n", "Выберите изображение водяного знака (рекомендуется PNG)...\n");
+    string wmFile = openFileDialogMedia(CURRENT_LANG == LANG_RU ? L"Выберите изображение водяного знака" : L"Select watermark image");
+    if (wmFile.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+    printColor(tr("Watermark: ", "Водяной знак: ") + wmFile, GREEN);
 
     double duration = getMediaDuration(inputFile);
 
-    cout << "\nWatermark position:\n1) Top-left\n2) Top-right\n3) Bottom-left\n4) Bottom-right\n5) Center\n0) Cancel (ESC)\n\nYour choice: ";
+    cout << "\n" << tr("Watermark position:\n1) Top-left\n2) Top-right\n3) Bottom-left\n4) Bottom-right\n5) Center\n0) Cancel (ESC)\n\nYour choice: ",
+                       "Позиция водяного знака:\n1) Вверху слева\n2) Вверху справа\n3) Внизу слева\n4) Внизу справа\n5) По центру\n0) Отмена (ESC)\n\nВаш выбор: ");
     char ch = getMenuChoice();
     if (ch == 27 || ch == '0') return;
     cout << ch << endl;
@@ -1998,38 +2560,40 @@ void addWatermark() {
         case '3': overlay = "overlay=10:H-h-10"; break;
         case '4': overlay = "overlay=W-w-10:H-h-10"; break;
         case '5': overlay = "overlay=(W-w)/2:(H-h)/2"; break;
-        default: printColor("[ERROR] Invalid choice!", RED); waitForKey(); return;
+        default: printColor(tr("[ERROR] Invalid choice!", "[ОШИБКА] Неверный выбор!"), RED); waitForKey(); return;
     }
 
     string outPath = buildOutputPath(inputFile, "_watermarked");
+    auto ft = prepareFFmpegTarget(outPath, {inputFile, wmFile});
 
-    wstring cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
-    cmd += L" -i \"" + utf8ToWstring(inputFile) + L"\"";
-    cmd += L" -i \"" + utf8ToWstring(wmFile) + L"\"";
+    wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
+    cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(inputFile)) + L"\"";
+    cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(wmFile)) + L"\"";
     cmd += L" -filter_complex \"" + utf8ToWstring(overlay) + L"\"";
     cmd += L" " + utf8ToWstring(getVideoCodecArgs());
-    cmd += L" -crf " + utf8ToWstring(CRF_VALUE);
-    cmd += L" -preset " + utf8ToWstring(PRESET);
+    cmd += L" " + utf8ToWstring(getVideoQualityArgs(CRF_VALUE));
+    cmd += L" " + utf8ToWstring(getVideoPresetArgs());
     cmd += L" " + utf8ToWstring(getAudioCodecArgs()) + L" -b:a " + utf8ToWstring(AUDIO_BITRATE) + L"k";
-    if (!OVERWRITE_FILES) cmd += L" -y";
-    cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
+    if (OVERWRITE_FILES) cmd += L" -y";
+    cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" ADDING WATERMARK...", CYAN);
+    printColor(tr(" ADDING WATERMARK...", " ДОБАВЛЕНИЕ ВОДЯНОГО ЗНАКА..."), CYAN);
     printColor("========================================", CYAN);
     cout << endl;
 
     bool ok = execFFmpegWithProgress(cmd, duration);
+    ok = finalizeFFmpegTarget(ft, ok);
 
     if (ok) {
         printColor("\n========================================", GREEN);
-        printColor("[OK] Watermark added successfully!", GREEN);
-        printColor("Output: " + outPath, GREEN);
+        printColor(tr("[OK] Watermark added successfully!", "[OK] Водяной знак успешно добавлен!"), GREEN);
+        printColor(tr("Output: ", "Выход: ") + outPath, GREEN);
         printColor("========================================", GREEN);
     } else {
         printColor("\n========================================", RED);
-        printColor("[ERROR] Watermark failed!", RED);
+        printColor(tr("[ERROR] Watermark failed!", "[ОШИБКА] Ошибка добавления водяного знака!"), RED);
         printColor("========================================", RED);
     }
     waitForKey();
@@ -2044,13 +2608,14 @@ void compressVideo() {
     printColor("========================================", CYAN);
 
     cout << "\n" << tr("Select video file...", "Выберите видеофайл...") << "\n";
-    string inputFile = openFileDialogMedia(L"Select video file to compress");
+    string inputFile = openFileDialogMedia(CURRENT_LANG == LANG_RU ? L"Выберите видеофайл для сжатия" : L"Select video file to compress");
     if (inputFile.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
-    printColor("\nInput: " + inputFile, GREEN);
+    printColor("\n" + tr("Input: ", "Вход: ") + inputFile, GREEN);
 
     double duration = getMediaDuration(inputFile);
 
-    cout << "\nCompression level:\n1) Light (CRF 20 - high quality, larger file)\n2) Medium (CRF 26 - balanced)\n3) Heavy (CRF 32 - smaller file, lower quality)\n4) Extreme (CRF 38 - minimum size)\n5) Custom CRF\n0) Cancel (ESC)\n\nYour choice: ";
+    cout << "\n" << tr("Compression level:\n1) Light (CRF 20 - high quality, larger file)\n2) Medium (CRF 26 - balanced)\n3) Heavy (CRF 32 - smaller file, lower quality)\n4) Extreme (CRF 38 - minimum size)\n5) Custom CRF\n0) Cancel (ESC)\n\nYour choice: ",
+                       "Степень сжатия:\n1) Легкое (CRF 20 - высокое качество, больший размер)\n2) Среднее (CRF 26 - баланс)\n3) Сильное (CRF 32 - меньший размер, ниже качество)\n4) Максимальное (CRF 38 - минимальный размер)\n5) Свой CRF\n0) Отмена (ESC)\n\nВаш выбор: ");
     char ch = getMenuChoice();
     if (ch == 27 || ch == '0') return;
     cout << ch << endl;
@@ -2063,53 +2628,57 @@ void compressVideo() {
         case '4': crf = "38"; break;
         case '5': {
             string s;
-            cout << "Enter CRF value (0-51, lower = better quality): ";
+            cout << tr("Enter CRF value (0-51, lower = better quality): ", "Введите значение CRF (0-51, меньше = лучше качество): ");
             if (!inputLineWithEscape(s, "")) return;
             crf = s;
             break;
         }
-        default: printColor("[ERROR] Invalid choice!", RED); waitForKey(); return;
+        default: printColor(tr("[ERROR] Invalid choice!", "[ОШИБКА] Неверный выбор!"), RED); waitForKey(); return;
     }
 
-    string outPath = buildOutputPath(inputFile, "_compressed");
+    std::error_code inSizeEc;
+    auto inSize = fs::file_size(fs::u8path(inputFile), inSizeEc);
 
-    wstring cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
-    if (HARDWARE_ACCEL) cmd += L" -hwaccel auto";
-    cmd += L" -i \"" + utf8ToWstring(inputFile) + L"\"";
+    string outPath = buildOutputPath(inputFile, "_compressed");
+    auto ft = prepareFFmpegTarget(outPath, {inputFile});
+
+    wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
+    cmd += utf8ToWstring(getHWAccelArg(true));
+    cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(inputFile)) + L"\"";
     cmd += L" " + utf8ToWstring(getVideoCodecArgs());
-    cmd += L" -crf " + utf8ToWstring(crf);
-    cmd += L" -preset slower";  // Use slower preset for better compression
+    cmd += L" " + utf8ToWstring(getVideoQualityArgs(crf));
+    cmd += L" " + utf8ToWstring(getVideoPresetArgs("slower"));
     cmd += L" " + utf8ToWstring(getAudioCodecArgs()) + L" -b:a 128k";
-    if (!OVERWRITE_FILES) cmd += L" -y";
-    cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
+    if (OVERWRITE_FILES) cmd += L" -y";
+    cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" COMPRESSING (CRF " + crf + ")...", CYAN);
+    printColor(tr(" COMPRESSING (CRF ", " СЖАТИЕ (CRF ") + crf + ")...", CYAN);
     printColor("========================================", CYAN);
     cout << endl;
 
     bool ok = execFFmpegWithProgress(cmd, duration);
+    ok = finalizeFFmpegTarget(ft, ok);
 
     if (ok) {
         // Show size comparison
         std::error_code ec;
-        auto inSize = fs::file_size(fs::u8path(inputFile), ec);
         auto outSize = fs::file_size(fs::u8path(outPath), ec);
         if (inSize > 0 && outSize > 0) {
             double ratio = (1.0 - (double)outSize / (double)inSize) * 100.0;
             char buf[128];
-            snprintf(buf, sizeof(buf), "Size: %.2f MB -> %.2f MB (%.1f%% smaller)",
+            snprintf(buf, sizeof(buf), (CURRENT_LANG == LANG_RU) ? "Размер: %.2f МБ -> %.2f МБ (на %.1f%% меньше)" : "Size: %.2f MB -> %.2f MB (%.1f%% smaller)",
                 (double)inSize / (1024.0*1024.0), (double)outSize / (1024.0*1024.0), ratio);
             printColor(string(buf), GREEN);
         }
         printColor("\n========================================", GREEN);
-        printColor("[OK] Compression completed!", GREEN);
-        printColor("Output: " + outPath, GREEN);
+        printColor(tr("[OK] Compression completed!", "[OK] Сжатие успешно завершено!"), GREEN);
+        printColor(tr("Output: ", "Выход: ") + outPath, GREEN);
         printColor("========================================", GREEN);
     } else {
         printColor("\n========================================", RED);
-        printColor("[ERROR] Compression failed!", RED);
+        printColor(tr("[ERROR] Compression failed!", "[ОШИБКА] Ошибка сжатия!"), RED);
         printColor("========================================", RED);
     }
     waitForKey();
@@ -2119,17 +2688,18 @@ void compressVideo() {
 void rotateVideo() {
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" ROTATE / FLIP VIDEO", CYAN);
+    printColor(tr(" ROTATE / FLIP VIDEO", " ПОВОРОТ / ОТРАЖЕНИЕ ВИДЕО"), CYAN);
     printColor("========================================", CYAN);
 
-    cout << "\nSelect video file...\n";
-    string inputFile = openFileDialogMedia(L"Select video file");
-    if (inputFile.empty()) { printColor("[INFO] Cancelled", YELLOW); waitForKey(); return; }
-    printColor("\nInput: " + inputFile, GREEN);
+    cout << "\n" << tr("Select video file...\n", "Выберите видеофайл...\n");
+    string inputFile = openFileDialogMedia(CURRENT_LANG == LANG_RU ? L"Выберите видеофайл" : L"Select video file");
+    if (inputFile.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+    printColor("\n" + tr("Input: ", "Вход: ") + inputFile, GREEN);
 
     double duration = getMediaDuration(inputFile);
 
-    cout << "\nTransform:\n1) Rotate 90 clockwise\n2) Rotate 90 counter-clockwise\n3) Rotate 180\n4) Flip horizontal (mirror)\n5) Flip vertical\n0) Cancel (ESC)\n\nYour choice: ";
+    cout << "\n" << tr("Transform:\n1) Rotate 90 clockwise\n2) Rotate 90 counter-clockwise\n3) Rotate 180\n4) Flip horizontal (mirror)\n5) Flip vertical\n0) Cancel (ESC)\n\nYour choice: ",
+                       "Преобразование:\n1) Повернуть на 90 по часовой стрелке\n2) Повернуть на 90 против часовой стрелки\n3) Повернуть на 180\n4) Отразить по горизонтали (зеркало)\n5) Отразить по вертикали\n0) Отмена (ESC)\n\nВаш выбор: ");
     char ch = getMenuChoice();
     if (ch == 27 || ch == '0') return;
     cout << ch << endl;
@@ -2141,37 +2711,39 @@ void rotateVideo() {
         case '3': vf = "transpose=1,transpose=1"; suffix = "_rot180"; break;
         case '4': vf = "hflip"; suffix = "_hflip"; break;
         case '5': vf = "vflip"; suffix = "_vflip"; break;
-        default: printColor("[ERROR] Invalid choice!", RED); waitForKey(); return;
+        default: printColor(tr("[ERROR] Invalid choice!", "[ОШИБКА] Неверный выбор!"), RED); waitForKey(); return;
     }
 
     string outPath = buildOutputPath(inputFile, suffix);
+    auto ft = prepareFFmpegTarget(outPath, {inputFile});
 
-    wstring cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
-    cmd += L" -i \"" + utf8ToWstring(inputFile) + L"\"";
+    wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
+    cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(inputFile)) + L"\"";
     cmd += L" -vf \"" + utf8ToWstring(vf) + L"\"";
     cmd += L" " + utf8ToWstring(getVideoCodecArgs());
-    cmd += L" -crf " + utf8ToWstring(CRF_VALUE);
-    cmd += L" -preset " + utf8ToWstring(PRESET);
+    cmd += L" " + utf8ToWstring(getVideoQualityArgs(CRF_VALUE));
+    cmd += L" " + utf8ToWstring(getVideoPresetArgs());
     cmd += L" " + utf8ToWstring(getAudioCodecArgs()) + L" -b:a " + utf8ToWstring(AUDIO_BITRATE) + L"k";
-    if (!OVERWRITE_FILES) cmd += L" -y";
-    cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
+    if (OVERWRITE_FILES) cmd += L" -y";
+    cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" TRANSFORMING VIDEO...", CYAN);
+    printColor(tr(" TRANSFORMING VIDEO...", " ПРЕОБРАЗОВАНИЕ ВИДЕО..."), CYAN);
     printColor("========================================", CYAN);
     cout << endl;
 
     bool ok = execFFmpegWithProgress(cmd, duration);
+    ok = finalizeFFmpegTarget(ft, ok);
 
     if (ok) {
         printColor("\n========================================", GREEN);
-        printColor("[OK] Transform completed!", GREEN);
-        printColor("Output: " + outPath, GREEN);
+        printColor(tr("[OK] Transform completed!", "[OK] Преобразование завершено!"), GREEN);
+        printColor(tr("Output: ", "Выход: ") + outPath, GREEN);
         printColor("========================================", GREEN);
     } else {
         printColor("\n========================================", RED);
-        printColor("[ERROR] Transform failed!", RED);
+        printColor(tr("[ERROR] Transform failed!", "[ОШИБКА] Ошибка преобразования!"), RED);
         printColor("========================================", RED);
     }
     waitForKey();
@@ -2181,75 +2753,76 @@ void rotateVideo() {
 void createGif() {
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" CREATE GIF FROM VIDEO", CYAN);
+    printColor(tr(" CREATE GIF FROM VIDEO", " СОЗДАНИЕ GIF ИЗ ВИДЕО"), CYAN);
     printColor("========================================", CYAN);
 
-    cout << "\nSelect video file...\n";
-    string inputFile = openFileDialogMedia(L"Select video file");
-    if (inputFile.empty()) { printColor("[INFO] Cancelled", YELLOW); waitForKey(); return; }
-    printColor("\nInput: " + inputFile, GREEN);
+    cout << "\n" << tr("Select video file...\n", "Выберите видеофайл...\n");
+    string inputFile = openFileDialogMedia(CURRENT_LANG == LANG_RU ? L"Выберите видеофайл" : L"Select video file");
+    if (inputFile.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+    printColor("\n" + tr("Input: ", "Вход: ") + inputFile, GREEN);
 
     double duration = getMediaDuration(inputFile);
     if (duration > 0) {
         int m = (int)(duration / 60), s = (int)duration % 60;
         char buf[64];
-        snprintf(buf, sizeof(buf), "Duration: %02d:%02d (%.1f sec)", m, s, duration);
+        snprintf(buf, sizeof(buf), (CURRENT_LANG == LANG_RU) ? "Длительность: %02d:%02d (%.1f сек)" : "Duration: %02d:%02d (%.1f sec)", m, s, duration);
         printColor(string(buf), CYAN);
     }
 
     string startTime, gifDuration;
-    cout << "\nStart time (HH:MM:SS or seconds, Enter=start):\n";
+    cout << "\n" << tr("Start time (HH:MM:SS or seconds, Enter=start):\n", "Время начала (ЧЧ:ММ:СС или секунды, Enter=с начала):\n");
     if (!inputLineWithEscape(startTime, "> ")) { startTime = "0"; }
     if (startTime.empty()) startTime = "0";
-    cout << "Duration in seconds (Enter=5):\n";
+    cout << tr("Duration in seconds (Enter=5):\n", "Длительность в секундах (Enter=5):\n");
     if (!inputLineWithEscape(gifDuration, "> ")) { gifDuration = "5"; }
     if (gifDuration.empty()) gifDuration = "5";
 
-    cout << "\nGIF width (Enter=480):\n";
+    cout << "\n" << tr("GIF width (Enter=480):\n", "Ширина GIF (Enter=480):\n");
     string gifWidth;
     if (!inputLineWithEscape(gifWidth, "> ")) { gifWidth = "480"; }
     if (gifWidth.empty()) gifWidth = "480";
 
-    cout << "\nFPS (Enter=15):\n";
+    cout << "\n" << tr("FPS (Enter=15):\n", "FPS (Enter=15):\n");
     string gifFps;
     if (!inputLineWithEscape(gifFps, "> ")) { gifFps = "15"; }
     if (gifFps.empty()) gifFps = "15";
 
-    fs::path inPath = fs::u8path(inputFile);
-    string outPath = OUTPUT_PATH + inPath.stem().u8string() + ".gif";
+    string outPath = buildOutputPath(inputFile, "", "gif");
+    auto ft = prepareFFmpegTarget(outPath, {inputFile});
 
     // Two-pass GIF creation for good quality
     string palettePath = OUTPUT_PATH + "palette_tmp.png";
 
     // Pass 1: Generate palette
-    wstring cmd1 = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
+    wstring cmd1 = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
     cmd1 += L" -ss " + utf8ToWstring(startTime);
     cmd1 += L" -t " + utf8ToWstring(gifDuration);
-    cmd1 += L" -i \"" + utf8ToWstring(inputFile) + L"\"";
+    cmd1 += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(inputFile)) + L"\"";
     cmd1 += L" -vf \"fps=" + utf8ToWstring(gifFps) + L",scale=" + utf8ToWstring(gifWidth) + L":-1:flags=lanczos,palettegen\"";
-    cmd1 += L" -y \"" + utf8ToWstring(palettePath) + L"\"";
+    cmd1 += L" -y \"" + utf8ToWstring(getSafeFFmpegPath(palettePath)) + L"\"";
 
     // Pass 2: Create GIF with palette
-    wstring cmd2 = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
+    wstring cmd2 = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
     cmd2 += L" -ss " + utf8ToWstring(startTime);
     cmd2 += L" -t " + utf8ToWstring(gifDuration);
-    cmd2 += L" -i \"" + utf8ToWstring(inputFile) + L"\"";
-    cmd2 += L" -i \"" + utf8ToWstring(palettePath) + L"\"";
+    cmd2 += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(inputFile)) + L"\"";
+    cmd2 += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(palettePath)) + L"\"";
     cmd2 += L" -filter_complex \"fps=" + utf8ToWstring(gifFps) + L",scale=" + utf8ToWstring(gifWidth) + L":-1:flags=lanczos[x];[x][1:v]paletteuse\"";
-    cmd2 += L" -y \"" + utf8ToWstring(outPath) + L"\"";
+    cmd2 += L" -y \"" + utf8ToWstring(getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" CREATING GIF...", CYAN);
+    printColor(tr(" CREATING GIF...", " СОЗДАНИЕ GIF..."), CYAN);
     printColor("========================================", CYAN);
 
-    printColor("\nPass 1: Generating palette...", CYAN);
+    printColor("\n" + tr("Pass 1: Generating palette...", "Проход 1: Генерация палитры..."), CYAN);
     bool ok = execFFmpegWithProgress(cmd1, 0);
 
     if (ok) {
-        printColor("\nPass 2: Creating GIF...", CYAN);
+        printColor("\n" + tr("Pass 2: Creating GIF...", "Проход 2: Создание GIF..."), CYAN);
         ok = execFFmpegWithProgress(cmd2, 0);
     }
+    ok = finalizeFFmpegTarget(ft, ok);
 
     // Cleanup palette
     std::error_code ec;
@@ -2257,12 +2830,12 @@ void createGif() {
 
     if (ok) {
         printColor("\n========================================", GREEN);
-        printColor("[OK] GIF created successfully!", GREEN);
-        printColor("Output: " + outPath, GREEN);
+        printColor(tr("[OK] GIF created successfully!", "[OK] GIF успешно создан!"), GREEN);
+        printColor(tr("Output: ", "Выход: ") + outPath, GREEN);
         printColor("========================================", GREEN);
     } else {
         printColor("\n========================================", RED);
-        printColor("[ERROR] GIF creation failed!", RED);
+        printColor(tr("[ERROR] GIF creation failed!", "[ОШИБКА] Ошибка создания GIF!"), RED);
         printColor("========================================", RED);
     }
     waitForKey();
@@ -2272,24 +2845,24 @@ void createGif() {
 void concatenateFiles() {
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" CONCATENATE (JOIN) FILES", CYAN);
+    printColor(tr(" CONCATENATE (JOIN) FILES", " СКЛЕИВАНИЕ (ОБЪЕДИНЕНИЕ) ФАЙЛОВ"), CYAN);
     printColor("========================================", CYAN);
 
     vector<string> files;
-    cout << "\nAdd files one by one. Press ESC when done.\n";
+    cout << "\n" << tr("Add files one by one. Press ESC when done.\n", "Добавляйте файлы по одному. Нажмите ESC по завершении.\n");
 
     int fileNum = 1;
     while (true) {
-        cout << "\nSelect file #" << fileNum << " (ESC to finish)...\n";
-        string f = openFileDialogMedia(L"Select file to add");
+        cout << "\n" << tr("Select file #", "Выберите файл #") << fileNum << tr(" (ESC to finish)...\n", " (ESC для завершения)...\n");
+        string f = openFileDialogMedia(CURRENT_LANG == LANG_RU ? L"Выберите файл для добавления" : L"Select file to add");
         if (f.empty()) break;
         files.push_back(f);
-        printColor("Added: " + f, GREEN);
+        printColor(tr("Added: ", "Добавлен: ") + f, GREEN);
         fileNum++;
     }
 
     if (files.size() < 2) {
-        printColor("[ERROR] Need at least 2 files to concatenate!", RED);
+        printColor(tr("[ERROR] Need at least 2 files to concatenate!", "[ОШИБКА] Требуется минимум 2 файла для склеивания!"), RED);
         waitForKey();
         return;
     }
@@ -2315,20 +2888,22 @@ void concatenateFiles() {
     for (const auto& f : files) totalDuration += getMediaDuration(f);
 
     string outPath = buildOutputPath(files[0], "_joined");
+    auto ft = prepareFFmpegTarget(outPath, files);
 
-    wstring cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
-    cmd += L" -f concat -safe 0 -i \"" + utf8ToWstring(listPath) + L"\"";
+    wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
+    cmd += L" -f concat -safe 0 -i \"" + utf8ToWstring(getSafeFFmpegPath(listPath)) + L"\"";
     cmd += L" -c copy";
-    if (!OVERWRITE_FILES) cmd += L" -y";
-    cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
+    if (OVERWRITE_FILES) cmd += L" -y";
+    cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" CONCATENATING " + to_string(files.size()) + " FILES...", CYAN);
+    printColor(tr(" CONCATENATING ", " СКЛЕИВАНИЕ ") + to_string(files.size()) + tr(" FILES...", " ФАЙЛОВ..."), CYAN);
     printColor("========================================", CYAN);
     cout << endl;
 
     bool ok = execFFmpegWithProgress(cmd, totalDuration);
+    ok = finalizeFFmpegTarget(ft, ok);
 
     // Cleanup
     std::error_code ec;
@@ -2336,12 +2911,12 @@ void concatenateFiles() {
 
     if (ok) {
         printColor("\n========================================", GREEN);
-        printColor("[OK] Concatenation completed!", GREEN);
-        printColor("Output: " + outPath, GREEN);
+        printColor(tr("[OK] Concatenation completed!", "[OK] Склеивание успешно завершено!"), GREEN);
+        printColor(tr("Output: ", "Выход: ") + outPath, GREEN);
         printColor("========================================", GREEN);
     } else {
         printColor("\n========================================", RED);
-        printColor("[ERROR] Concatenation failed!", RED);
+        printColor(tr("[ERROR] Concatenation failed!", "[ОШИБКА] Ошибка склеивания!"), RED);
         printColor("========================================", RED);
     }
     waitForKey();
@@ -2351,39 +2926,41 @@ void concatenateFiles() {
 void stripAudio() {
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" STRIP AUDIO (REMOVE SOUND)", CYAN);
+    printColor(tr(" STRIP AUDIO (REMOVE SOUND)", " УДАЛЕНИЕ ЗВУКА ИЗ ВИДЕО"), CYAN);
     printColor("========================================", CYAN);
 
-    cout << "\nSelect video file...\n";
-    string inputFile = openFileDialogMedia(L"Select video file");
-    if (inputFile.empty()) { printColor("[INFO] Cancelled", YELLOW); waitForKey(); return; }
-    printColor("\nInput: " + inputFile, GREEN);
+    cout << "\n" << tr("Select video file...\n", "Выберите видеофайл...\n");
+    string inputFile = openFileDialogMedia(CURRENT_LANG == LANG_RU ? L"Выберите видеофайл" : L"Select video file");
+    if (inputFile.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+    printColor("\n" + tr("Input: ", "Вход: ") + inputFile, GREEN);
 
     double duration = getMediaDuration(inputFile);
     string outPath = buildOutputPath(inputFile, "_nosound");
+    auto ft = prepareFFmpegTarget(outPath, {inputFile});
 
-    wstring cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
-    cmd += L" -i \"" + utf8ToWstring(inputFile) + L"\"";
+    wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
+    cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(inputFile)) + L"\"";
     cmd += L" -c:v copy -an";  // Copy video, no audio
-    if (!OVERWRITE_FILES) cmd += L" -y";
-    cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
+    if (OVERWRITE_FILES) cmd += L" -y";
+    cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" STRIPPING AUDIO...", CYAN);
+    printColor(tr(" STRIPPING AUDIO...", " УДАЛЕНИЕ ЗВУКА..."), CYAN);
     printColor("========================================", CYAN);
     cout << endl;
 
     bool ok = execFFmpegWithProgress(cmd, duration);
+    ok = finalizeFFmpegTarget(ft, ok);
 
     if (ok) {
         printColor("\n========================================", GREEN);
-        printColor("[OK] Audio stripped successfully!", GREEN);
-        printColor("Output: " + outPath, GREEN);
+        printColor(tr("[OK] Audio stripped successfully!", "[OK] Звук успешно удален!"), GREEN);
+        printColor(tr("Output: ", "Выход: ") + outPath, GREEN);
         printColor("========================================", GREEN);
     } else {
         printColor("\n========================================", RED);
-        printColor("[ERROR] Strip audio failed!", RED);
+        printColor(tr("[ERROR] Strip audio failed!", "[ОШИБКА] Ошибка удаления звука!"), RED);
         printColor("========================================", RED);
     }
     waitForKey();
@@ -2393,33 +2970,33 @@ void stripAudio() {
 void showFileInfo() {
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" MEDIA FILE INFORMATION", CYAN);
+    printColor(tr(" MEDIA FILE INFORMATION", " ИНФОРМАЦИЯ О МЕДИАФАЙЛЕ"), CYAN);
     printColor("========================================", CYAN);
 
-    cout << "\nSelect media file...\n";
-    string inputFile = openFileDialogMedia(L"Select media file");
-    if (inputFile.empty()) { printColor("[INFO] Cancelled", YELLOW); waitForKey(); return; }
+    cout << "\n" << tr("Select media file...\n", "Выберите медиафайл...\n");
+    string inputFile = openFileDialogMedia(CURRENT_LANG == LANG_RU ? L"Выберите медиафайл" : L"Select media file");
+    if (inputFile.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
 
-    printColor("\nFile: " + inputFile, GREEN);
+    printColor("\n" + tr("File: ", "Файл: ") + inputFile, GREEN);
 
     // File size
     std::error_code ec;
     auto fsize = fs::file_size(fs::u8path(inputFile), ec);
     if (!ec) {
         char buf[64];
-        if (fsize > 1024ULL * 1024 * 1024) snprintf(buf, sizeof(buf), "Size: %.2f GB", (double)fsize / (1024.0*1024.0*1024.0));
-        else if (fsize > 1024 * 1024) snprintf(buf, sizeof(buf), "Size: %.2f MB", (double)fsize / (1024.0*1024.0));
-        else snprintf(buf, sizeof(buf), "Size: %.2f KB", (double)fsize / 1024.0);
+        if (fsize > 1024ULL * 1024 * 1024) snprintf(buf, sizeof(buf), (CURRENT_LANG == LANG_RU) ? "Размер: %.2f ГБ" : "Size: %.2f GB", (double)fsize / (1024.0*1024.0*1024.0));
+        else if (fsize > 1024 * 1024) snprintf(buf, sizeof(buf), (CURRENT_LANG == LANG_RU) ? "Размер: %.2f МБ" : "Size: %.2f MB", (double)fsize / (1024.0*1024.0));
+        else snprintf(buf, sizeof(buf), (CURRENT_LANG == LANG_RU) ? "Размер: %.2f КБ" : "Size: %.2f KB", (double)fsize / 1024.0);
         printColor(string(buf), WHITE);
     }
 
     string info = getMediaInfo(inputFile);
     if (!info.empty()) {
-        printColor("\n--- Detailed Info ---", CYAN);
+        printColor("\n" + tr("--- Detailed Info ---", "--- Подробная информация ---"), CYAN);
         cout << formatMediaInfoDisplay(info);
         printColor("---------------------", CYAN);
     } else {
-        printColor("[WARNING] Could not retrieve media info", YELLOW);
+        printColor(tr("[WARNING] Could not retrieve media info", "[ВНИМАНИЕ] Не удалось получить информацию о медиа"), YELLOW);
     }
 
     waitForKey();
@@ -2429,17 +3006,18 @@ void showFileInfo() {
 void extractFrames() {
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" EXTRACT FRAMES (SCREENSHOTS)", CYAN);
+    printColor(tr(" EXTRACT FRAMES (SCREENSHOTS)", " ИЗВЛЕЧЕНИЕ КАДРОВ (СКРИНШОТЫ)"), CYAN);
     printColor("========================================", CYAN);
 
-    cout << "\nSelect video file...\n";
-    string inputFile = openFileDialogMedia(L"Select video file");
-    if (inputFile.empty()) { printColor("[INFO] Cancelled", YELLOW); waitForKey(); return; }
-    printColor("\nInput: " + inputFile, GREEN);
+    cout << "\n" << tr("Select video file...\n", "Выберите видеофайл...\n");
+    string inputFile = openFileDialogMedia(CURRENT_LANG == LANG_RU ? L"Выберите видеофайл" : L"Select video file");
+    if (inputFile.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+    printColor("\n" + tr("Input: ", "Вход: ") + inputFile, GREEN);
 
     double duration = getMediaDuration(inputFile);
 
-    cout << "\nExtraction mode:\n1) Single frame at time position\n2) One frame per second\n3) One frame per N seconds\n4) Every Nth frame\n0) Cancel (ESC)\n\nYour choice: ";
+    cout << "\n" << tr("Extraction mode:\n1) Single frame at time position\n2) One frame per second\n3) One frame per N seconds\n4) Every Nth frame\n0) Cancel (ESC)\n\nYour choice: ",
+                       "Режим извлечения:\n1) Один кадр по времени\n2) Один кадр в секунду\n3) Один кадр каждые N секунд\n4) Каждый N-й кадр\n0) Отмена (ESC)\n\nВаш выбор: ");
     char ch = getMenuChoice();
     if (ch == 27 || ch == '0') return;
     cout << ch << endl;
@@ -2449,52 +3027,52 @@ void extractFrames() {
     string framesDir = OUTPUT_PATH + inPath.stem().u8string() + "_frames\\";
     createDirRecursive(framesDir);
 
-    wstring cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
-    cmd += L" -i \"" + utf8ToWstring(inputFile) + L"\"";
+    wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
+    cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(inputFile)) + L"\"";
 
     switch (ch) {
         case '1': {
             string timePos;
-            cout << "Time position (HH:MM:SS or seconds): ";
+            cout << tr("Time position (HH:MM:SS or seconds): ", "Позиция по времени (ЧЧ:ММ:СС или секунды): ");
             if (!inputLineWithEscape(timePos, "")) return;
-            cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
+            cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
             cmd += L" -ss " + utf8ToWstring(timePos);
-            cmd += L" -i \"" + utf8ToWstring(inputFile) + L"\"";
+            cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(inputFile)) + L"\"";
             cmd += L" -vframes 1 -q:v 2";
-            if (!OVERWRITE_FILES) cmd += L" -y";
-            cmd += L" \"" + utf8ToWstring(framesDir + "frame.png") + L"\"";
+            if (OVERWRITE_FILES) cmd += L" -y";
+            cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(framesDir + "frame.png")) + L"\"";
             break;
         }
         case '2': {
             cmd += L" -vf fps=1 -q:v 2";
-            if (!OVERWRITE_FILES) cmd += L" -y";
-            cmd += L" \"" + utf8ToWstring(framesDir + "frame_%04d.png") + L"\"";
+            if (OVERWRITE_FILES) cmd += L" -y";
+            cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(framesDir + "frame_%04d.png")) + L"\"";
             break;
         }
         case '3': {
             string interval;
-            cout << "Interval in seconds: ";
+            cout << tr("Interval in seconds: ", "Интервал в секундах: ");
             if (!inputLineWithEscape(interval, "")) return;
             cmd += L" -vf \"fps=1/" + utf8ToWstring(interval) + L"\" -q:v 2";
-            if (!OVERWRITE_FILES) cmd += L" -y";
-            cmd += L" \"" + utf8ToWstring(framesDir + "frame_%04d.png") + L"\"";
+            if (OVERWRITE_FILES) cmd += L" -y";
+            cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(framesDir + "frame_%04d.png")) + L"\"";
             break;
         }
         case '4': {
             string nth;
-            cout << "Extract every Nth frame (e.g. 30): ";
+            cout << tr("Extract every Nth frame (e.g. 30): ", "Извлекать каждый N-й кадр (напр. 30): ");
             if (!inputLineWithEscape(nth, "")) return;
             cmd += L" -vf \"select=not(mod(n\\," + utf8ToWstring(nth) + L"))\" -vsync vfr -q:v 2";
-            if (!OVERWRITE_FILES) cmd += L" -y";
-            cmd += L" \"" + utf8ToWstring(framesDir + "frame_%04d.png") + L"\"";
+            if (OVERWRITE_FILES) cmd += L" -y";
+            cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(framesDir + "frame_%04d.png")) + L"\"";
             break;
         }
-        default: printColor("[ERROR] Invalid choice!", RED); waitForKey(); return;
+        default: printColor(tr("[ERROR] Invalid choice!", "[ОШИБКА] Неверный выбор!"), RED); waitForKey(); return;
     }
 
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" EXTRACTING FRAMES...", CYAN);
+    printColor(tr(" EXTRACTING FRAMES...", " ИЗВЛЕЧЕНИЕ КАДРОВ..."), CYAN);
     printColor("========================================", CYAN);
     cout << endl;
 
@@ -2502,12 +3080,12 @@ void extractFrames() {
 
     if (ok) {
         printColor("\n========================================", GREEN);
-        printColor("[OK] Frames extracted!", GREEN);
-        printColor("Output folder: " + framesDir, GREEN);
+        printColor(tr("[OK] Frames extracted!", "[OK] Кадры успешно извлечены!"), GREEN);
+        printColor(tr("Output folder: ", "Папка вывода: ") + framesDir, GREEN);
         printColor("========================================", GREEN);
     } else {
         printColor("\n========================================", RED);
-        printColor("[ERROR] Frame extraction failed!", RED);
+        printColor(tr("[ERROR] Frame extraction failed!", "[ОШИБКА] Ошибка извлечения кадров!"), RED);
         printColor("========================================", RED);
     }
     waitForKey();
@@ -2517,32 +3095,35 @@ void extractFrames() {
 void addSubtitles() {
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" ADD SUBTITLES (BURN-IN)", CYAN);
+    printColor(tr(" ADD SUBTITLES (BURN-IN)", " ВШИВАНИЕ СУБТИТРОВ (ХАРДСАБ)"), CYAN);
     printColor("========================================", CYAN);
 
-    cout << "\nSelect video file...\n";
-    string inputFile = openFileDialogMedia(L"Select video file");
-    if (inputFile.empty()) { printColor("[INFO] Cancelled", YELLOW); waitForKey(); return; }
-    printColor("Video: " + inputFile, GREEN);
+    cout << "\n" << tr("Select video file...\n", "Выберите видеофайл...\n");
+    string inputFile = openFileDialogMedia(CURRENT_LANG == LANG_RU ? L"Выберите видеофайл" : L"Select video file");
+    if (inputFile.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+    printColor(tr("Video: ", "Видео: ") + inputFile, GREEN);
 
-    cout << "\nSelect subtitle file (SRT/ASS/SSA)...\n";
+    cout << "\n" << tr("Select subtitle file (SRT/ASS/SSA)...\n", "Выберите файл субтитров (SRT/ASS/SSA)...\n");
     // Use a custom file dialog for subtitles
     OPENFILENAMEW ofn = { 0 };
     wchar_t fn[MAX_PATH] = L"";
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = GetConsoleWindow();
-    ofn.lpstrFilter = L"Subtitle Files\0*.srt;*.ass;*.ssa;*.sub;*.vtt\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFilter = (CURRENT_LANG == LANG_RU) ?
+                      L"Файлы субтитров\0*.srt;*.ass;*.ssa;*.sub;*.vtt\0Все файлы (*.*)\0*.*\0" :
+                      L"Subtitle Files\0*.srt;*.ass;*.ssa;*.sub;*.vtt\0All Files (*.*)\0*.*\0";
     ofn.lpstrFile = fn;
     ofn.nMaxFile = MAX_PATH;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
-    ofn.lpstrTitle = L"Select subtitle file";
+    wstring subTitle = (CURRENT_LANG == LANG_RU) ? L"Выберите файл субтитров" : L"Select subtitle file";
+    ofn.lpstrTitle = subTitle.c_str();
 
     string subFile;
     if (GetOpenFileNameW(&ofn)) {
         subFile = wstringToUtf8(wstring(fn));
     }
-    if (subFile.empty()) { printColor("[INFO] Cancelled", YELLOW); waitForKey(); return; }
-    printColor("Subtitles: " + subFile, GREEN);
+    if (subFile.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+    printColor(tr("Subtitles: ", "Субтитры: ") + subFile, GREEN);
 
     double duration = getMediaDuration(inputFile);
 
@@ -2557,33 +3138,35 @@ void addSubtitles() {
     }
 
     string outPath = buildOutputPath(inputFile, "_subtitled");
+    auto ft = prepareFFmpegTarget(outPath, {inputFile, subFile});
 
-    wstring cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
-    cmd += L" -i \"" + utf8ToWstring(inputFile) + L"\"";
+    wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
+    cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(inputFile)) + L"\"";
     cmd += L" -vf \"subtitles='" + utf8ToWstring(escaped) + L"'\"";
     cmd += L" " + utf8ToWstring(getVideoCodecArgs());
-    cmd += L" -crf " + utf8ToWstring(CRF_VALUE);
-    cmd += L" -preset " + utf8ToWstring(PRESET);
+    cmd += L" " + utf8ToWstring(getVideoQualityArgs(CRF_VALUE));
+    cmd += L" " + utf8ToWstring(getVideoPresetArgs());
     cmd += L" " + utf8ToWstring(getAudioCodecArgs()) + L" -b:a " + utf8ToWstring(AUDIO_BITRATE) + L"k";
-    if (!OVERWRITE_FILES) cmd += L" -y";
-    cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
+    if (OVERWRITE_FILES) cmd += L" -y";
+    cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" BURNING SUBTITLES...", CYAN);
+    printColor(tr(" BURNING SUBTITLES...", " ВШИВАНИЕ СУБТИТРОВ..."), CYAN);
     printColor("========================================", CYAN);
     cout << endl;
 
     bool ok = execFFmpegWithProgress(cmd, duration);
+    ok = finalizeFFmpegTarget(ft, ok);
 
     if (ok) {
         printColor("\n========================================", GREEN);
-        printColor("[OK] Subtitles added successfully!", GREEN);
-        printColor("Output: " + outPath, GREEN);
+        printColor(tr("[OK] Subtitles added successfully!", "[OK] Субтитры успешно добавлены!"), GREEN);
+        printColor(tr("Output: ", "Выход: ") + outPath, GREEN);
         printColor("========================================", GREEN);
     } else {
         printColor("\n========================================", RED);
-        printColor("[ERROR] Adding subtitles failed!", RED);
+        printColor(tr("[ERROR] Adding subtitles failed!", "[ОШИБКА] Ошибка вшивания субтитров!"), RED);
         printColor("========================================", RED);
     }
     waitForKey();
@@ -2591,28 +3174,89 @@ void addSubtitles() {
 
 // ========== SETTINGS MENUS ==========
 void selectOutputFormat() {
-    vector<string> options = {
+    vector<string> formatKeys = {
         "MP4(H.264)", "MP4(H.265/HEVC)", "MP4(AV1)",
         "MKV(H.264)", "MKV(H.265/HEVC)",
-        "WEBM(VP9)", "WEBM(AV1)", "AVI(MPEG4)", "MOV(H.264)",
+        "WEBM(VP9)", "WEBM(AV1)", "MOV(H.264)", "AVI(MPEG4)",
         "MP3", "M4A(AAC)", "WAV", "FLAC", "OGG(Vorbis)"
     };
+
+    vector<string> options = {
+        tr("[Video] MP4 (H.264 / AVC)       - Maximum compatibility",
+           "[Видео] MP4 (H.264 / AVC)       - Максимальная совместимость"),
+        tr("[Video] MP4 (H.265 / HEVC)      - High efficiency (1080p / 4K)",
+           "[Видео] MP4 (H.265 / HEVC)      - Высокая эффективность (1080p / 4K)"),
+        tr("[Video] MP4 (AV1)               - Next-gen best compression",
+           "[Видео] MP4 (AV1)               - Новейшее ультра-сжатие"),
+        tr("[Video] MKV (H.264)             - Universal film container",
+           "[Видео] MKV (H.264)             - Универсальный контейнер для кино"),
+        tr("[Video] MKV (H.265 / HEVC)      - Modern container with HEVC",
+           "[Видео] MKV (H.265 / HEVC)      - Современный контейнер с HEVC"),
+        tr("[Video] WEBM (VP9)              - Web video (YouTube standard)",
+           "[Видео] WEBM (VP9)              - Веб-видео (стандарт YouTube)"),
+        tr("[Video] WEBM (AV1)              - Ultra-efficient web video",
+           "[Видео] WEBM (AV1)              - Ультра-сжатие для веб-видео"),
+        tr("[Video] MOV (H.264)             - Apple QuickTime & editing",
+           "[Видео] MOV (H.264)             - Apple QuickTime и видеомонтаж"),
+        tr("[Video] AVI (MPEG-4)            - Legacy car / DVD players",
+           "[Видео] AVI (MPEG-4)            - Старые DVD-плееры и магнитолы"),
+        tr("[Audio] MP3                     - Universal audio format",
+           "[Аудио] MP3                     - Универсальный аудиоформат"),
+        tr("[Audio] M4A (AAC)               - High quality (Apple / YouTube)",
+           "[Аудио] M4A (AAC)               - Качественный звук (Apple / YouTube)"),
+        tr("[Audio] WAV                     - Uncompressed studio PCM",
+           "[Аудио] WAV                     - Несжатый студийный звук (PCM)"),
+        tr("[Audio] FLAC                    - Lossless compression (100% quality)",
+           "[Аудио] FLAC                    - Сжатие без потерь (100% качество)"),
+        tr("[Audio] OGG (Vorbis)            - Open-source audio format",
+           "[Аудио] OGG (Vorbis)            - Свободный аудиоформат")
+    };
+
+    vector<string> hints = {
+        tr("Maximum compatibility. Plays on all PCs, smartphones, smart TVs, consoles and browsers. Best default choice.",
+           "Максимальная совместимость. Воспроизводится на любых смартфонах, ТВ, плеерах и в браузерах. Рекомендуется по умолчанию."),
+        tr("Modern high-efficiency codec. Files are 30-50% smaller than H.264 with identical visual quality. Best for 1080p, 2K and 4K.",
+           "Современный кодек высокого сжатия. Файлы на 30-50% меньше H.264 при том же качестве. Идеально для 1080p, 2K и 4K."),
+        tr("Next-generation royalty-free codec. Delivers best compression ratio, but takes longer to encode. Supported by modern devices.",
+           "Открытый кодек нового поколения. Максимальное сжатие, но кодируется медленнее. Поддерживается современными устройствами."),
+        tr("Matroska container. Supports multiple audio tracks, embedded subtitles and chapters. Perfect for storing movies and TV series.",
+           "Контейнер Matroska. Поддерживает множество аудиодорожек, встроенные субтитры и главы. Идеально для хранения фильмов."),
+        tr("Matroska container with HEVC codec. Compact file size for heavy movies with multi-track audio and subtitle support.",
+           "Контейнер Matroska с кодеком HEVC. Компактный размер для тяжелых фильмов с поддержкой нескольких дорожек и субтитров."),
+        tr("Google open web video format. Natively supported by all web browsers and YouTube. Good alternative to MP4.",
+           "Открытый формат Google для веб. Нативно поддерживается всеми браузерами и YouTube. Хорошая альтернатива MP4."),
+        tr("Next-gen web format with ultra-compression AV1. Future of internet video and streaming media.",
+           "Новейший веб-формат со сверхвысоким сжатием AV1. Будущее интернет-видео и онлайн-стриминга."),
+        tr("Apple QuickTime container. Native for Apple ecosystem (macOS, iPhone, iPad) and video editors (Final Cut, Premiere, DaVinci).",
+           "Контейнер Apple QuickTime. Родной формат для macOS, iPhone/iPad и видеоредакторов (Final Cut, Premiere, DaVinci)."),
+        tr("Legacy AVI container. Use only if needed for playback on older DVD players, TV sets or car stereos.",
+           "Классический устаревший формат. Используйте только для совместимости со старыми DVD-плеерами и автомагнитолами."),
+        tr("Audio only. World's most popular audio format. Plays on virtually any device, portable speaker or car radio.",
+           "Только звук. Самый популярный в мире аудиоформат. Воспроизводится на любых устройствах, колонках и магнитолах."),
+        tr("Audio only. Advanced Audio Coding. Noticeably better clarity and detail than MP3 at the same bitrate. Standard for Apple & YouTube.",
+           "Только звук. Современный формат AAC. Звучит чище и детальнее, чем MP3 при том же битрейте. Стандарт для Apple и YouTube."),
+        tr("Audio only. Uncompressed PCM audio. Exact bit-for-bit studio master copy without loss, but files are very large.",
+           "Только звук. Несжатый студийный звук (PCM). Точная побитовая копия без потерь, но файлы занимают много места."),
+        tr("Audio only. Lossless audio compression. Cuts file size roughly in half while preserving 100% of the original studio quality.",
+           "Только звук. Сжатие без потерь (Lossless). Уменьшает размер примерно в 2 раза с сохранением 100% студийного качества."),
+        tr("Audio only. Open-source patent-free format Ogg Vorbis with great sound quality. Widely used in games and Linux.",
+           "Только звук. Свободный формат Ogg Vorbis с отличным качеством звучания. Популярен в играх и на Linux.")
+    };
+
     int cur = 0;
-    for (int i = 0; i < (int)options.size(); i++) {
-        if (options[i] == OUTPUT_FORMAT) { cur = i; break; }
+    for (int i = 0; i < (int)formatKeys.size(); i++) {
+        if (formatKeys[i] == OUTPUT_FORMAT) { cur = i; break; }
     }
+
     string desc = tr(
-        "The output container and codec format.\n"
-        "This determines the video codec (H.264, H.265, VP9, AV1)\n"
-        "and audio codec (AAC, MP3, Opus, etc.) used for encoding.\n"
-        "MP4 with H.264 is the most compatible format.",
-        "Формат контейнера и кодека.\n"
-        "Определяет видеокодек (H.264, H.265, VP9, AV1)\n"
-        "и аудиокодек (AAC, MP3, Opus, и т.д.).\n"
-        "MP4 с H.264 — наиболее совместимый формат.");
-    int sel = arrowSelect(tr("OUTPUT FORMAT", "ФОРМАТ ВЫВОДА"), desc, options, cur);
+        "Choose an output container and codec for video or audio processing.\n"
+        "Use arrow keys to navigate and view detailed explanations of each format below.",
+        "Выберите контейнер и кодек для обработки видео или аудио.\n"
+        "Используйте стрелки для навигации и чтения подробного описания каждого формата внизу.");
+
+    int sel = arrowSelect(tr("OUTPUT FORMAT", "ФОРМАТ ВЫВОДА"), desc, options, cur, hints);
     if (sel >= 0) {
-        OUTPUT_FORMAT = options[sel];
+        OUTPUT_FORMAT = formatKeys[sel];
         saveConfig();
         printColor(tr("[OK] Output format set to ", "[OK] Формат установлен: ") + OUTPUT_FORMAT, GREEN);
         waitForKey();
@@ -2814,11 +3458,11 @@ void settingsMenu() {
              << "\n5. " << tr("Encoding preset: [", "Пресет кодирования: [") << PRESET << "]"
              << "\n6. " << tr("CRF value: [", "Значение CRF: [") << CRF_VALUE << "]"
              << "\n7. " << tr("Audio bitrate: [", "Битрейт аудио: [") << AUDIO_BITRATE << " kbps]"
-             << "\n8. " << tr("Hardware acceleration: [", "Аппаратное ускорение: [") << (HARDWARE_ACCEL ? "ON" : "OFF") << "]"
-             << "\n9. " << tr("Add suffixes to files: [", "Добавлять суффиксы в конец файлов: [") << (OVERWRITE_FILES ? "ON" : "OFF") << "]"
+             << "\n8. " << tr("Program acceleration: [", "Программное ускорение: [") << getAccelerationModeName() << "]"
+             << "\n9. " << tr("Add suffixes to files: [", "Добавлять суффиксы в конец файлов: [") << (!OVERWRITE_FILES ? "ON" : "OFF") << "]"
              << "\nm. " << tr("Keep metadata: [", "Сохранять метаданные: [") << (KEEP_METADATA ? "ON" : "OFF") << "]"
-             << "\nv. " << tr("Video codec prompt: [", "Запрос видеокодека: [") << (VIDEO_CODEC_ASK ? tr("Always Ask", "Всегда спрашивать") : tr("Use defaults", "По умолчанию")) << "]"
-             << "\na. " << tr("Audio codec prompt: [", "Запрос аудиокодека: [") << (AUDIO_CODEC_ASK ? tr("Always Ask", "Всегда спрашивать") : tr("Use defaults", "По умолчанию")) << "]"
+             << "\nv. " << tr("Video codec prompt: [", "Запрос видеокодека: [") << (VIDEO_CODEC_ASK ? tr("Always Ask", "Всегда спрашивать") : tr("Always use configured settings", "Всегда как задано моими настройками")) << "]"
+             << "\na. " << tr("Audio codec prompt: [", "Запрос аудиокодека: [") << (AUDIO_CODEC_ASK ? tr("Always Ask", "Всегда спрашивать") : tr("Always use configured settings", "Всегда как задано моими настройками")) << "]"
              << "\nu. " << tr("Update FFmpeg & components", "Обновить FFmpeg")
              << "\n0. " << tr("Return (ESC)", "Назад (ESC)") << "\n\n" << tr("Your choice: ", "Ваш выбор: ");
         char ch = getMenuChoice();
@@ -2848,17 +3492,101 @@ void settingsMenu() {
         case '6': selectCRF(); break;
         case '7': selectAudioBitrate(); break;
         case '8': {
-            vector<string> opts = {"ON", "OFF"};
+            vector<string> opts;
+            vector<AccelMode> modes;
+
+            // 1. Без ускорения (программный libx264)
+            opts.push_back(tr("Software CPU (libx264)", "Программный CPU (libx264)"));
+            modes.push_back(ACCEL_CPU_ONLY);
+
+            int hwCount = (HAS_NVIDIA_DEVICE ? 1 : 0) + (HAS_INTEL_DEVICE ? 1 : 0) + (HAS_AMD_DEVICE ? 1 : 0);
+
+            // 2. Программный + Аппаратный (только если найден хотя бы один GPU)
+            if (hwCount > 0) {
+                opts.push_back(tr("Software + Hardware (CPU Decoding, GPU Encoding)",
+                                  "Программный + Аппаратный (Декодирование CPU, Кодирование GPU)"));
+                modes.push_back(ACCEL_CPU_DEC_GPU_ENC);
+            }
+
+            // 3. Аппаратные варианты (только обнаруженные)
+            if (HAS_NVIDIA_DEVICE) {
+                opts.push_back(tr("Hardware NVIDIA (NVENC)", "Аппаратный NVIDIA (NVENC)"));
+                modes.push_back(ACCEL_NVIDIA);
+            }
+            if (HAS_INTEL_DEVICE) {
+                opts.push_back(tr("Hardware INTEL (QSV)", "Аппаратный INTEL (QSV)"));
+                modes.push_back(ACCEL_INTEL);
+            }
+            if (HAS_AMD_DEVICE) {
+                opts.push_back(tr("Hardware AMD (AMF)", "Аппаратный AMD (AMF)"));
+                modes.push_back(ACCEL_AMD);
+            }
+
+            int curIdx = 0;
+            for (size_t j = 0; j < modes.size(); j++) {
+                if (modes[j] == ACCELERATION_MODE) {
+                    curIdx = (int)j;
+                    break;
+                }
+            }
+
             string desc = tr(
-                "Use GPU hardware acceleration (NVENC, QSV, AMF) for decoding.\n"
-                "Can significantly speed up processing. Disable if compatibility issues occur.",
-                "Использовать аппаратное ускорение GPU (NVENC, QSV, AMF).\n"
-                "Значительно ускоряет обработку. Отключите при проблемах совместимости.");
-            int sel = arrowSelect(tr("HARDWARE ACCELERATION", "АППАРАТНОЕ УСКОРЕНИЕ"), desc, opts, HARDWARE_ACCEL ? 0 : 1);
+                "Select acceleration and encoding method.\n"
+                "Software: CPU-only processing.\n"
+                "Software + Hardware: CPU decoding, GPU encoding.\n"
+                "Hardware: full GPU acceleration where supported.",
+                "Выберите метод ускорения и кодирования.\n"
+                "Программный: обработка только на CPU.\n"
+                "Программный + Аппаратный: декодирование CPU, кодирование GPU.\n"
+                "Аппаратный: полное ускорение на поддерживаемом GPU.");
+
+            int sel = arrowSelect(tr("PROGRAM ACCELERATION", "ПРОГРАММНОЕ УСКОРЕНИЕ"), desc, opts, curIdx);
             if (sel >= 0) {
-                HARDWARE_ACCEL = (sel == 0);
+                AccelMode chosen = modes[sel];
+                if (chosen == ACCEL_CPU_DEC_GPU_ENC) {
+                    // Check if more than one GPU device is present
+                    if (hwCount > 1) {
+                        vector<string> gpuOpts;
+                        vector<AccelMode> gpuModes;
+                        if (HAS_NVIDIA_DEVICE) {
+                            gpuOpts.push_back("NVIDIA (NVENC)");
+                            gpuModes.push_back(ACCEL_NVIDIA);
+                        }
+                        if (HAS_INTEL_DEVICE) {
+                            gpuOpts.push_back("INTEL (QSV)");
+                            gpuModes.push_back(ACCEL_INTEL);
+                        }
+                        if (HAS_AMD_DEVICE) {
+                            gpuOpts.push_back("AMD (AMF)");
+                            gpuModes.push_back(ACCEL_AMD);
+                        }
+
+                        int curGpuIdx = 0;
+                        for (size_t k = 0; k < gpuModes.size(); k++) {
+                            if (gpuModes[k] == HYBRID_GPU_CHOICE) {
+                                curGpuIdx = (int)k;
+                                break;
+                            }
+                        }
+
+                        int selGpu = arrowSelect(
+                            tr("WHAT TO CHOOSE AS GPU?", "ЧТО ВЫБРАТЬ КАК GPU?"),
+                            tr("Select which GPU to use for encoding:", "Выберите, какой GPU использовать для кодирования:"),
+                            gpuOpts,
+                            curGpuIdx
+                        );
+                        if (selGpu >= 0) {
+                            HYBRID_GPU_CHOICE = gpuModes[selGpu];
+                        }
+                    } else {
+                        if (HAS_NVIDIA_DEVICE) HYBRID_GPU_CHOICE = ACCEL_NVIDIA;
+                        else if (HAS_INTEL_DEVICE) HYBRID_GPU_CHOICE = ACCEL_INTEL;
+                        else if (HAS_AMD_DEVICE) HYBRID_GPU_CHOICE = ACCEL_AMD;
+                    }
+                }
+                ACCELERATION_MODE = chosen;
                 saveConfig();
-                printColor(string(tr("[OK] Hardware acceleration ", "[OK] Аппаратное ускорение ")) + (HARDWARE_ACCEL ? "ON" : "OFF"), GREEN);
+                printColor(tr("[OK] Acceleration mode: ", "[OK] Режим ускорения: ") + getAccelerationModeName(), GREEN);
                 waitForKey();
             }
             break;
@@ -2870,11 +3598,11 @@ void settingsMenu() {
                 "When ON, a suffix (_1, _compressed, etc.) is added to protect the original.",
                 "Когда ВЫКЛ, существующие файлы перезаписываются без запроса, удаляя оригинал!\n"
                 "Когда ВКЛ, добавляется суффикс (_1, _compressed, и т.д.) для защиты от перезаписи оригинала!");
-            int sel = arrowSelect(tr("ADD SUFFIXES TO FILES", "ДОБАВЛЯТЬ СУФФИКСЫ В КОНЕЦ ФАЙЛОВ"), desc, opts, OVERWRITE_FILES ? 1 : 0);
+            int sel = arrowSelect(tr("ADD SUFFIXES TO FILES", "ДОБАВЛЯТЬ СУФФИКСЫ В КОНЕЦ ФАЙЛОВ"), desc, opts, (!OVERWRITE_FILES) ? 1 : 0);
             if (sel >= 0) {
-                OVERWRITE_FILES = (sel == 1);
+                OVERWRITE_FILES = (sel == 0); // 0 -> OFF (overwrite), 1 -> ON (do not overwrite, add suffix)
                 saveConfig();
-                printColor(string(tr("[OK] Add suffixes to files ", "[OK] Добавлять суффиксы в конец файлов ")) + (!OVERWRITE_FILES ? "OFF" : "ON"), GREEN);
+                printColor(string(tr("[OK] Add suffixes to files ", "[OK] Добавлять суффиксы в конец файлов ")) + (!OVERWRITE_FILES ? "ON" : "OFF"), GREEN);
                 waitForKey();
             }
             break;
@@ -2896,33 +3624,37 @@ void settingsMenu() {
             break;
         }
         case 'v': {
-            vector<string> opts = {tr("Always Ask", "Всегда спрашивать"), tr("Use defaults", "По умолчанию")};
+            vector<string> opts = {tr("Always Ask", "Всегда спрашивать"), tr("Always use configured settings", "Всегда как задано моими настройками")};
             string desc = tr(
                 "When 'Always Ask' is active, you will be prompted to review\n"
-                "video settings (format, CRF, preset, resolution) before each operation.",
+                "video settings (format, CRF, preset, resolution) before each operation.\n"
+                "When 'Always use configured settings' is selected, your saved preferences are used automatically.",
                 "Когда 'Всегда спрашивать' активно, перед каждой операцией\n"
-                "вам будет предложено проверить настройки видео (формат, CRF, пресет, разрешение).");
+                "вам будет предложено проверить настройки видео (формат, CRF, пресет, разрешение).\n"
+                "Когда выбрано 'Всегда как задано моими настройками', сразу применяются сохранённые параметры.");
             int sel = arrowSelect(tr("VIDEO CODEC PROMPT", "ЗАПРОС ВИДЕОКОДЕКА"), desc, opts, VIDEO_CODEC_ASK ? 0 : 1);
             if (sel >= 0) {
                 VIDEO_CODEC_ASK = (sel == 0);
                 saveConfig();
-                printColor(tr("[OK] Video codec prompt: ", "[OK] Запрос видеокодека: ") + (VIDEO_CODEC_ASK ? tr("Always Ask", "Всегда спрашивать") : tr("Use defaults", "По умолчанию")), GREEN);
+                printColor(tr("[OK] Video codec prompt: ", "[OK] Запрос видеокодека: ") + (VIDEO_CODEC_ASK ? tr("Always Ask", "Всегда спрашивать") : tr("Always use configured settings", "Всегда как задано моими настройками")), GREEN);
                 waitForKey();
             }
             break;
         }
         case 'a': {
-            vector<string> opts = {tr("Always Ask", "Всегда спрашивать"), tr("Use defaults", "По умолчанию")};
+            vector<string> opts = {tr("Always Ask", "Всегда спрашивать"), tr("Always use configured settings", "Всегда как задано моими настройками")};
             string desc = tr(
                 "When 'Always Ask' is active, you will be prompted to review\n"
-                "audio settings (format, bitrate) before each audio operation.",
+                "audio settings (format, bitrate) before each audio operation.\n"
+                "When 'Always use configured settings' is selected, your saved preferences are used automatically.",
                 "Когда 'Всегда спрашивать' активно, перед каждой аудиооперацией\n"
-                "вам будет предложено проверить настройки аудио (формат, битрейт).");
+                "вам будет предложено проверить настройки аудио (формат, битрейт).\n"
+                "Когда выбрано 'Всегда как задано моими настройками', сразу применяются сохранённые параметры.");
             int sel = arrowSelect(tr("AUDIO CODEC PROMPT", "ЗАПРОС АУДИОКОДЕКА"), desc, opts, AUDIO_CODEC_ASK ? 0 : 1);
             if (sel >= 0) {
                 AUDIO_CODEC_ASK = (sel == 0);
                 saveConfig();
-                printColor(tr("[OK] Audio codec prompt: ", "[OK] Запрос аудиокодека: ") + (AUDIO_CODEC_ASK ? tr("Always Ask", "Всегда спрашивать") : tr("Use defaults", "По умолчанию")), GREEN);
+                printColor(tr("[OK] Audio codec prompt: ", "[OK] Запрос аудиокодека: ") + (AUDIO_CODEC_ASK ? tr("Always Ask", "Всегда спрашивать") : tr("Always use configured settings", "Всегда как задано моими настройками")), GREEN);
                 waitForKey();
             }
             break;
@@ -2943,15 +3675,15 @@ bool checkDependencies() {
 
     if (!FFMPEG_FOUND) {
         printColor("========================================", RED);
-        printColor("[ERROR] FFmpeg not found!", RED);
+        printColor(tr("[ERROR] FFmpeg not found!", "[ОШИБКА] FFmpeg не найден!"), RED);
         printColor("========================================", RED);
 
         printColor("\n========================================", CYAN);
-        printColor(" AUTO INSTALLER", CYAN);
+        printColor(tr(" AUTO INSTALLER", " АВТОУСТАНОВЩИК"), CYAN);
         printColor("========================================", CYAN);
 
         while (true) {
-            printColor("\nInstall FFmpeg automatically? (y/n): \n", CYAN, false);
+            printColor("\n" + tr("Install FFmpeg automatically? (y/n): \n", "Установить FFmpeg автоматически? (y/n): \n"), CYAN, false);
 
             char ch = getMenuChoice();
 
@@ -2962,9 +3694,9 @@ bool checkDependencies() {
             else if (ch == 'n' || ch == 'N' || ch == 27) {
                 cout << "n" << endl;
                 printColor("\n========================================", YELLOW);
-                printColor(" [ERROR] FFmpeg is required to run the application!", RED);
-                printColor(" [INFO] Download from: https://github.com/BtbN/FFmpeg-Builds/releases", YELLOW);
-                printColor(" [INFO] Place 'ffmpeg.exe' and 'ffprobe.exe' in: " + CONFIG_PATH, YELLOW);
+                printColor(tr(" [ERROR] FFmpeg is required to run the application!", " [ОШИБКА] FFmpeg необходим для работы программы!"), RED);
+                printColor(tr(" [INFO] Download from: https://github.com/BtbN/FFmpeg-Builds/releases", " [ИНФО] Скачайте с: https://github.com/BtbN/FFmpeg-Builds/releases"), YELLOW);
+                printColor(tr(" [INFO] Place 'ffmpeg.exe' and 'ffprobe.exe' in: ", " [ИНФО] Поместите 'ffmpeg.exe' и 'ffprobe.exe' в: ") + CONFIG_PATH, YELLOW);
                 printColor("========================================", YELLOW);
                 waitForKey();
                 return false;
@@ -2976,10 +3708,10 @@ bool checkDependencies() {
             createDirRecursive(CONFIG_PATH);
         }
 
-        printColor("\n[INFO] Installing FFmpeg (~160MB)...", CYAN);
+        printColor("\n" + tr("[INFO] Installing FFmpeg (~160MB)...", "[ИНФО] Установка FFmpeg (~160MB)..."), CYAN);
         string zipFile = CONFIG_PATH + "ffmpeg.zip";
         if (downloadFile("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip", zipFile, "FFmpeg")) {
-            printComponentProgress("FFmpeg", 100.0, "Extracting components...");
+            printComponentProgress("FFmpeg", 100.0, tr("Extracting components...", "Распаковка компонентов..."));
             if (extractZip(zipFile, CONFIG_PATH)) {
                 organizeExtractedTool("ffmpeg.exe", CONFIG_PATH);
                 FFMPEG_FOUND = fileExists(CONFIG_PATH + "ffmpeg.exe");
@@ -2988,23 +3720,23 @@ bool checkDependencies() {
                     FFMPEG_PATH = CONFIG_PATH + "ffmpeg.exe";
                     FFPROBE_PATH = CONFIG_PATH + "ffprobe.exe";
                     cout << "\n";
-                    printColor("[OK] FFmpeg and FFprobe installed successfully!", GREEN);
+                    printColor(tr("[OK] FFmpeg and FFprobe installed successfully!", "[OK] FFmpeg и FFprobe успешно установлены!"), GREEN);
                 }
                 else {
                     cout << "\n";
-                    printColor("[ERROR] Failed to locate ffmpeg.exe after extraction!", RED);
+                    printColor(tr("[ERROR] Failed to locate ffmpeg.exe after extraction!", "[ОШИБКА] Не удалось найти ffmpeg.exe после распаковки!"), RED);
                 }
             }
             else {
                 cout << "\n";
-                printColor("[ERROR] Failed to extract FFmpeg archive!", RED);
+                printColor(tr("[ERROR] Failed to extract FFmpeg archive!", "[ОШИБКА] Ошибка распаковки архива FFmpeg!"), RED);
             }
 
             std::error_code ec;
             fs::remove(fs::u8path(zipFile), ec);
         }
         else {
-            printColor("[ERROR] Failed to download FFmpeg!", RED);
+            printColor(tr("[ERROR] Failed to download FFmpeg!", "[ОШИБКА] Ошибка загрузки FFmpeg!"), RED);
         }
 
         // Final verification
@@ -3012,12 +3744,12 @@ bool checkDependencies() {
         FFPROBE_FOUND = fileExists(FFPROBE_PATH);
 
         if (FFMPEG_FOUND) {
-            printColor("\n[OK] Dependencies check completed!", GREEN);
+            printColor("\n" + tr("[OK] Dependencies check completed!", "[OK] Проверка зависимостей завершена!"), GREEN);
             Sleep(1000);
             return true;
         }
         else {
-            printColor("\n[ERROR] FFmpeg is missing and could not be installed!", RED);
+            printColor("\n" + tr("[ERROR] FFmpeg is missing and could not be installed!", "[ОШИБКА] FFmpeg отсутствует и не может быть установлен!"), RED);
             waitForKey();
             return false;
         }
@@ -3030,11 +3762,50 @@ bool checkDependencies() {
 void displayMenu() {
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" MR CLI FOR FFMPEG v1.1.0", CYAN);
+    printColor(" MR CLI FOR FFMPEG v1.1.1", CYAN);
     printColor("========================================", CYAN);
     printColor("========================================", GREEN);
     printColor(" FFMPEG:  " + string(FFMPEG_FOUND ? tr("[OK] installed", "[OK] установлен") : tr("[ERROR] not found", "[ОШИБКА] не найден")), FFMPEG_FOUND ? GREEN : RED);
     printColor(" FFPROBE: " + string(FFPROBE_FOUND ? tr("[OK] installed", "[OK] установлен") : tr("[WARNING] not installed", "[ВНИМАНИЕ] не установлен")), FFPROBE_FOUND ? GREEN : YELLOW);
+    string hwTag = "";
+    string hwDevice = "";
+    switch (ACCELERATION_MODE) {
+        case ACCEL_CPU_ONLY:
+            hwTag = "[CPU(libx264)]";
+            hwDevice = !DETECTED_CPU_NAME.empty() ? DETECTED_CPU_NAME : "CPU";
+            break;
+        case ACCEL_NVIDIA:
+            hwTag = "[GPU(NVENC)]";
+            hwDevice = !DETECTED_NVIDIA_NAME.empty() ? DETECTED_NVIDIA_NAME : DETECTED_GPU_NAME;
+            break;
+        case ACCEL_INTEL:
+            hwTag = "[GPU(QSV)]";
+            hwDevice = !DETECTED_INTEL_NAME.empty() ? DETECTED_INTEL_NAME : DETECTED_GPU_NAME;
+            break;
+        case ACCEL_AMD:
+            hwTag = "[GPU(AMF)]";
+            hwDevice = !DETECTED_AMD_NAME.empty() ? DETECTED_AMD_NAME : DETECTED_GPU_NAME;
+            break;
+        case ACCEL_CPU_DEC_GPU_ENC: {
+            string sub = (HYBRID_GPU_CHOICE == ACCEL_NVIDIA) ? "NVENC" :
+                         (HYBRID_GPU_CHOICE == ACCEL_INTEL)  ? "QSV" :
+                         (HYBRID_GPU_CHOICE == ACCEL_AMD)    ? "AMF" : "GPU";
+            hwTag = "[CPU+GPU(" + sub + ")]";
+            string gName = (HYBRID_GPU_CHOICE == ACCEL_NVIDIA) ? DETECTED_NVIDIA_NAME :
+                           (HYBRID_GPU_CHOICE == ACCEL_INTEL)  ? DETECTED_INTEL_NAME :
+                           (HYBRID_GPU_CHOICE == ACCEL_AMD)    ? DETECTED_AMD_NAME : DETECTED_GPU_NAME;
+            if (gName.empty()) gName = DETECTED_GPU_NAME;
+            hwDevice = gName;
+            break;
+        }
+        default:
+            hwTag = "[CPU(libx264)]";
+            hwDevice = !DETECTED_CPU_NAME.empty() ? DETECTED_CPU_NAME : "CPU";
+            break;
+    }
+    string hwLine = " " + tr("Hardware: ", "Железо: ") + hwTag;
+    if (!hwDevice.empty()) hwLine += " (" + hwDevice + ")";
+    printColor(hwLine, (ACCELERATION_MODE == ACCEL_CPU_ONLY) ? WHITE : GREEN);
     printColor("========================================", GREEN);
     cout << "========================================\n"
          << "--- " << tr("VIDEO OPERATIONS", "ВИДЕО ОПЕРАЦИИ") << " ---\n"
@@ -3091,12 +3862,15 @@ int main() {
         if (!dirExists(OUTPUT_PATH)) createDirRecursive(OUTPUT_PATH);
     }
 
+    initDefaultLanguage();
     loadConfig();
 
     if (!checkDependencies()) {
         CoUninitialize();
         return 1;
     }
+
+    detectGPU();
 
     while (true) {
         displayMenu();

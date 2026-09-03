@@ -1,10 +1,14 @@
-# MR CLI FOR FFMPEG v1.0.0
+# MR CLI FOR FFMPEG 
 
-**Консольный интерфейс для редактирования и конвертирования видео на базе FFmpeg**
+> **Language:** Русский · [English](README.en.md)
 
 ## 📋 Описание
 
 MR CLI FOR FFMPEG — это удобная консольная программа-обёртка над FFmpeg, предоставляющая интуитивное меню для выполнения разнообразных операций с видео и аудио файлами без необходимости запоминать сложные команды FFmpeg.
+
+[![Version](https://img.shields.io/badge/version-1.1.1-green.svg)]()
+[![Platform](https://img.shields.io/badge/platform-Windows-green.svg)]()
+[![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 
 ## ✨ Возможности
 

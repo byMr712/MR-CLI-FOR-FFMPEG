@@ -1,4 +1,4 @@
-# MR CLI FOR FFMPEG v1.0.0
+# MR CLI FOR FFMPEG
 
 > **Language:** English · [Русский](README.md)
 
