@@ -37,8 +37,14 @@ string WATERMARK_PATH = "";
 string WATERMARK_POSITION = "bottom-right";
 bool FFMPEG_FOUND = false, FFPROBE_FOUND = false;
 bool OVERWRITE_FILES = true;
-bool HARDWARE_ACCEL = false;
+bool HARDWARE_ACCEL = true;
 bool KEEP_METADATA = true;
+bool VIDEO_CODEC_ASK = true;
+bool AUDIO_CODEC_ASK = true;
+
+// ========== LANGUAGE ==========
+enum Language { LANG_EN = 0, LANG_RU = 1 };
+Language CURRENT_LANG = LANG_EN;
 
 // ========== UTF-8 HELPERS ==========
 string wstringToUtf8(const wstring& wstr) {
@@ -74,6 +80,51 @@ void printColor(const string& t, int c = WHITE, bool nl = true) {
     if (nl) cout << endl;
 }
 
+// ========== BILINGUAL KEYBOARD MAPPING (QWERTY ↔ ЙЦУКЕН) ==========
+char normalizeKeyToEnglish(wint_t wc) {
+    if (wc < 128) return (char)wc;
+    switch (wc) {
+        case 0x0439: case 0x0419: return 'q';  // й Й
+        case 0x0446: case 0x0426: return 'w';  // ц Ц
+        case 0x0443: case 0x0423: return 'e';  // у У
+        case 0x043A: case 0x041A: return 'r';  // к К
+        case 0x0435: case 0x0415: return 't';  // е Е
+        case 0x043D: case 0x041D: return 'y';  // н Н
+        case 0x0433: case 0x0413: return 'u';  // г Г
+        case 0x0448: case 0x0428: return 'i';  // ш Ш
+        case 0x0449: case 0x0429: return 'o';  // щ Щ
+        case 0x0437: case 0x0417: return 'p';  // з З
+        case 0x0445: case 0x0425: return '[';  // х Х
+        case 0x044A: case 0x042A: return ']';  // ъ Ъ
+        case 0x0444: case 0x0424: return 'a';  // ф Ф
+        case 0x044B: case 0x042B: return 's';  // ы Ы
+        case 0x0432: case 0x0412: return 'd';  // в В
+        case 0x0430: case 0x0410: return 'f';  // а А
+        case 0x043F: case 0x041F: return 'g';  // п П
+        case 0x0440: case 0x0420: return 'h';  // р Р
+        case 0x043E: case 0x041E: return 'j';  // о О
+        case 0x043B: case 0x041B: return 'k';  // л Л
+        case 0x0434: case 0x0414: return 'l';  // д Д
+        case 0x0436: case 0x0416: return ';';  // ж Ж
+        case 0x044D: case 0x042D: return '\''; // э Э
+        case 0x044F: case 0x042F: return 'z';  // я Я
+        case 0x0447: case 0x0427: return 'x';  // ч Ч
+        case 0x0441: case 0x0421: return 'c';  // с С
+        case 0x043C: case 0x041C: return 'v';  // м М
+        case 0x0438: case 0x0418: return 'b';  // и И
+        case 0x0442: case 0x0422: return 'n';  // т Т
+        case 0x044C: case 0x042C: return 'm';  // ь Ь
+        case 0x0431: case 0x0411: return ',';  // б Б
+        case 0x044E: case 0x042E: return '.';  // ю Ю
+        default: return (char)(wc & 0xFF);
+    }
+}
+
+// ========== LOCALIZATION ==========
+string tr(const string& en, const string& ru) {
+    return (CURRENT_LANG == LANG_RU) ? ru : en;
+}
+
 // ========== CONSOLE & SCREEN HELPERS ==========
 void setUTF8() {
     SetConsoleCP(CP_UTF8);
@@ -86,7 +137,7 @@ void setUTF8() {
         dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
         SetConsoleMode(hOut, dwMode);
     }
-    SetConsoleTitleW(L"MR CLI FOR FFMPEG v1.0.0");
+    SetConsoleTitleW(L"MR CLI FOR FFMPEG v1.1.0");
 }
 
 void clearScreen() {
@@ -109,7 +160,7 @@ void clearScreen() {
 }
 
 void waitForKey() {
-    cout << "\nPress any key...";
+    cout << "\n" << tr("Press any key...", "Нажмите любую клавишу...") << flush;
     (void)_getch();
     while (_kbhit()) (void)_getch();
     cout << "\n";
@@ -119,8 +170,13 @@ char getMenuChoice() {
     while (_kbhit()) {
         (void)_getch();
     }
-    char c = _getch();
-    if (c == 27) return 27; // ESC
+    wint_t wc = _getwch();
+    if (wc == 27) return 27; // ESC
+    if (wc == 0 || wc == 0xE0) {
+        (void)_getwch(); // consume extended scan code
+        return 0;
+    }
+    char c = normalizeKeyToEnglish(wc);
     if (c >= 'A' && c <= 'Z') {
         c += 32;
     }
@@ -763,23 +819,35 @@ bool execFFmpegWithProgress(const wstring& cmdLine, double totalDuration = 0) {
 }
 
 // ========== DIALOGS ==========
-string openFolderDialog() {
-    BROWSEINFOW bi = { 0 };
-    bi.lpszTitle = L"Select folder";
-    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+string openFolderDialog(const wchar_t* title = L"Select folder") {
+    IFileDialog* pfd = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(&pfd));
+    if (FAILED(hr)) return "";
 
-    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
-    if (!pidl) return "";
+    DWORD dwOptions;
+    pfd->GetOptions(&dwOptions);
+    pfd->SetOptions(dwOptions | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+    pfd->SetTitle(title);
 
-    wchar_t p[MAX_PATH];
-    if (SHGetPathFromIDListW(pidl, p)) {
-        CoTaskMemFree(pidl);
-        wstring wp(p);
-        if (wp.back() != L'\\' && wp.back() != L'/') wp += L'\\';
-        return wstringToUtf8(wp);
-    }
-    CoTaskMemFree(pidl);
-    return "";
+    hr = pfd->Show(nullptr);
+    if (FAILED(hr)) { pfd->Release(); return ""; }
+
+    IShellItem* psi = nullptr;
+    hr = pfd->GetResult(&psi);
+    if (FAILED(hr)) { pfd->Release(); return ""; }
+
+    wchar_t* pPath = nullptr;
+    hr = psi->GetDisplayName(SIGDN_FILESYSPATH, &pPath);
+    psi->Release();
+    pfd->Release();
+
+    if (FAILED(hr) || !pPath) return "";
+
+    wstring result(pPath);
+    CoTaskMemFree(pPath);
+    if (result.back() != L'\\' && result.back() != L'/') result += L'\\';
+    return wstringToUtf8(result);
 }
 
 string openFileDialogMedia(const wchar_t* title = L"Select media file") {
@@ -823,9 +891,12 @@ void saveConfig() {
       << "VIDEO_BITRATE=" << VIDEO_BITRATE << "\n"
       << "CRF_VALUE=" << CRF_VALUE << "\n"
       << "PRESET=" << PRESET << "\n"
-      << "OVERWRITE_FILES=" << (OVERWRITE_FILES ? "true" : "false") << "\n"
+      << "OVERWRITE_FILES=" << (!OVERWRITE_FILES ? "true" : "false") << "\n"
       << "HARDWARE_ACCEL=" << (HARDWARE_ACCEL ? "true" : "false") << "\n"
       << "KEEP_METADATA=" << (KEEP_METADATA ? "true" : "false") << "\n"
+      << "VIDEO_CODEC_ASK=" << (VIDEO_CODEC_ASK ? "true" : "false") << "\n"
+      << "AUDIO_CODEC_ASK=" << (AUDIO_CODEC_ASK ? "true" : "false") << "\n"
+      << "LANGUAGE=" << (CURRENT_LANG == LANG_RU ? "ru" : "en") << "\n"
       << "WATERMARK_PATH=" << WATERMARK_PATH << "\n"
       << "WATERMARK_POSITION=" << WATERMARK_POSITION << "\n";
     f.close();
@@ -853,9 +924,12 @@ void loadConfig() {
                 else if (l.find("VIDEO_BITRATE=") == 0) VIDEO_BITRATE = l.substr(14);
                 else if (l.find("CRF_VALUE=") == 0) CRF_VALUE = l.substr(10);
                 else if (l.find("PRESET=") == 0) PRESET = l.substr(7);
-                else if (l.find("OVERWRITE_FILES=") == 0) OVERWRITE_FILES = (l.substr(16) == "true");
+                else if (l.find("OVERWRITE_FILES=") == 0) OVERWRITE_FILES = (l.substr(16) != "true");
                 else if (l.find("HARDWARE_ACCEL=") == 0) HARDWARE_ACCEL = (l.substr(15) == "true");
                 else if (l.find("KEEP_METADATA=") == 0) KEEP_METADATA = (l.substr(14) == "true");
+                else if (l.find("VIDEO_CODEC_ASK=") == 0) VIDEO_CODEC_ASK = (l.substr(16) == "true");
+                else if (l.find("AUDIO_CODEC_ASK=") == 0) AUDIO_CODEC_ASK = (l.substr(16) == "true");
+                else if (l.find("LANGUAGE=") == 0) CURRENT_LANG = (l.substr(9) == "ru") ? LANG_RU : LANG_EN;
                 else if (l.find("WATERMARK_PATH=") == 0) WATERMARK_PATH = l.substr(15);
                 else if (l.find("WATERMARK_POSITION=") == 0) WATERMARK_POSITION = l.substr(19);
             }
@@ -922,29 +996,545 @@ string buildOutputPath(const string& inputPath, const string& suffix = "") {
     fs::path inPath = fs::u8path(inputPath);
     string stem = inPath.stem().u8string();
     string ext = getOutputExtension();
-    string outName = stem + suffix + "." + ext;
+    string usedSuffix = OVERWRITE_FILES ? suffix : "";
+    string outName = stem + usedSuffix + "." + ext;
     string outPath = OUTPUT_PATH + outName;
 
-    // Avoid collision
-    int counter = 1;
-    while (fileExists(outPath)) {
-        outPath = OUTPUT_PATH + stem + suffix + "_" + to_string(counter) + "." + ext;
-        counter++;
+    if (OVERWRITE_FILES) {
+        int counter = 1;
+        while (fileExists(outPath)) {
+            outPath = OUTPUT_PATH + stem + usedSuffix + "_" + to_string(counter) + "." + ext;
+            counter++;
+        }
     }
     return outPath;
 }
 
-// ========== OPERATION 1: CONVERT FORMAT ==========
-void convertFormat() {
+// ========== ARROW-KEY SELECTION MENU ==========
+int arrowSelect(const string& title, const string& description, const vector<string>& options, int currentIdx) {
+    int selected = (currentIdx >= 0 && currentIdx < (int)options.size()) ? currentIdx : 0;
+    while (true) {
+        clearScreen();
+        printColor("========================================", CYAN);
+        printColor(" " + title, CYAN);
+        printColor("========================================", CYAN);
+        if (!description.empty()) {
+            cout << "\n" << description << "\n";
+        }
+        cout << "\n";
+        for (int i = 0; i < (int)options.size(); i++) {
+            if (i == selected) {
+                setColor(GREEN);
+                cout << " > " << options[i] << endl;
+                setColor(WHITE);
+            } else {
+                cout << "   " << options[i] << endl;
+            }
+        }
+        cout << "\n" << tr("Arrow keys to select, Enter to confirm, ESC to cancel",
+                           "Стрелки для выбора, Enter для подтверждения, ESC для отмены") << endl;
+        int key = _getch();
+        if (key == 27) return -1;
+        if (key == 13) return selected;
+        if (key == 0 || key == 0xE0) {
+            int scan = _getch();
+            if (scan == 72) selected = (selected > 0) ? selected - 1 : (int)options.size() - 1;
+            else if (scan == 80) selected = (selected < (int)options.size() - 1) ? selected + 1 : 0;
+        }
+    }
+}
+
+// ========== ALWAYS-ASK CODEC PROMPTS ==========
+bool promptVideoCodecSettings() {
+    if (!VIDEO_CODEC_ASK) return true;
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" CONVERT VIDEO/AUDIO FORMAT", CYAN);
+    printColor(tr(" VIDEO CODEC SETTINGS REVIEW", " ПРОВЕРКА НАСТРОЕК ВИДЕОКОДЕКА"), CYAN);
     printColor("========================================", CYAN);
-    cout << "\nSelect input file (or press ESC to cancel)...\n";
+    cout << "\n" << tr("Current video settings:", "Текущие настройки видео:") << "\n"
+         << "  " << tr("Format: ", "Формат: ") << OUTPUT_FORMAT << "\n"
+         << "  " << tr("CRF: ", "CRF: ") << CRF_VALUE << "\n"
+         << "  " << tr("Preset: ", "Пресет: ") << PRESET << "\n"
+         << "  " << tr("Resolution: ", "Разрешение: ") << OUTPUT_RESOLUTION << "\n"
+         << "  " << tr("FPS: ", "FPS: ") << OUTPUT_FPS << "\n"
+         << "  " << tr("Hardware accel: ", "Аппаратное ускорение: ") << (HARDWARE_ACCEL ? "ON" : "OFF") << "\n"
+         << "\n" << tr("Proceed with these settings? [Y/N]: ", "Продолжить с этими настройками? [Y/N]: ");
+    char ch = getMenuChoice();
+    if (ch == 27) return false;
+    if (ch == 'n') {
+        cout << "N\n";
+        printColor(tr("[INFO] Change settings in the Settings menu and try again.",
+                      "[ИНФО] Измените настройки в меню Настроек и повторите."), YELLOW);
+        waitForKey();
+        return false;
+    }
+    cout << "Y\n";
+    return true;
+}
+
+bool promptAudioCodecSettings() {
+    if (!AUDIO_CODEC_ASK) return true;
+    clearScreen();
+    printColor("========================================", CYAN);
+    printColor(tr(" AUDIO CODEC SETTINGS REVIEW", " ПРОВЕРКА НАСТРОЕК АУДИОКОДЕКА"), CYAN);
+    printColor("========================================", CYAN);
+    cout << "\n" << tr("Current audio settings:", "Текущие настройки аудио:") << "\n"
+         << "  " << tr("Format: ", "Формат: ") << OUTPUT_FORMAT << "\n"
+         << "  " << tr("Bitrate: ", "Битрейт: ") << AUDIO_BITRATE << " kbps\n"
+         << "\n" << tr("Proceed with these settings? [Y/N]: ", "Продолжить с этими настройками? [Y/N]: ");
+    char ch = getMenuChoice();
+    if (ch == 27) return false;
+    if (ch == 'n') {
+        cout << "N\n";
+        printColor(tr("[INFO] Change settings in the Settings menu and try again.",
+                      "[ИНФО] Измените настройки в меню Настроек и повторите."), YELLOW);
+        waitForKey();
+        return false;
+    }
+    cout << "Y\n";
+    return true;
+}
+
+// ========== MEDIA PROPERTIES STRUCT (FOR COMPARISON) ==========
+struct MediaProperties {
+    string path;
+    string format;
+    double durationSec = 0;
+    string durationStr;
+    string sizeStr;
+    double sizeBytes = 0;
+    string bitrateStr;
+    double bitrateVal = 0;
+    string videoCodec;
+    string width, height;
+    string fps;
+    string audioCodec;
+    string sampleRate;
+    string channels;
+};
+
+MediaProperties parseMediaProperties(const string& filePath) {
+    MediaProperties mp;
+    mp.path = filePath;
+
+    std::error_code ec;
+    auto fsize = fs::file_size(fs::u8path(filePath), ec);
+    if (!ec) {
+        mp.sizeBytes = (double)fsize;
+        char buf[64];
+        if (fsize > 1024ULL * 1024 * 1024) snprintf(buf, sizeof(buf), "%.2f GB", (double)fsize / (1024.0*1024.0*1024.0));
+        else if (fsize > 1024 * 1024) snprintf(buf, sizeof(buf), "%.2f MB", (double)fsize / (1024.0*1024.0));
+        else snprintf(buf, sizeof(buf), "%.2f KB", (double)fsize / 1024.0);
+        mp.sizeStr = buf;
+    }
+
+    string rawInfo = getMediaInfo(filePath);
+    if (rawInfo.empty()) return mp;
+
+    istringstream iss(rawInfo);
+    string line;
+    bool inStream = false;
+
+    while (getline(iss, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (line == "[STREAM]") { inStream = true; continue; }
+        if (line == "[/STREAM]") { inStream = false; continue; }
+        if (line == "[FORMAT]" || line == "[/FORMAT]") continue;
+
+        size_t eq = line.find('=');
+        if (eq == string::npos) continue;
+        string key = line.substr(0, eq);
+        string val = line.substr(eq + 1);
+
+        if (inStream) {
+            if (key == "codec_name") {
+                if (mp.videoCodec.empty() && mp.width.empty()) mp.videoCodec = val;
+                else if (mp.audioCodec.empty()) mp.audioCodec = val;
+            }
+            else if (key == "codec_type") {
+                if (val == "video" && !mp.videoCodec.empty() && mp.audioCodec.empty()) { /* already set */ }
+                else if (val == "audio") { /* will be set on next codec_name */ }
+            }
+            else if (key == "width" && mp.width.empty()) mp.width = val;
+            else if (key == "height" && mp.height.empty()) mp.height = val;
+            else if (key == "r_frame_rate" && mp.fps.empty()) mp.fps = val;
+            else if (key == "sample_rate" && mp.sampleRate.empty()) mp.sampleRate = val;
+            else if (key == "channels" && mp.channels.empty()) mp.channels = val;
+        } else {
+            if (key == "format_name") mp.format = val;
+            else if (key == "duration") {
+                try {
+                    double dur = stod(val);
+                    mp.durationSec = dur;
+                    int h = (int)(dur / 3600);
+                    int m = (int)((dur - h * 3600) / 60);
+                    int s = (int)(dur) % 60;
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "%02d:%02d:%02d", h, m, s);
+                    mp.durationStr = buf;
+                } catch (...) {}
+            }
+            else if (key == "bit_rate") {
+                try {
+                    double br = stod(val);
+                    mp.bitrateVal = br;
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "%.0f kbps", br / 1000.0);
+                    mp.bitrateStr = buf;
+                } catch (...) {}
+            }
+        }
+    }
+    return mp;
+}
+
+// ========== COMPARE TWO FILES ==========
+void compareFiles() {
+    clearScreen();
+    printColor("========================================", CYAN);
+    printColor(tr(" COMPARE TWO MEDIA FILES", " СРАВНЕНИЕ ДВУХ МЕДИАФАЙЛОВ"), CYAN);
+    printColor("========================================", CYAN);
+
+    cout << "\n" << tr("Select FIRST file...", "Выберите ПЕРВЫЙ файл...") << "\n";
+    string file1 = openFileDialogMedia(CURRENT_LANG == LANG_RU ? L"Выберите первый файл" : L"Select first file");
+    if (file1.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+    printColor(tr("File 1: ", "Файл 1: ") + file1, GREEN);
+
+    cout << "\n" << tr("Select SECOND file...", "Выберите ВТОРОЙ файл...") << "\n";
+    string file2 = openFileDialogMedia(CURRENT_LANG == LANG_RU ? L"Выберите второй файл" : L"Select second file");
+    if (file2.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+    printColor(tr("File 2: ", "Файл 2: ") + file2, GREEN);
+
+    cout << "\n" << tr("Analyzing files...", "Анализ файлов...") << "\n";
+    MediaProperties mp1 = parseMediaProperties(file1);
+    MediaProperties mp2 = parseMediaProperties(file2);
+
+    clearScreen();
+    printColor("========================================", CYAN);
+    printColor(tr(" COMPARISON TABLE", " ТАБЛИЦА СРАВНЕНИЯ"), CYAN);
+    printColor("========================================", CYAN);
+
+    // Column widths
+    string col = "%-14s %-24s %-24s\n";
+    cout << "\n";
+    printf(col.c_str(), "", tr("File 1", "Файл 1").c_str(), tr("File 2", "Файл 2").c_str());
+    printf("%-14s %-24s %-24s\n", "----------", "------------------------", "------------------------");
+
+    auto row = [&](const string& label, const string& v1, const string& v2) {
+        printf("%-14s %-24s %-24s\n", label.c_str(), (v1.empty() ? "N/A" : v1.c_str()), (v2.empty() ? "N/A" : v2.c_str()));
+    };
+
+    row(tr("Format", "Формат"), mp1.format, mp2.format);
+    row(tr("Duration", "Длительность"), mp1.durationStr, mp2.durationStr);
+    string res1 = (!mp1.width.empty() && !mp1.height.empty()) ? mp1.width + "x" + mp1.height : "";
+    string res2 = (!mp2.width.empty() && !mp2.height.empty()) ? mp2.width + "x" + mp2.height : "";
+    row(tr("Resolution", "Разрешение"), res1, res2);
+    row(tr("Video codec", "Видеокодек"), mp1.videoCodec, mp2.videoCodec);
+    row(tr("Audio codec", "Аудиокодек"), mp1.audioCodec, mp2.audioCodec);
+    row(tr("Bitrate", "Битрейт"), mp1.bitrateStr, mp2.bitrateStr);
+    row(tr("Size", "Размер"), mp1.sizeStr, mp2.sizeStr);
+    row(tr("FPS", "FPS"), mp1.fps, mp2.fps);
+    row(tr("Sample rate", "Частота"), mp1.sampleRate.empty() ? "" : mp1.sampleRate + " Hz",
+                                      mp2.sampleRate.empty() ? "" : mp2.sampleRate + " Hz");
+    row(tr("Channels", "Каналы"), mp1.channels, mp2.channels);
+
+    // Differences section
+    cout << "\n";
+    printColor("========================================", YELLOW);
+    printColor(tr(" DIFFERENCES", " РАЗЛИЧИЯ"), YELLOW);
+    printColor("========================================", YELLOW);
+    cout << "\n";
+
+    bool hasDiff = false;
+    auto diff = [&](const string& label, const string& v1, const string& v2, double n1 = 0, double n2 = 0, bool higherBetter = true) {
+        if (v1 == v2 && (v1.empty() || !v1.empty())) {
+            if (v1 == v2) return;
+        }
+        if (v1.empty() && v2.empty()) return;
+        if (v1 == v2) return;
+        hasDiff = true;
+        cout << " " << label << ": ";
+        if (n1 > 0 && n2 > 0) {
+            bool firstBetter = higherBetter ? (n1 >= n2) : (n1 <= n2);
+            setColor(firstBetter ? GREEN : RED);
+            cout << v1;
+            setColor(WHITE);
+            cout << " vs ";
+            setColor(firstBetter ? RED : GREEN);
+            cout << v2;
+            setColor(WHITE);
+        } else {
+            setColor(CYAN);
+            cout << v1;
+            setColor(WHITE);
+            cout << " vs ";
+            setColor(CYAN);
+            cout << v2;
+            setColor(WHITE);
+        }
+        cout << "\n";
+    };
+
+    diff(tr("Format", "Формат"), mp1.format, mp2.format);
+    diff(tr("Duration", "Длительность"), mp1.durationStr, mp2.durationStr, mp1.durationSec, mp2.durationSec, true);
+    diff(tr("Resolution", "Разрешение"), res1, res2);
+    diff(tr("Video codec", "Видеокодек"), mp1.videoCodec, mp2.videoCodec);
+    diff(tr("Audio codec", "Аудиокодек"), mp1.audioCodec, mp2.audioCodec);
+    diff(tr("Bitrate", "Битрейт"), mp1.bitrateStr, mp2.bitrateStr, mp1.bitrateVal, mp2.bitrateVal, true);
+    diff(tr("Size", "Размер"), mp1.sizeStr, mp2.sizeStr, mp1.sizeBytes, mp2.sizeBytes, false);
+    diff(tr("FPS", "FPS"), mp1.fps, mp2.fps);
+    diff(tr("Sample rate", "Частота"), mp1.sampleRate, mp2.sampleRate);
+    diff(tr("Channels", "Каналы"), mp1.channels, mp2.channels);
+
+    if (!hasDiff) {
+        printColor(tr("  No significant differences found.", "  Значительных различий не найдено."), GREEN);
+    }
+
+    waitForKey();
+}
+
+// ========== BATCH VIDEO COMPRESSION ==========
+void batchCompressVideo() {
+    clearScreen();
+    printColor("========================================", CYAN);
+    printColor(tr(" BATCH VIDEO COMPRESSION", " ПАКЕТНОЕ СЖАТИЕ ВИДЕО"), CYAN);
+    printColor("========================================", CYAN);
+
+    cout << "\n" << tr("Select folder with video files...", "Выберите папку с видеофайлами...") << "\n";
+    string folder = openFolderDialog(utf8ToWstring(tr("Select folder with video files", "Выберите папку с видеофайлами")).c_str());
+    if (folder.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+
+    vector<string> videoExts = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".ts", ".m4v"};
+    vector<string> files;
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(fs::u8path(folder), ec)) {
+        if (ec || !entry.is_regular_file(ec)) continue;
+        string ext = entry.path().extension().u8string();
+        transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        for (const auto& ve : videoExts) {
+            if (ext == ve) { files.push_back(entry.path().u8string()); break; }
+        }
+    }
+
+    if (files.empty()) {
+        printColor(tr("[ERROR] No video files found in the selected folder!",
+                      "[ОШИБКА] Видеофайлы в выбранной папке не найдены!"), RED);
+        waitForKey();
+        return;
+    }
+
+    clearScreen();
+    printColor("========================================", CYAN);
+    printColor(tr(" BATCH VIDEO COMPRESSION", " ПАКЕТНОЕ СЖАТИЕ ВИДЕО"), CYAN);
+    printColor("========================================", CYAN);
+
+    cout << "\n" << tr("Found files: ", "Найдено файлов: ") << files.size() << "\n";
+    for (size_t i = 0; i < files.size(); i++) {
+        cout << "  " << (i + 1) << ". " << fs::u8path(files[i]).filename().u8string() << "\n";
+    }
+
+    cout << "\n" << tr("Settings:", "Настройки:") << "\n"
+         << "  " << tr("Format: ", "Формат: ") << OUTPUT_FORMAT << "\n"
+         << "  CRF: " << CRF_VALUE << "\n"
+         << "  " << tr("Preset: ", "Пресет: ") << PRESET << "\n"
+         << "  " << tr("Hardware accel: ", "Аппаратное ускорение: ") << (HARDWARE_ACCEL ? "ON" : "OFF") << "\n";
+
+    cout << "\n" << tr("Would you like to change any settings before proceeding? [Y/N]: ",
+                       "Хотите изменить настройки перед началом? [Y/N]: ");
+    char ch = getMenuChoice();
+    if (ch == 27) return;
+    if (ch == 'y') {
+        cout << "Y\n";
+        printColor(tr("[INFO] Please change settings in the Settings menu and restart batch operation.",
+                      "[ИНФО] Измените настройки в меню Настроек и перезапустите пакетную операцию."), YELLOW);
+        waitForKey();
+        return;
+    }
+    cout << "N\n";
+
+    cout << "\n" << tr("Delete original files after conversion? [Y/N]: ",
+                       "Удалить оригиналы после преобразования? [Y/N]: ");
+    char chDel = getMenuChoice();
+    if (chDel == 27) return;
+    bool deleteOrig = (chDel == 'y');
+    cout << (deleteOrig ? "Y\n" : "N\n");
+
+    int success = 0, fail = 0;
+    for (size_t i = 0; i < files.size(); i++) {
+        cout << "\n";
+        printColor("========================================", CYAN);
+        char label[128];
+        snprintf(label, sizeof(label), " %s %zu / %zu - %s",
+                 tr("Processing", "Обработка").c_str(), i + 1, files.size(),
+                 fs::u8path(files[i]).filename().u8string().c_str());
+        printColor(label, CYAN);
+        printColor("========================================", CYAN);
+
+        double duration = getMediaDuration(files[i]);
+        string outPath = buildOutputPath(files[i], "_compressed");
+
+        wstring cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
+        if (HARDWARE_ACCEL) cmd += L" -hwaccel auto";
+        cmd += L" -i \"" + utf8ToWstring(files[i]) + L"\"";
+        cmd += L" " + utf8ToWstring(getVideoCodecArgs());
+        cmd += L" -crf " + utf8ToWstring(CRF_VALUE);
+        cmd += L" -preset " + utf8ToWstring(PRESET);
+        cmd += L" " + utf8ToWstring(getAudioCodecArgs()) + L" -b:a 128k";
+        if (!OVERWRITE_FILES) cmd += L" -y";
+        cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
+
+        bool ok = execFFmpegWithProgress(cmd, duration);
+        if (ok) {
+            success++;
+            printColor(tr("[OK] Done", "[OK] Готово"), GREEN);
+            if (deleteOrig) {
+                std::error_code dec;
+                fs::remove(fs::u8path(files[i]), dec);
+            }
+        }
+        else { fail++; printColor(tr("[ERROR] Failed", "[ОШИБКА] Не удалось"), RED); }
+    }
+
+    cout << "\n";
+    printColor("========================================", GREEN);
+    char summary[128];
+    snprintf(summary, sizeof(summary), " %s: %d %s, %d %s",
+             tr("Result", "Результат").c_str(), success,
+             tr("success", "успешно").c_str(), fail,
+             tr("failed", "ошибок").c_str());
+    printColor(summary, fail > 0 ? YELLOW : GREEN);
+    printColor("========================================", GREEN);
+    cout << "\n";
+    printColor("========================================", CYAN);
+    printColor(tr(" All files saved to \"", " Все файлы сохранены по пути \"") + OUTPUT_PATH + "\"", CYAN);
+    printColor("========================================", CYAN);
+    waitForKey();
+}
+
+// ========== BATCH AUDIO COMPRESSION ==========
+void batchCompressAudio() {
+    clearScreen();
+    printColor("========================================", CYAN);
+    printColor(tr(" BATCH AUDIO COMPRESSION", " ПАКЕТНОЕ СЖАТИЕ АУДИО"), CYAN);
+    printColor("========================================", CYAN);
+
+    cout << "\n" << tr("Select folder with audio files...", "Выберите папку с аудиофайлами...") << "\n";
+    string folder = openFolderDialog(utf8ToWstring(tr("Select folder with audio files", "Выберите папку с аудиофайлами")).c_str());
+    if (folder.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+
+    vector<string> audioExts = {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".flac", ".opus", ".wma"};
+    vector<string> files;
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(fs::u8path(folder), ec)) {
+        if (ec || !entry.is_regular_file(ec)) continue;
+        string ext = entry.path().extension().u8string();
+        transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        for (const auto& ae : audioExts) {
+            if (ext == ae) { files.push_back(entry.path().u8string()); break; }
+        }
+    }
+
+    if (files.empty()) {
+        printColor(tr("[ERROR] No audio files found in the selected folder!",
+                      "[ОШИБКА] Аудиофайлы в выбранной папке не найдены!"), RED);
+        waitForKey();
+        return;
+    }
+
+    clearScreen();
+    printColor("========================================", CYAN);
+    printColor(tr(" BATCH AUDIO COMPRESSION", " ПАКЕТНОЕ СЖАТИЕ АУДИО"), CYAN);
+    printColor("========================================", CYAN);
+
+    cout << "\n" << tr("Found files: ", "Найдено файлов: ") << files.size() << "\n";
+    for (size_t i = 0; i < files.size(); i++) {
+        cout << "  " << (i + 1) << ". " << fs::u8path(files[i]).filename().u8string() << "\n";
+    }
+
+    cout << "\n" << tr("Settings:", "Настройки:") << "\n"
+         << "  " << tr("Audio bitrate: ", "Битрейт аудио: ") << AUDIO_BITRATE << " kbps\n";
+
+    cout << "\n" << tr("Would you like to change any settings before proceeding? [Y/N]: ",
+                       "Хотите изменить настройки перед началом? [Y/N]: ");
+    char ch = getMenuChoice();
+    if (ch == 27) return;
+    if (ch == 'y') {
+        cout << "Y\n";
+        printColor(tr("[INFO] Please change settings in the Settings menu and restart batch operation.",
+                      "[ИНФО] Измените настройки в меню Настроек и перезапустите пакетную операцию."), YELLOW);
+        waitForKey();
+        return;
+    }
+    cout << "N\n";
+
+    cout << "\n" << tr("Delete original files after conversion? [Y/N]: ",
+                       "Удалить оригиналы после преобразования? [Y/N]: ");
+    char chDel = getMenuChoice();
+    if (chDel == 27) return;
+    bool deleteOrig = (chDel == 'y');
+    cout << (deleteOrig ? "Y\n" : "N\n");
+
+    int success = 0, fail = 0;
+    for (size_t i = 0; i < files.size(); i++) {
+        cout << "\n";
+        printColor("========================================", CYAN);
+        char label[128];
+        snprintf(label, sizeof(label), " %s %zu / %zu - %s",
+                 tr("Processing", "Обработка").c_str(), i + 1, files.size(),
+                 fs::u8path(files[i]).filename().u8string().c_str());
+        printColor(label, CYAN);
+        printColor("========================================", CYAN);
+
+        double duration = getMediaDuration(files[i]);
+        fs::path inPath = fs::u8path(files[i]);
+        string outPath = OUTPUT_PATH + inPath.stem().u8string() + "_compressed.mp3";
+
+        wstring cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
+        cmd += L" -i \"" + utf8ToWstring(files[i]) + L"\"";
+        cmd += L" -c:a libmp3lame -b:a " + utf8ToWstring(AUDIO_BITRATE) + L"k";
+        if (!OVERWRITE_FILES) cmd += L" -y";
+        cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
+
+        bool ok = execFFmpegWithProgress(cmd, duration);
+        if (ok) {
+            success++;
+            printColor(tr("[OK] Done", "[OK] Готово"), GREEN);
+            if (deleteOrig) {
+                std::error_code dec;
+                fs::remove(fs::u8path(files[i]), dec);
+            }
+        }
+        else { fail++; printColor(tr("[ERROR] Failed", "[ОШИБКА] Не удалось"), RED); }
+    }
+
+    cout << "\n";
+    printColor("========================================", GREEN);
+    char summary[128];
+    snprintf(summary, sizeof(summary), " %s: %d %s, %d %s",
+             tr("Result", "Результат").c_str(), success,
+             tr("success", "успешно").c_str(), fail,
+             tr("failed", "ошибок").c_str());
+    printColor(summary, fail > 0 ? YELLOW : GREEN);
+    printColor("========================================", GREEN);
+    cout << "\n";
+    printColor("========================================", CYAN);
+    printColor(tr(" All files saved to \"", " Все файлы сохранены по пути \"") + OUTPUT_PATH + "\"", CYAN);
+    printColor("========================================", CYAN);
+    waitForKey();
+}
+
+// ========== OPERATION 1: CONVERT FORMAT ==========
+void convertFormat() {
+    if (!promptVideoCodecSettings()) return;
+    clearScreen();
+    printColor("========================================", CYAN);
+    printColor(tr(" CONVERT VIDEO/AUDIO FORMAT", " КОНВЕРТАЦИЯ ФОРМАТА"), CYAN);
+    printColor("========================================", CYAN);
+    cout << "\n" << tr("Select input file (or press ESC to cancel)...", "Выберите файл (или нажмите ESC для отмены)...") << "\n";
 
     string inputFile = openFileDialogMedia(L"Select file to convert");
     if (inputFile.empty()) {
-        printColor("[INFO] Cancelled", YELLOW);
+        printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW);
         waitForKey();
         return;
     }
@@ -992,7 +1582,7 @@ void convertFormat() {
         cmd += L" -r " + utf8ToWstring(OUTPUT_FPS);
     }
     if (KEEP_METADATA) cmd += L" -map_metadata 0";
-    if (OVERWRITE_FILES) cmd += L" -y";
+    if (!OVERWRITE_FILES) cmd += L" -y";
     cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
 
     clearScreen();
@@ -1018,11 +1608,12 @@ void convertFormat() {
 
 // ========== OPERATION 2: TRIM / CUT VIDEO ==========
 void trimVideo() {
+    if (!promptVideoCodecSettings()) return;
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" TRIM / CUT VIDEO", CYAN);
+    printColor(tr(" TRIM / CUT VIDEO", " ОБРЕЗКА ВИДЕО"), CYAN);
     printColor("========================================", CYAN);
-    cout << "\nSelect input file...\n";
+    cout << "\n" << tr("Select input file...", "Выберите файл...") << "\n";
 
     string inputFile = openFileDialogMedia(L"Select file to trim");
     if (inputFile.empty()) { printColor("[INFO] Cancelled", YELLOW); waitForKey(); return; }
@@ -1056,7 +1647,7 @@ void trimVideo() {
     cmd += L" -i \"" + utf8ToWstring(inputFile) + L"\"";
     cmd += L" -to " + utf8ToWstring(endTime);
     cmd += L" -c copy";  // Stream copy for speed
-    if (OVERWRITE_FILES) cmd += L" -y";
+    if (!OVERWRITE_FILES) cmd += L" -y";
     cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
 
     clearScreen();
@@ -1083,14 +1674,15 @@ void trimVideo() {
 
 // ========== OPERATION 3: EXTRACT AUDIO ==========
 void extractAudio() {
+    if (!promptAudioCodecSettings()) return;
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" EXTRACT AUDIO FROM VIDEO", CYAN);
+    printColor(tr(" EXTRACT AUDIO FROM VIDEO", " ИЗВЛЕЧЕНИЕ АУДИО ИЗ ВИДЕО"), CYAN);
     printColor("========================================", CYAN);
-    cout << "\nSelect video file...\n";
+    cout << "\n" << tr("Select video file...", "Выберите видеофайл...") << "\n";
 
     string inputFile = openFileDialogMedia(L"Select video to extract audio from");
-    if (inputFile.empty()) { printColor("[INFO] Cancelled", YELLOW); waitForKey(); return; }
+    if (inputFile.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
 
     printColor("\nInput: " + inputFile, GREEN);
     double duration = getMediaDuration(inputFile);
@@ -1116,7 +1708,7 @@ void extractAudio() {
     wstring cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
     cmd += L" -i \"" + utf8ToWstring(inputFile) + L"\"";
     cmd += L" -vn " + utf8ToWstring(codecArgs);
-    if (OVERWRITE_FILES) cmd += L" -y";
+    if (!OVERWRITE_FILES) cmd += L" -y";
     cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
 
     clearScreen();
@@ -1165,7 +1757,7 @@ void mergeVideoAudio() {
     cmd += L" -i \"" + utf8ToWstring(audioFile) + L"\"";
     cmd += L" -c:v copy -c:a aac -b:a " + utf8ToWstring(AUDIO_BITRATE) + L"k";
     cmd += L" -map 0:v:0 -map 1:a:0 -shortest";
-    if (OVERWRITE_FILES) cmd += L" -y";
+    if (!OVERWRITE_FILES) cmd += L" -y";
     cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
 
     clearScreen();
@@ -1191,14 +1783,15 @@ void mergeVideoAudio() {
 
 // ========== OPERATION 5: CHANGE RESOLUTION ==========
 void changeResolution() {
+    if (!promptVideoCodecSettings()) return;
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" CHANGE VIDEO RESOLUTION", CYAN);
+    printColor(tr(" CHANGE VIDEO RESOLUTION", " ИЗМЕНЕНИЕ РАЗРЕШЕНИЯ"), CYAN);
     printColor("========================================", CYAN);
 
-    cout << "\nSelect video file...\n";
+    cout << "\n" << tr("Select video file...", "Выберите видеофайл...") << "\n";
     string inputFile = openFileDialogMedia(L"Select video file");
-    if (inputFile.empty()) { printColor("[INFO] Cancelled", YELLOW); waitForKey(); return; }
+    if (inputFile.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
     printColor("\nInput: " + inputFile, GREEN);
 
     double duration = getMediaDuration(inputFile);
@@ -1244,7 +1837,7 @@ void changeResolution() {
     cmd += L" -crf " + utf8ToWstring(CRF_VALUE);
     cmd += L" -preset " + utf8ToWstring(PRESET);
     cmd += L" " + utf8ToWstring(getAudioCodecArgs()) + L" -b:a " + utf8ToWstring(AUDIO_BITRATE) + L"k";
-    if (OVERWRITE_FILES) cmd += L" -y";
+    if (!OVERWRITE_FILES) cmd += L" -y";
     cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
 
     clearScreen();
@@ -1348,7 +1941,7 @@ void changeSpeed() {
     cmd += L" -crf " + utf8ToWstring(CRF_VALUE);
     cmd += L" -preset " + utf8ToWstring(PRESET);
     cmd += L" " + utf8ToWstring(getAudioCodecArgs()) + L" -b:a " + utf8ToWstring(AUDIO_BITRATE) + L"k";
-    if (OVERWRITE_FILES) cmd += L" -y";
+    if (!OVERWRITE_FILES) cmd += L" -y";
     cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
 
     clearScreen();
@@ -1418,7 +2011,7 @@ void addWatermark() {
     cmd += L" -crf " + utf8ToWstring(CRF_VALUE);
     cmd += L" -preset " + utf8ToWstring(PRESET);
     cmd += L" " + utf8ToWstring(getAudioCodecArgs()) + L" -b:a " + utf8ToWstring(AUDIO_BITRATE) + L"k";
-    if (OVERWRITE_FILES) cmd += L" -y";
+    if (!OVERWRITE_FILES) cmd += L" -y";
     cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
 
     clearScreen();
@@ -1444,14 +2037,15 @@ void addWatermark() {
 
 // ========== OPERATION 8: COMPRESS VIDEO ==========
 void compressVideo() {
+    if (!promptVideoCodecSettings()) return;
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" COMPRESS VIDEO", CYAN);
+    printColor(tr(" COMPRESS VIDEO", " СЖАТИЕ ВИДЕО"), CYAN);
     printColor("========================================", CYAN);
 
-    cout << "\nSelect video file...\n";
+    cout << "\n" << tr("Select video file...", "Выберите видеофайл...") << "\n";
     string inputFile = openFileDialogMedia(L"Select video file to compress");
-    if (inputFile.empty()) { printColor("[INFO] Cancelled", YELLOW); waitForKey(); return; }
+    if (inputFile.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
     printColor("\nInput: " + inputFile, GREEN);
 
     double duration = getMediaDuration(inputFile);
@@ -1486,7 +2080,7 @@ void compressVideo() {
     cmd += L" -crf " + utf8ToWstring(crf);
     cmd += L" -preset slower";  // Use slower preset for better compression
     cmd += L" " + utf8ToWstring(getAudioCodecArgs()) + L" -b:a 128k";
-    if (OVERWRITE_FILES) cmd += L" -y";
+    if (!OVERWRITE_FILES) cmd += L" -y";
     cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
 
     clearScreen();
@@ -1559,7 +2153,7 @@ void rotateVideo() {
     cmd += L" -crf " + utf8ToWstring(CRF_VALUE);
     cmd += L" -preset " + utf8ToWstring(PRESET);
     cmd += L" " + utf8ToWstring(getAudioCodecArgs()) + L" -b:a " + utf8ToWstring(AUDIO_BITRATE) + L"k";
-    if (OVERWRITE_FILES) cmd += L" -y";
+    if (!OVERWRITE_FILES) cmd += L" -y";
     cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
 
     clearScreen();
@@ -1725,7 +2319,7 @@ void concatenateFiles() {
     wstring cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
     cmd += L" -f concat -safe 0 -i \"" + utf8ToWstring(listPath) + L"\"";
     cmd += L" -c copy";
-    if (OVERWRITE_FILES) cmd += L" -y";
+    if (!OVERWRITE_FILES) cmd += L" -y";
     cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
 
     clearScreen();
@@ -1771,7 +2365,7 @@ void stripAudio() {
     wstring cmd = L"\"" + utf8ToWstring(FFMPEG_PATH) + L"\"";
     cmd += L" -i \"" + utf8ToWstring(inputFile) + L"\"";
     cmd += L" -c:v copy -an";  // Copy video, no audio
-    if (OVERWRITE_FILES) cmd += L" -y";
+    if (!OVERWRITE_FILES) cmd += L" -y";
     cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
 
     clearScreen();
@@ -1867,13 +2461,13 @@ void extractFrames() {
             cmd += L" -ss " + utf8ToWstring(timePos);
             cmd += L" -i \"" + utf8ToWstring(inputFile) + L"\"";
             cmd += L" -vframes 1 -q:v 2";
-            if (OVERWRITE_FILES) cmd += L" -y";
+            if (!OVERWRITE_FILES) cmd += L" -y";
             cmd += L" \"" + utf8ToWstring(framesDir + "frame.png") + L"\"";
             break;
         }
         case '2': {
             cmd += L" -vf fps=1 -q:v 2";
-            if (OVERWRITE_FILES) cmd += L" -y";
+            if (!OVERWRITE_FILES) cmd += L" -y";
             cmd += L" \"" + utf8ToWstring(framesDir + "frame_%04d.png") + L"\"";
             break;
         }
@@ -1882,7 +2476,7 @@ void extractFrames() {
             cout << "Interval in seconds: ";
             if (!inputLineWithEscape(interval, "")) return;
             cmd += L" -vf \"fps=1/" + utf8ToWstring(interval) + L"\" -q:v 2";
-            if (OVERWRITE_FILES) cmd += L" -y";
+            if (!OVERWRITE_FILES) cmd += L" -y";
             cmd += L" \"" + utf8ToWstring(framesDir + "frame_%04d.png") + L"\"";
             break;
         }
@@ -1891,7 +2485,7 @@ void extractFrames() {
             cout << "Extract every Nth frame (e.g. 30): ";
             if (!inputLineWithEscape(nth, "")) return;
             cmd += L" -vf \"select=not(mod(n\\," + utf8ToWstring(nth) + L"))\" -vsync vfr -q:v 2";
-            if (OVERWRITE_FILES) cmd += L" -y";
+            if (!OVERWRITE_FILES) cmd += L" -y";
             cmd += L" \"" + utf8ToWstring(framesDir + "frame_%04d.png") + L"\"";
             break;
         }
@@ -1971,7 +2565,7 @@ void addSubtitles() {
     cmd += L" -crf " + utf8ToWstring(CRF_VALUE);
     cmd += L" -preset " + utf8ToWstring(PRESET);
     cmd += L" " + utf8ToWstring(getAudioCodecArgs()) + L" -b:a " + utf8ToWstring(AUDIO_BITRATE) + L"k";
-    if (OVERWRITE_FILES) cmd += L" -y";
+    if (!OVERWRITE_FILES) cmd += L" -y";
     cmd += L" \"" + utf8ToWstring(outPath) + L"\"";
 
     clearScreen();
@@ -1997,207 +2591,174 @@ void addSubtitles() {
 
 // ========== SETTINGS MENUS ==========
 void selectOutputFormat() {
-    clearScreen();
-    printColor("========================================", CYAN);
-    printColor(" SELECT OUTPUT FORMAT", CYAN);
-    printColor("========================================", CYAN);
-    cout << "\n--- Video Formats ---"
-         << "\n1) MP4(H.264)"
-         << "\n2) MP4(H.265/HEVC)"
-         << "\n3) MP4(AV1)"
-         << "\n4) MKV(H.264)"
-         << "\n5) MKV(H.265/HEVC)"
-         << "\n6) WEBM(VP9)"
-         << "\n7) WEBM(AV1)"
-         << "\n8) AVI(MPEG4)"
-         << "\n9) MOV(H.264)"
-         << "\n--- Audio Formats ---"
-         << "\na) MP3"
-         << "\nb) M4A(AAC)"
-         << "\nc) WAV"
-         << "\nd) FLAC"
-         << "\ne) OGG(Vorbis)"
-         << "\n0) Cancel (ESC)\n\nYour choice: ";
-    char ch = getMenuChoice();
-    if (ch == 27 || ch == '0') return;
-    cout << ch << endl;
-
-    switch (ch) {
-        case '1': OUTPUT_FORMAT = "MP4(H.264)"; break;
-        case '2': OUTPUT_FORMAT = "MP4(H.265/HEVC)"; break;
-        case '3': OUTPUT_FORMAT = "MP4(AV1)"; break;
-        case '4': OUTPUT_FORMAT = "MKV(H.264)"; break;
-        case '5': OUTPUT_FORMAT = "MKV(H.265/HEVC)"; break;
-        case '6': OUTPUT_FORMAT = "WEBM(VP9)"; break;
-        case '7': OUTPUT_FORMAT = "WEBM(AV1)"; break;
-        case '8': OUTPUT_FORMAT = "AVI(MPEG4)"; break;
-        case '9': OUTPUT_FORMAT = "MOV(H.264)"; break;
-        case 'a': OUTPUT_FORMAT = "MP3"; break;
-        case 'b': OUTPUT_FORMAT = "M4A(AAC)"; break;
-        case 'c': OUTPUT_FORMAT = "WAV"; break;
-        case 'd': OUTPUT_FORMAT = "FLAC"; break;
-        case 'e': OUTPUT_FORMAT = "OGG(Vorbis)"; break;
-        default: printColor("[ERROR] Invalid choice!", RED); waitForKey(); return;
+    vector<string> options = {
+        "MP4(H.264)", "MP4(H.265/HEVC)", "MP4(AV1)",
+        "MKV(H.264)", "MKV(H.265/HEVC)",
+        "WEBM(VP9)", "WEBM(AV1)", "AVI(MPEG4)", "MOV(H.264)",
+        "MP3", "M4A(AAC)", "WAV", "FLAC", "OGG(Vorbis)"
+    };
+    int cur = 0;
+    for (int i = 0; i < (int)options.size(); i++) {
+        if (options[i] == OUTPUT_FORMAT) { cur = i; break; }
     }
-    saveConfig();
-    printColor("[OK] Output format set to " + OUTPUT_FORMAT, GREEN);
-    waitForKey();
+    string desc = tr(
+        "The output container and codec format.\n"
+        "This determines the video codec (H.264, H.265, VP9, AV1)\n"
+        "and audio codec (AAC, MP3, Opus, etc.) used for encoding.\n"
+        "MP4 with H.264 is the most compatible format.",
+        "Формат контейнера и кодека.\n"
+        "Определяет видеокодек (H.264, H.265, VP9, AV1)\n"
+        "и аудиокодек (AAC, MP3, Opus, и т.д.).\n"
+        "MP4 с H.264 — наиболее совместимый формат.");
+    int sel = arrowSelect(tr("OUTPUT FORMAT", "ФОРМАТ ВЫВОДА"), desc, options, cur);
+    if (sel >= 0) {
+        OUTPUT_FORMAT = options[sel];
+        saveConfig();
+        printColor(tr("[OK] Output format set to ", "[OK] Формат установлен: ") + OUTPUT_FORMAT, GREEN);
+        waitForKey();
+    }
 }
 
 void selectResolution() {
-    clearScreen();
-    printColor("========================================", CYAN);
-    printColor(" SELECT OUTPUT RESOLUTION", CYAN);
-    printColor("========================================", CYAN);
-    cout << "\n1) Original (no change)"
-         << "\n2) 2160p (4K)"
-         << "\n3) 1440p (2K)"
-         << "\n4) 1080p (FullHD)"
-         << "\n5) 720p (HD)"
-         << "\n6) 480p"
-         << "\n7) 360p"
-         << "\n0) Cancel (ESC)\n\nYour choice: ";
-    char ch = getMenuChoice();
-    if (ch == 27 || ch == '0') return;
-    cout << ch << endl;
-    switch (ch) {
-        case '1': OUTPUT_RESOLUTION = "original"; break;
-        case '2': OUTPUT_RESOLUTION = "2160"; break;
-        case '3': OUTPUT_RESOLUTION = "1440"; break;
-        case '4': OUTPUT_RESOLUTION = "1080"; break;
-        case '5': OUTPUT_RESOLUTION = "720"; break;
-        case '6': OUTPUT_RESOLUTION = "480"; break;
-        case '7': OUTPUT_RESOLUTION = "360"; break;
-        default: printColor("[ERROR] Invalid choice!", RED); waitForKey(); return;
+    vector<string> options = {
+        tr("Original (no change)", "Оригинал (без изменений)"),
+        "2160p (4K)", "1440p (2K)", "1080p (FullHD)",
+        "720p (HD)", "480p", "360p"
+    };
+    vector<string> values = {"original", "2160", "1440", "1080", "720", "480", "360"};
+    int cur = 0;
+    for (int i = 0; i < (int)values.size(); i++) {
+        if (values[i] == OUTPUT_RESOLUTION) { cur = i; break; }
     }
-    saveConfig();
-    printColor("[OK] Output resolution set to " + OUTPUT_RESOLUTION, GREEN);
-    waitForKey();
+    string desc = tr(
+        "The output video resolution.\n"
+        "'Original' keeps the source resolution unchanged.\n"
+        "Downscaling reduces file size but lowers visual quality.",
+        "Разрешение выходного видео.\n"
+        "'Оригинал' сохраняет исходное разрешение.\n"
+        "Уменьшение снижает размер файла, но ухудшает качество.");
+    int sel = arrowSelect(tr("RESOLUTION", "РАЗРЕШЕНИЕ"), desc, options, cur);
+    if (sel >= 0) {
+        OUTPUT_RESOLUTION = values[sel];
+        saveConfig();
+        printColor(tr("[OK] Resolution set to ", "[OK] Разрешение: ") + OUTPUT_RESOLUTION, GREEN);
+        waitForKey();
+    }
 }
 
 void selectFPS() {
-    clearScreen();
-    printColor("========================================", CYAN);
-    printColor(" SELECT OUTPUT FPS", CYAN);
-    printColor("========================================", CYAN);
-    cout << "\n1) Original (no change)"
-         << "\n2) 60fps"
-         << "\n3) 30fps"
-         << "\n4) 24fps"
-         << "\n5) 15fps"
-         << "\n0) Cancel (ESC)\n\nYour choice: ";
-    char ch = getMenuChoice();
-    if (ch == 27 || ch == '0') return;
-    cout << ch << endl;
-    switch (ch) {
-        case '1': OUTPUT_FPS = "original"; break;
-        case '2': OUTPUT_FPS = "60"; break;
-        case '3': OUTPUT_FPS = "30"; break;
-        case '4': OUTPUT_FPS = "24"; break;
-        case '5': OUTPUT_FPS = "15"; break;
-        default: printColor("[ERROR] Invalid choice!", RED); waitForKey(); return;
+    vector<string> options = {
+        tr("Original (no change)", "Оригинал (без изменений)"),
+        "60fps", "30fps", "24fps", "15fps"
+    };
+    vector<string> values = {"original", "60", "30", "24", "15"};
+    int cur = 0;
+    for (int i = 0; i < (int)values.size(); i++) {
+        if (values[i] == OUTPUT_FPS) { cur = i; break; }
     }
-    saveConfig();
-    printColor("[OK] FPS set to " + OUTPUT_FPS, GREEN);
-    waitForKey();
+    string desc = tr(
+        "Frames per second. 'Original' keeps the source framerate.\n"
+        "Lower FPS reduces file size.\n"
+        "24fps = cinema, 30fps = TV, 60fps = smooth.",
+        "Кадров в секунду. 'Оригинал' сохраняет исходный FPS.\n"
+        "Меньше FPS — меньше размер файла.\n"
+        "24fps = кино, 30fps = ТВ, 60fps = плавное.");
+    int sel = arrowSelect(tr("FPS", "FPS"), desc, options, cur);
+    if (sel >= 0) {
+        OUTPUT_FPS = values[sel];
+        saveConfig();
+        printColor(tr("[OK] FPS set to ", "[OK] FPS: ") + OUTPUT_FPS, GREEN);
+        waitForKey();
+    }
 }
 
 void selectPreset() {
-    clearScreen();
-    printColor("========================================", CYAN);
-    printColor(" SELECT ENCODING PRESET", CYAN);
-    printColor("========================================", CYAN);
-    cout << "\nFaster presets = larger file, quicker encoding"
-         << "\nSlower presets = smaller file, slower encoding"
-         << "\n\n1) ultrafast"
-         << "\n2) superfast"
-         << "\n3) veryfast"
-         << "\n4) faster"
-         << "\n5) fast"
-         << "\n6) medium (default)"
-         << "\n7) slow"
-         << "\n8) slower"
-         << "\n9) veryslow"
-         << "\n0) Cancel (ESC)\n\nYour choice: ";
-    char ch = getMenuChoice();
-    if (ch == 27 || ch == '0') return;
-    cout << ch << endl;
-    switch (ch) {
-        case '1': PRESET = "ultrafast"; break;
-        case '2': PRESET = "superfast"; break;
-        case '3': PRESET = "veryfast"; break;
-        case '4': PRESET = "faster"; break;
-        case '5': PRESET = "fast"; break;
-        case '6': PRESET = "medium"; break;
-        case '7': PRESET = "slow"; break;
-        case '8': PRESET = "slower"; break;
-        case '9': PRESET = "veryslow"; break;
-        default: printColor("[ERROR] Invalid choice!", RED); waitForKey(); return;
+    vector<string> options = {
+        "ultrafast", "superfast", "veryfast", "faster", "fast",
+        "medium", "slow", "slower", "veryslow"
+    };
+    int cur = 0;
+    for (int i = 0; i < (int)options.size(); i++) {
+        if (options[i] == PRESET) { cur = i; break; }
     }
-    saveConfig();
-    printColor("[OK] Preset set to " + PRESET, GREEN);
-    waitForKey();
+    string desc = tr(
+        "Encoding speed vs compression trade-off.\n"
+        "Faster presets encode quickly but produce larger files.\n"
+        "Slower presets take longer but produce smaller files with same quality.",
+        "Баланс скорости кодирования и сжатия.\n"
+        "Быстрые пресеты кодируют быстрее, но файлы больше.\n"
+        "Медленные пресеты дольше, но файлы меньше при том же качестве.");
+    int sel = arrowSelect(tr("ENCODING PRESET", "ПРЕСЕТ КОДИРОВАНИЯ"), desc, options, cur);
+    if (sel >= 0) {
+        PRESET = options[sel];
+        saveConfig();
+        printColor(tr("[OK] Preset set to ", "[OK] Пресет: ") + PRESET, GREEN);
+        waitForKey();
+    }
 }
 
 void selectCRF() {
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" SELECT CRF VALUE", CYAN);
+    printColor(tr(" CRF VALUE", " ЗНАЧЕНИЕ CRF"), CYAN);
     printColor("========================================", CYAN);
-    cout << "\nCRF (Constant Rate Factor): 0-51"
-         << "\nLower = better quality, larger file"
-         << "\n0 = lossless, 23 = default, 51 = worst"
-         << "\n\nCurrent CRF: " << CRF_VALUE
-         << "\n\nEnter new CRF value (0-51, ESC to cancel): ";
+    cout << "\n" << tr(
+        "CRF (Constant Rate Factor): 0-51\n"
+        "Lower = better quality, larger file\n"
+        "0 = lossless, 18 = visually lossless, 23 = default, 28 = small, 51 = worst",
+        "CRF (Constant Rate Factor): 0-51\n"
+        "Ниже = лучше качество, больше файл\n"
+        "0 = без потерь, 18 = визуально без потерь, 23 = стандарт, 28 = маленький, 51 = худший") << "\n";
+    cout << "\n" << tr("Current CRF: ", "Текущий CRF: ") << CRF_VALUE
+         << "\n\n" << tr("Enter new CRF value (0-51, ESC to cancel): ",
+                         "Введите CRF (0-51, ESC для отмены): ");
     string val;
     if (!inputLineWithEscape(val, "")) return;
     try {
         int v = stoi(val);
-        if (v < 0 || v > 51) { printColor("[ERROR] CRF must be 0-51!", RED); waitForKey(); return; }
+        if (v < 0 || v > 51) { printColor(tr("[ERROR] CRF must be 0-51!", "[ОШИБКА] CRF должен быть 0-51!"), RED); waitForKey(); return; }
         CRF_VALUE = val;
         saveConfig();
-        printColor("[OK] CRF set to " + CRF_VALUE, GREEN);
+        printColor(tr("[OK] CRF set to ", "[OK] CRF: ") + CRF_VALUE, GREEN);
     } catch (...) {
-        printColor("[ERROR] Invalid number!", RED);
+        printColor(tr("[ERROR] Invalid number!", "[ОШИБКА] Неверное число!"), RED);
     }
     waitForKey();
 }
 
 void selectAudioBitrate() {
-    clearScreen();
-    printColor("========================================", CYAN);
-    printColor(" SELECT AUDIO BITRATE", CYAN);
-    printColor("========================================", CYAN);
-    cout << "\n1) 96 kbps"
-         << "\n2) 128 kbps"
-         << "\n3) 192 kbps (default)"
-         << "\n4) 256 kbps"
-         << "\n5) 320 kbps"
-         << "\n0) Cancel (ESC)\n\nYour choice: ";
-    char ch = getMenuChoice();
-    if (ch == 27 || ch == '0') return;
-    cout << ch << endl;
-    switch (ch) {
-        case '1': AUDIO_BITRATE = "96"; break;
-        case '2': AUDIO_BITRATE = "128"; break;
-        case '3': AUDIO_BITRATE = "192"; break;
-        case '4': AUDIO_BITRATE = "256"; break;
-        case '5': AUDIO_BITRATE = "320"; break;
-        default: printColor("[ERROR] Invalid choice!", RED); waitForKey(); return;
+    vector<string> options = {
+        "96 kbps", "128 kbps", "192 kbps", "256 kbps", "320 kbps"
+    };
+    vector<string> values = {"96", "128", "192", "256", "320"};
+    int cur = 0;
+    for (int i = 0; i < (int)values.size(); i++) {
+        if (values[i] == AUDIO_BITRATE) { cur = i; break; }
     }
-    saveConfig();
-    printColor("[OK] Audio bitrate set to " + AUDIO_BITRATE + " kbps", GREEN);
-    waitForKey();
+    string desc = tr(
+        "Audio encoding bitrate in kilobits per second.\n"
+        "Higher values = better quality, larger files.\n"
+        "128kbps = speech, 192kbps = balanced, 320kbps = high quality.",
+        "Битрейт аудиокодирования в кбит/с.\n"
+        "Больше = лучше качество, больше файлы.\n"
+        "128kbps = речь, 192kbps = баланс, 320kbps = высокое качество.");
+    int sel = arrowSelect(tr("AUDIO BITRATE", "БИТРЕЙТ АУДИО"), desc, options, cur);
+    if (sel >= 0) {
+        AUDIO_BITRATE = values[sel];
+        saveConfig();
+        printColor(tr("[OK] Audio bitrate set to ", "[OK] Битрейт аудио: ") + AUDIO_BITRATE + " kbps", GREEN);
+        waitForKey();
+    }
 }
 
 // ========== UPDATE COMPONENTS ==========
 void updateComponentsMenu() {
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" COMPONENT UPDATER", CYAN);
+    printColor(tr(" COMPONENT UPDATER", " ОБНОВЛЕНИЕ КОМПОНЕНТОВ"), CYAN);
     printColor("========================================", CYAN);
-    cout << "\n1. Re-download FFmpeg + FFprobe"
-         << "\n0. Return (ESC)\n\nYour choice: ";
+    cout << "\n1. " << tr("Re-download FFmpeg + FFprobe", "Переустановить FFmpeg + FFprobe")
+         << "\n0. " << tr("Return (ESC)", "Назад (ESC)") << "\n\n" << tr("Your choice: ", "Ваш выбор: ");
     char ch = getMenuChoice();
     if (ch == 27 || ch == '0') {
         return;
@@ -2205,11 +2766,11 @@ void updateComponentsMenu() {
     if (ch == '1') {
         clearScreen();
         printColor("========================================", CYAN);
-        printColor(" Downloading latest FFmpeg (~160MB)...", CYAN);
+        printColor(tr(" Downloading latest FFmpeg (~160MB)...", " Загрузка последней версии FFmpeg (~160МБ)..."), CYAN);
         printColor("========================================", CYAN);
         string zipFile = CONFIG_PATH + "ffmpeg.zip";
         if (downloadFile("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip", zipFile, "FFmpeg")) {
-            printComponentProgress("FFmpeg", 100.0, "Extracting components...");
+            printComponentProgress("FFmpeg", 100.0, tr("Extracting components...", "Извлечение компонентов..."));
             if (extractZip(zipFile, CONFIG_PATH)) {
                 organizeExtractedTool("ffmpeg.exe", CONFIG_PATH);
                 FFMPEG_FOUND = fileExists(CONFIG_PATH + "ffmpeg.exe");
@@ -2218,22 +2779,22 @@ void updateComponentsMenu() {
                     FFMPEG_PATH = CONFIG_PATH + "ffmpeg.exe";
                     FFPROBE_PATH = CONFIG_PATH + "ffprobe.exe";
                     cout << "\n";
-                    printColor("[OK] FFmpeg updated successfully!", GREEN);
+                    printColor(tr("[OK] FFmpeg updated successfully!", "[OK] FFmpeg успешно обновлён!"), GREEN);
                 }
                 else {
                     cout << "\n";
-                    printColor("[ERROR] Failed to locate ffmpeg.exe after extraction!", RED);
+                    printColor(tr("[ERROR] Failed to locate ffmpeg.exe after extraction!", "[ОШИБКА] ffmpeg.exe не найден после извлечения!"), RED);
                 }
             }
             else {
                 cout << "\n";
-                printColor("[ERROR] Failed to extract FFmpeg archive!", RED);
+                printColor(tr("[ERROR] Failed to extract FFmpeg archive!", "[ОШИБКА] Не удалось извлечь архив FFmpeg!"), RED);
             }
             std::error_code ec;
             fs::remove(fs::u8path(zipFile), ec);
         }
         else {
-            printColor("[ERROR] Failed to download FFmpeg!", RED);
+            printColor(tr("[ERROR] Failed to download FFmpeg!", "[ОШИБКА] Не удалось скачать FFmpeg!"), RED);
         }
         waitForKey();
     }
@@ -2244,20 +2805,22 @@ void settingsMenu() {
     while (true) {
         clearScreen();
         printColor("========================================", CYAN);
-        printColor(" SETTINGS", CYAN);
+        printColor(tr(" SETTINGS", " НАСТРОЙКИ"), CYAN);
         printColor("========================================", CYAN);
-        cout << "\n1. Output location: [" << OUTPUT_PATH << "]"
-             << "\n2. Output format: [" << OUTPUT_FORMAT << "]"
-             << "\n3. Resolution: [" << OUTPUT_RESOLUTION << "]"
-             << "\n4. FPS: [" << OUTPUT_FPS << "]"
-             << "\n5. Encoding preset: [" << PRESET << "]"
-             << "\n6. CRF value: [" << CRF_VALUE << "]"
-             << "\n7. Audio bitrate: [" << AUDIO_BITRATE << " kbps]"
-             << "\n8. Hardware acceleration: [" << (HARDWARE_ACCEL ? "ON" : "OFF") << "]"
-             << "\n9. Overwrite files: [" << (OVERWRITE_FILES ? "ON" : "OFF") << "]"
-             << "\nm. Keep metadata: [" << (KEEP_METADATA ? "ON" : "OFF") << "]"
-             << "\nu. Update FFmpeg & components"
-             << "\n0. Return (ESC)\n\nYour choice: ";
+        cout << "\n1. " << tr("Output location: [", "Папка вывода: [") << OUTPUT_PATH << "]"
+             << "\n2. " << tr("Output format: [", "Формат вывода: [") << OUTPUT_FORMAT << "]"
+             << "\n3. " << tr("Resolution: [", "Разрешение: [") << OUTPUT_RESOLUTION << "]"
+             << "\n4. " << tr("FPS: [", "FPS: [") << OUTPUT_FPS << "]"
+             << "\n5. " << tr("Encoding preset: [", "Пресет кодирования: [") << PRESET << "]"
+             << "\n6. " << tr("CRF value: [", "Значение CRF: [") << CRF_VALUE << "]"
+             << "\n7. " << tr("Audio bitrate: [", "Битрейт аудио: [") << AUDIO_BITRATE << " kbps]"
+             << "\n8. " << tr("Hardware acceleration: [", "Аппаратное ускорение: [") << (HARDWARE_ACCEL ? "ON" : "OFF") << "]"
+             << "\n9. " << tr("Add suffixes to files: [", "Добавлять суффиксы в конец файлов: [") << (OVERWRITE_FILES ? "ON" : "OFF") << "]"
+             << "\nm. " << tr("Keep metadata: [", "Сохранять метаданные: [") << (KEEP_METADATA ? "ON" : "OFF") << "]"
+             << "\nv. " << tr("Video codec prompt: [", "Запрос видеокодека: [") << (VIDEO_CODEC_ASK ? tr("Always Ask", "Всегда спрашивать") : tr("Use defaults", "По умолчанию")) << "]"
+             << "\na. " << tr("Audio codec prompt: [", "Запрос аудиокодека: [") << (AUDIO_CODEC_ASK ? tr("Always Ask", "Всегда спрашивать") : tr("Use defaults", "По умолчанию")) << "]"
+             << "\nu. " << tr("Update FFmpeg & components", "Обновить FFmpeg")
+             << "\n0. " << tr("Return (ESC)", "Назад (ESC)") << "\n\n" << tr("Your choice: ", "Ваш выбор: ");
         char ch = getMenuChoice();
         if (ch == 27 || ch == '0') {
             return;
@@ -2265,15 +2828,15 @@ void settingsMenu() {
         cout << ch << endl;
         switch (ch) {
         case '1': {
-            string p = openFolderDialog();
+            string p = openFolderDialog(utf8ToWstring(tr("Select output folder", "Выберите папку вывода")).c_str());
             if (!p.empty()) {
                 OUTPUT_PATH = p;
                 if (!dirExists(OUTPUT_PATH)) createDirRecursive(OUTPUT_PATH);
                 saveConfig();
-                printColor("[OK] Output location updated!", GREEN);
+                printColor(tr("[OK] Output location updated!", "[OK] Папка вывода обновлена!"), GREEN);
             }
             else {
-                printColor("[INFO] Not changed", YELLOW);
+                printColor(tr("[INFO] Not changed", "[ИНФО] Не изменено"), YELLOW);
             }
             waitForKey();
             break;
@@ -2284,26 +2847,88 @@ void settingsMenu() {
         case '5': selectPreset(); break;
         case '6': selectCRF(); break;
         case '7': selectAudioBitrate(); break;
-        case '8':
-            HARDWARE_ACCEL = !HARDWARE_ACCEL;
-            saveConfig();
-            printColor(string("[OK] Hardware acceleration ") + (HARDWARE_ACCEL ? "ON" : "OFF"), GREEN);
-            waitForKey();
+        case '8': {
+            vector<string> opts = {"ON", "OFF"};
+            string desc = tr(
+                "Use GPU hardware acceleration (NVENC, QSV, AMF) for decoding.\n"
+                "Can significantly speed up processing. Disable if compatibility issues occur.",
+                "Использовать аппаратное ускорение GPU (NVENC, QSV, AMF).\n"
+                "Значительно ускоряет обработку. Отключите при проблемах совместимости.");
+            int sel = arrowSelect(tr("HARDWARE ACCELERATION", "АППАРАТНОЕ УСКОРЕНИЕ"), desc, opts, HARDWARE_ACCEL ? 0 : 1);
+            if (sel >= 0) {
+                HARDWARE_ACCEL = (sel == 0);
+                saveConfig();
+                printColor(string(tr("[OK] Hardware acceleration ", "[OK] Аппаратное ускорение ")) + (HARDWARE_ACCEL ? "ON" : "OFF"), GREEN);
+                waitForKey();
+            }
             break;
-        case '9':
-            OVERWRITE_FILES = !OVERWRITE_FILES;
-            saveConfig();
-            printColor(string("[OK] Overwrite files ") + (OVERWRITE_FILES ? "ON" : "OFF"), GREEN);
-            waitForKey();
+        }
+        case '9': {
+            vector<string> opts = {"OFF", "ON"};
+            string desc = tr(
+                "When OFF, existing output files are overwritten without asking.\n"
+                "When ON, a suffix (_1, _compressed, etc.) is added to protect the original.",
+                "Когда ВЫКЛ, существующие файлы перезаписываются без запроса, удаляя оригинал!\n"
+                "Когда ВКЛ, добавляется суффикс (_1, _compressed, и т.д.) для защиты от перезаписи оригинала!");
+            int sel = arrowSelect(tr("ADD SUFFIXES TO FILES", "ДОБАВЛЯТЬ СУФФИКСЫ В КОНЕЦ ФАЙЛОВ"), desc, opts, OVERWRITE_FILES ? 1 : 0);
+            if (sel >= 0) {
+                OVERWRITE_FILES = (sel == 1);
+                saveConfig();
+                printColor(string(tr("[OK] Add suffixes to files ", "[OK] Добавлять суффиксы в конец файлов ")) + (!OVERWRITE_FILES ? "OFF" : "ON"), GREEN);
+                waitForKey();
+            }
             break;
-        case 'm': case 'M':
-            KEEP_METADATA = !KEEP_METADATA;
-            saveConfig();
-            printColor(string("[OK] Keep metadata ") + (KEEP_METADATA ? "ON" : "OFF"), GREEN);
-            waitForKey();
+        }
+        case 'm': {
+            vector<string> opts = {"ON", "OFF"};
+            string desc = tr(
+                "When ON, metadata (title, artist, date, etc.) from source is copied to output.\n"
+                "When OFF, all metadata is stripped from the output.",
+                "Когда ВКЛ, метаданные (название, артист, дата) копируются в выходной файл.\n"
+                "Когда ВЫКЛ, все метаданные удаляются.");
+            int sel = arrowSelect(tr("KEEP METADATA", "СОХРАНЕНИЕ МЕТАДАННЫХ"), desc, opts, KEEP_METADATA ? 0 : 1);
+            if (sel >= 0) {
+                KEEP_METADATA = (sel == 0);
+                saveConfig();
+                printColor(string(tr("[OK] Keep metadata ", "[OK] Сохранение метаданных ")) + (KEEP_METADATA ? "ON" : "OFF"), GREEN);
+                waitForKey();
+            }
             break;
-        case 'u': case 'U': updateComponentsMenu(); break;
-        default: printColor("[ERROR] Invalid choice!", RED); waitForKey();
+        }
+        case 'v': {
+            vector<string> opts = {tr("Always Ask", "Всегда спрашивать"), tr("Use defaults", "По умолчанию")};
+            string desc = tr(
+                "When 'Always Ask' is active, you will be prompted to review\n"
+                "video settings (format, CRF, preset, resolution) before each operation.",
+                "Когда 'Всегда спрашивать' активно, перед каждой операцией\n"
+                "вам будет предложено проверить настройки видео (формат, CRF, пресет, разрешение).");
+            int sel = arrowSelect(tr("VIDEO CODEC PROMPT", "ЗАПРОС ВИДЕОКОДЕКА"), desc, opts, VIDEO_CODEC_ASK ? 0 : 1);
+            if (sel >= 0) {
+                VIDEO_CODEC_ASK = (sel == 0);
+                saveConfig();
+                printColor(tr("[OK] Video codec prompt: ", "[OK] Запрос видеокодека: ") + (VIDEO_CODEC_ASK ? tr("Always Ask", "Всегда спрашивать") : tr("Use defaults", "По умолчанию")), GREEN);
+                waitForKey();
+            }
+            break;
+        }
+        case 'a': {
+            vector<string> opts = {tr("Always Ask", "Всегда спрашивать"), tr("Use defaults", "По умолчанию")};
+            string desc = tr(
+                "When 'Always Ask' is active, you will be prompted to review\n"
+                "audio settings (format, bitrate) before each audio operation.",
+                "Когда 'Всегда спрашивать' активно, перед каждой аудиооперацией\n"
+                "вам будет предложено проверить настройки аудио (формат, битрейт).");
+            int sel = arrowSelect(tr("AUDIO CODEC PROMPT", "ЗАПРОС АУДИОКОДЕКА"), desc, opts, AUDIO_CODEC_ASK ? 0 : 1);
+            if (sel >= 0) {
+                AUDIO_CODEC_ASK = (sel == 0);
+                saveConfig();
+                printColor(tr("[OK] Audio codec prompt: ", "[OK] Запрос аудиокодека: ") + (AUDIO_CODEC_ASK ? tr("Always Ask", "Всегда спрашивать") : tr("Use defaults", "По умолчанию")), GREEN);
+                waitForKey();
+            }
+            break;
+        }
+        case 'u': updateComponentsMenu(); break;
+        default: printColor(tr("[ERROR] Invalid choice!", "[ОШИБКА] Неверный выбор!"), RED); waitForKey();
         }
     }
 }
@@ -2405,36 +3030,40 @@ bool checkDependencies() {
 void displayMenu() {
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" MR CLI FOR FFMPEG v1.0.0", CYAN);
+    printColor(" MR CLI FOR FFMPEG v1.1.0", CYAN);
     printColor("========================================", CYAN);
     printColor("========================================", GREEN);
-    printColor(" FFMPEG:  " + string(FFMPEG_FOUND ? "[OK] installed" : "[ERROR] not found"), FFMPEG_FOUND ? GREEN : RED);
-    printColor(" FFPROBE: " + string(FFPROBE_FOUND ? "[OK] installed" : "[WARNING] not installed"), FFPROBE_FOUND ? GREEN : YELLOW);
+    printColor(" FFMPEG:  " + string(FFMPEG_FOUND ? tr("[OK] installed", "[OK] установлен") : tr("[ERROR] not found", "[ОШИБКА] не найден")), FFMPEG_FOUND ? GREEN : RED);
+    printColor(" FFPROBE: " + string(FFPROBE_FOUND ? tr("[OK] installed", "[OK] установлен") : tr("[WARNING] not installed", "[ВНИМАНИЕ] не установлен")), FFPROBE_FOUND ? GREEN : YELLOW);
     printColor("========================================", GREEN);
     cout << "========================================\n"
-         << "--- VIDEO OPERATIONS ---\n"
-         << " 1. Convert format\n"
-         << " 2. Trim / Cut video\n"
-         << " 3. Change resolution\n"
-         << " 4. Change speed\n"
-         << " 5. Rotate / Flip\n"
-         << " 6. Compress video\n"
-         << " 7. Add watermark\n"
-         << " 8. Add subtitles (burn-in)\n"
-         << "--- AUDIO OPERATIONS ---\n"
-         << " 9. Extract audio\n"
-         << " a. Merge video + audio\n"
-         << " b. Strip audio (mute)\n"
-         << "--- OTHER ---\n"
-         << " c. Concatenate (join) files\n"
-         << " d. Create GIF\n"
-         << " e. Extract frames\n"
-         << " f. File information\n"
-         << "--- PROGRAM ---\n"
-         << " s. Settings\n"
-         << " 0. Exit (ESC)\n"
+         << "--- " << tr("VIDEO OPERATIONS", "ВИДЕО ОПЕРАЦИИ") << " ---\n"
+         << " 1. " << tr("Convert video", "Конвертировать видео") << "\n"
+         << " 2. " << tr("Trim / Cut video", "Обрезать видео") << "\n"
+         << " 3. " << tr("Change resolution", "Изменить разрешение") << "\n"
+         << " 4. " << tr("Change speed", "Изменить скорость") << "\n"
+         << " 5. " << tr("Rotate / Flip", "Повернуть / Отразить") << "\n"
+         << " 6. " << tr("Compress video", "Сжать видео") << "\n"
+         << " 7. " << tr("Add watermark", "Добавить водяной знак") << "\n"
+         << " 8. " << tr("Add subtitles (burn-in)", "Добавить субтитры (вшить)") << "\n"
+         << "--- " << tr("AUDIO OPERATIONS", "АУДИО ОПЕРАЦИИ") << " ---\n"
+         << " 9. " << tr("Extract audio", "Извлечь аудио") << "\n"
+         << " a. " << tr("Merge video + audio", "Объединить видео + аудио") << "\n"
+         << " b. " << tr("Strip audio (mute)", "Удалить звук") << "\n"
+         << "--- " << tr("OTHER", "ДРУГОЕ") << " ---\n"
+         << " c. " << tr("Concatenate (join) files", "Склеить файлы") << "\n"
+         << " d. " << tr("Create GIF", "Создать GIF") << "\n"
+         << " e. " << tr("Extract frames", "Извлечь кадры") << "\n"
+         << " f. " << tr("File information", "Информация о файле") << "\n"
+         << " g. " << tr("Compare two files", "Сравнить два файла") << "\n"
+         << " h. " << tr("Batch compress video", "Пакетное сжатие видео") << "\n"
+         << " i. " << tr("Batch compress audio", "Пакетное сжатие аудио") << "\n"
+         << "--- " << tr("PROGRAM", "ПРОГРАММА") << " ---\n"
+         << " s. " << tr("Settings", "Настройки") << "\n"
+         << " l. " << (CURRENT_LANG == LANG_EN ? "Language: English" : "Язык: Русский") << "\n"
+         << " 0. " << tr("Exit (ESC)", "Выход (ESC)") << "\n"
          << "========================================\n"
-         << "\nYour choice: ";
+         << "\n" << tr("Your choice: ", "Ваш выбор: ");
 }
 
 int main() {
@@ -2473,7 +3102,7 @@ int main() {
         displayMenu();
         char ch = getMenuChoice();
         if (ch == 27 || ch == '0') {
-            cout << "Exiting...\n";
+            cout << tr("Exiting...", "Выход...") << "\n";
             CoUninitialize();
             return 0;
         }
@@ -2494,9 +3123,16 @@ int main() {
         case 'd': createGif(); break;
         case 'e': extractFrames(); break;
         case 'f': showFileInfo(); break;
+        case 'g': compareFiles(); break;
+        case 'h': batchCompressVideo(); break;
+        case 'i': batchCompressAudio(); break;
         case 's': settingsMenu(); break;
+        case 'l':
+            CURRENT_LANG = (CURRENT_LANG == LANG_EN) ? LANG_RU : LANG_EN;
+            saveConfig();
+            break;
         default:
-            printColor("[ERROR] Invalid choice!", RED);
+            printColor(tr("[ERROR] Invalid choice!", "[ОШИБКА] Неверный выбор!"), RED);
             waitForKey();
         }
     }
