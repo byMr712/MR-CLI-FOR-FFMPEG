@@ -60,3 +60,7 @@ msbuild mr-cli-ffmpeg.sln /p:Configuration=Release /p:Platform=x64
 
 ## 📄 Лицензия
 1. Лицензия [Apache 2.0](LICENSE) — пользуйтесь и изменяйте свободно!
+
+## 🙏 Выражаю большую благодарность
+1. [FFmpeg](https://ffmpeg.org/)
+

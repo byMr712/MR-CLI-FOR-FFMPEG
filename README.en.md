@@ -56,3 +56,6 @@ When you first launch the program, it will automatically prompt you to download 
 
 ## 📄 License
 1. [Apache 2.0] License (LICENSE) - use and modify freely!
+
+## 🙏 Many thanks to
+1. [FFmpeg](https://ffmpeg.org/)
