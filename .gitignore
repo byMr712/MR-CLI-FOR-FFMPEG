@@ -262,3 +262,6 @@ mr-cli-ffmpeg*.exe
 
 # Agent Guidelines
 AGENTS.md
+
+# lnk
+.lnk
