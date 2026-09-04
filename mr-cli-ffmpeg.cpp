@@ -42,6 +42,7 @@ bool KEEP_METADATA = true;
 bool VIDEO_CODEC_ASK = true;
 bool AUDIO_CODEC_ASK = true;
 bool g_ffmpegEscaped = false;
+string VIDEO_PIX_FMT_FILTER = "";
 
 // ========== ACCELERATION & GPU MODES ==========
 enum AccelMode {
@@ -876,6 +877,140 @@ string getMediaInfo(const string& filePath) {
     return output;
 }
 
+// ========== GET VIDEO PIXEL FORMAT VIA FFPROBE ==========
+string getVideoPixelFormat(const string& filePath) {
+    if (!FFPROBE_FOUND || FFPROBE_PATH.empty()) return "";
+
+    string cmd = "\"" + FFPROBE_PATH + "\" -v quiet -select_streams v:0 -show_entries stream=codec_type,pix_fmt -of default=noprint_wrappers=1 \"" + filePath + "\"";
+
+    SECURITY_ATTRIBUTES sa = {};
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.bInheritHandle = TRUE;
+
+    HANDLE hReadPipe = NULL, hWritePipe = NULL;
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return "";
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.hStdOutput = hWritePipe;
+    si.hStdError = hWritePipe;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi = {};
+    wstring wcmd = utf8ToWstring(cmd);
+    if (!CreateProcessW(NULL, &wcmd[0], NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(hReadPipe);
+        CloseHandle(hWritePipe);
+        return "";
+    }
+    CloseHandle(hWritePipe);
+
+    string output;
+    char buf[256];
+    DWORD bytesRead = 0;
+    while (ReadFile(hReadPipe, buf, sizeof(buf) - 1, &bytesRead, NULL) && bytesRead > 0) {
+        buf[bytesRead] = '\0';
+        output += buf;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    CloseHandle(hReadPipe);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    string pixFmt = "";
+    istringstream iss(output);
+    string line;
+    bool isVideo = false;
+    while (getline(iss, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        size_t eq = line.find('=');
+        if (eq == string::npos) continue;
+        string key = line.substr(0, eq);
+        string val = line.substr(eq + 1);
+        if (key == "codec_type" && val == "video") isVideo = true;
+        else if (key == "pix_fmt" && isVideo) { pixFmt = val; break; }
+    }
+    return pixFmt;
+}
+
+bool isPixelFormatIncompatible(const string& pixFmt) {
+    if (pixFmt.empty()) return false;
+    string lower = pixFmt;
+    transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    return (lower.find("10") != string::npos || lower.find("12") != string::npos ||
+            lower.find("14") != string::npos || lower.find("16") != string::npos ||
+            lower.find("422") != string::npos || lower.find("444") != string::npos ||
+            lower.find("p010") != string::npos || lower.find("p016") != string::npos);
+}
+
+// ========== PIXEL FORMAT WARNING DIALOG ==========
+int dialogPixelFormatWarning(const string& pixFmt, bool batchMode) {
+    clearScreen();
+    setColor(YELLOW);
+    cout << "========================================" << endl;
+    cout << "          ПРЕДУПРЕЖДЕНИЕ               " << endl;
+    cout << "========================================" << endl;
+    setColor(WHITE);
+
+    cout << "\n";
+    setColor(YELLOW);
+    cout << "  " << tr("Pixel format detected: ", "Обнаружен формат пикселей: ") << pixFmt << endl;
+    setColor(WHITE);
+    cout << "\n";
+    cout << "  " << tr("This format is not supported by hardware encoder.", "Этот формат не поддерживается аппаратным кодировщиком.") << "\n";
+    cout << "  " << tr("Encoding may fail with 'Function not implemented' error.", "Кодирование может завершиться ошибкой 'Function not implemented'.") << "\n";
+    cout << "\n";
+    setColor(CYAN);
+    cout << "  " << tr("Recommended: convert to yuv420p (8-bit) or use software CPU.", "Рекомендуется: конвертировать в yuv420p (8-bit) или использовать программный CPU.") << "\n";
+    setColor(WHITE);
+    cout << "\n";
+
+    vector<string> options = {
+        tr(">> Add filter: format=yuv420p (Recommended)", ">> Добавить фильтр: format=yuv420p (Рекомендуется)"),
+        tr("   Use software CPU (libx264) for this video", "   Использовать программный CPU (libx264) для этого видео"),
+        tr("   Use software CPU for ALL remaining videos with this issue", "   Использовать программный CPU для ВСЕХ оставшихся видео с этой ошибкой"),
+        tr("   Skip (may cause encoding error)", "   Пропустить (может вызвать ошибку кодирования)")
+    };
+    if (!batchMode) {
+        options.erase(options.begin() + 2);
+    }
+
+    int selected = 0;
+    while (true) {
+        cout << "\r";
+        for (int i = 0; i < (int)options.size(); i++) {
+            if (i == selected) {
+                setColor(GREEN);
+                cout << " > " << options[i] << "        " << endl;
+                setColor(WHITE);
+            } else {
+                cout << "   " << options[i] << "        " << endl;
+            }
+        }
+        cout << "\n" << tr("Arrow keys to select, Enter to confirm", "Стрелки для выбора, Enter для подтверждения") << endl;
+
+        int key = _getch();
+        if (key == 13) break;
+        if (key == 0 || key == 0xE0) {
+            int scan = _getch();
+            if (scan == 72) selected = (selected > 0) ? selected - 1 : (int)options.size() - 1;
+            else if (scan == 80) selected = (selected < (int)options.size() - 1) ? selected + 1 : 0;
+        }
+        // Repaint
+        int lines = (int)options.size() + 3;
+        cout << "\033[" << lines << "A";
+        for (int i = 0; i < lines; i++) {
+            cout << "\033[2K\n";
+        }
+        cout << "\r";
+    }
+
+    return selected;
+}
+
 // ========== FORMAT MEDIA INFO FOR DISPLAY ==========
 string formatMediaInfoDisplay(const string& rawInfo) {
     if (rawInfo.empty()) return tr("[No info available]", "[Информация недоступна]");
@@ -1110,15 +1245,15 @@ string openFileDialogMedia(const wchar_t* title = nullptr) {
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = GetConsoleWindow();
     ofn.lpstrFilter = (CURRENT_LANG == LANG_RU) ?
-                      L"Медиа файлы\0*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.ts;*.m4v;*.mp3;*.m4a;*.aac;*.wav;*.ogg;*.flac;*.opus;*.wma;*.gif;*.png;*.jpg;*.jpeg;*.bmp;*.tiff\0"
-                      L"Видео файлы\0*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.ts;*.m4v\0"
-                      L"Аудио файлы\0*.mp3;*.m4a;*.aac;*.wav;*.ogg;*.flac;*.opus;*.wma\0"
-                      L"Изображения\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tiff\0"
+                      L"Медиа файлы (*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.ts;*.m4v;*.mp3;*.m4a;*.aac;*.wav;*.ogg;*.flac;*.opus;*.wma;*.gif;*.png;*.jpg;*.jpeg;*.bmp;*.tiff)\0*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.ts;*.m4v;*.mp3;*.m4a;*.aac;*.wav;*.ogg;*.flac;*.opus;*.wma;*.gif;*.png;*.jpg;*.jpeg;*.bmp;*.tiff\0"
+                      L"Видео файлы (*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.ts;*.m4v)\0*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.ts;*.m4v\0"
+                      L"Аудио файлы (*.mp3;*.m4a;*.aac;*.wav;*.ogg;*.flac;*.opus;*.wma)\0*.mp3;*.m4a;*.aac;*.wav;*.ogg;*.flac;*.opus;*.wma\0"
+                      L"Изображения (*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tiff)\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tiff\0"
                       L"Все файлы (*.*)\0*.*\0" :
-                      L"Media Files\0*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.ts;*.m4v;*.mp3;*.m4a;*.aac;*.wav;*.ogg;*.flac;*.opus;*.wma;*.gif;*.png;*.jpg;*.jpeg;*.bmp;*.tiff\0"
-                      L"Video Files\0*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.ts;*.m4v\0"
-                      L"Audio Files\0*.mp3;*.m4a;*.aac;*.wav;*.ogg;*.flac;*.opus;*.wma\0"
-                      L"Image Files\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tiff\0"
+                      L"Media Files (*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.ts;*.m4v;*.mp3;*.m4a;*.aac;*.wav;*.ogg;*.flac;*.opus;*.wma;*.gif;*.png;*.jpg;*.jpeg;*.bmp;*.tiff)\0*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.ts;*.m4v;*.mp3;*.m4a;*.aac;*.wav;*.ogg;*.flac;*.opus;*.wma;*.gif;*.png;*.jpg;*.jpeg;*.bmp;*.tiff\0"
+                      L"Video Files (*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.ts;*.m4v)\0*.mp4;*.mkv;*.avi;*.mov;*.wmv;*.flv;*.webm;*.ts;*.m4v\0"
+                      L"Audio Files (*.mp3;*.m4a;*.aac;*.wav;*.ogg;*.flac;*.opus;*.wma)\0*.mp3;*.m4a;*.aac;*.wav;*.ogg;*.flac;*.opus;*.wma\0"
+                      L"Image Files (*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tiff)\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tiff\0"
                       L"All Files (*.*)\0*.*\0";
     ofn.lpstrFile = fn;
     ofn.nMaxFile = MAX_PATH;
@@ -1834,6 +1969,8 @@ void batchCompressVideo() {
     }
 
     int success = 0, fail = 0;
+    static bool forceCPUAll = false;
+    forceCPUAll = false;
     size_t i = 0;
     while (i < files.size()) {
         cout << "\n";
@@ -1849,10 +1986,42 @@ void batchCompressVideo() {
         string outPath = buildOutputPath(files[i], "_compressed");
         auto ft = prepareFFmpegTarget(outPath, {files[i]});
 
+        VIDEO_PIX_FMT_FILTER = "";
+        bool useCPU = false;
+        AccelMode activeGpuForPfmt = getActiveGpuMode();
+        if ((activeGpuForPfmt == ACCEL_NVIDIA || activeGpuForPfmt == ACCEL_AMD || activeGpuForPfmt == ACCEL_INTEL) && !forceCPUAll) {
+            string pixFmt = getVideoPixelFormat(files[i]);
+            if (!pixFmt.empty() && isPixelFormatIncompatible(pixFmt)) {
+                int pfmtChoice = dialogPixelFormatWarning(pixFmt, true);
+                if (pfmtChoice == 0) {
+                    VIDEO_PIX_FMT_FILTER = "-vf format=yuv420p";
+                } else if (pfmtChoice == 1) {
+                    useCPU = true;
+                } else if (pfmtChoice == 2) {
+                    forceCPUAll = true;
+                    useCPU = true;
+                } else {
+                    fail++;
+                    i++;
+                    continue;
+                }
+            }
+        } else if (forceCPUAll) {
+            string pixFmt = getVideoPixelFormat(files[i]);
+            if (!pixFmt.empty() && isPixelFormatIncompatible(pixFmt)) {
+                useCPU = true;
+            }
+        }
+
         wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
-        cmd += utf8ToWstring(getHWAccelArg(true));
+        if (!useCPU) cmd += utf8ToWstring(getHWAccelArg(true));
         cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(files[i])) + L"\"";
-        cmd += L" " + utf8ToWstring(getVideoCodecArgs());
+        if (!VIDEO_PIX_FMT_FILTER.empty()) cmd += L" " + utf8ToWstring(VIDEO_PIX_FMT_FILTER);
+        if (useCPU) {
+            cmd += L" -c:v libx264";
+        } else {
+            cmd += L" " + utf8ToWstring(getVideoCodecArgs());
+        }
         cmd += L" " + utf8ToWstring(getVideoQualityArgs(CRF_VALUE));
         cmd += L" " + utf8ToWstring(getVideoPresetArgs());
         cmd += L" " + utf8ToWstring(getAudioCodecArgs()) + L" -b:a 128k";
@@ -2105,6 +2274,24 @@ void convertFormat() {
     string outPath = buildOutputPath(inputFile, "_converted");
     auto ft = prepareFFmpegTarget(outPath, {inputFile});
 
+    VIDEO_PIX_FMT_FILTER = "";
+    bool useCPU = false;
+    AccelMode activeGpuForPfmt = getActiveGpuMode();
+    if (activeGpuForPfmt == ACCEL_NVIDIA || activeGpuForPfmt == ACCEL_AMD || activeGpuForPfmt == ACCEL_INTEL) {
+        string pixFmt = getVideoPixelFormat(inputFile);
+        if (!pixFmt.empty() && isPixelFormatIncompatible(pixFmt)) {
+            int pfmtChoice = dialogPixelFormatWarning(pixFmt, false);
+            if (pfmtChoice == 0) {
+                VIDEO_PIX_FMT_FILTER = "format=yuv420p";
+            } else if (pfmtChoice == 1) {
+                useCPU = true;
+            } else {
+                waitForKey();
+                return;
+            }
+        }
+    }
+
     printColor("\n" + tr("Output: ", "Выход: ") + outPath, GREEN);
     printColor(tr("Format: ", "Формат: ") + OUTPUT_FORMAT, GREEN);
 
@@ -2114,9 +2301,13 @@ void convertFormat() {
     cout << ch << endl;
 
     wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
-    cmd += utf8ToWstring(getHWAccelArg(true));
+    if (!useCPU) cmd += utf8ToWstring(getHWAccelArg(true));
     cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(inputFile)) + L"\"";
-    cmd += L" " + utf8ToWstring(getVideoCodecArgs());
+    if (useCPU) {
+        cmd += L" -c:v libx264";
+    } else {
+        cmd += L" " + utf8ToWstring(getVideoCodecArgs());
+    }
     cmd += L" " + utf8ToWstring(getAudioCodecArgs());
     cmd += L" -b:a " + utf8ToWstring(AUDIO_BITRATE) + L"k";
 
@@ -2128,8 +2319,12 @@ void convertFormat() {
 
     cmd += L" " + utf8ToWstring(getVideoPresetArgs());
 
-    if (OUTPUT_RESOLUTION != "original") {
+    if (OUTPUT_RESOLUTION != "original" && !VIDEO_PIX_FMT_FILTER.empty()) {
+        cmd += L" -vf scale=-2:" + utf8ToWstring(OUTPUT_RESOLUTION) + L"," + utf8ToWstring(VIDEO_PIX_FMT_FILTER);
+    } else if (OUTPUT_RESOLUTION != "original") {
         cmd += L" -vf scale=-2:" + utf8ToWstring(OUTPUT_RESOLUTION);
+    } else if (!VIDEO_PIX_FMT_FILTER.empty()) {
+        cmd += L" -vf " + utf8ToWstring(VIDEO_PIX_FMT_FILTER);
     }
     if (OUTPUT_FPS != "original") {
         cmd += L" -r " + utf8ToWstring(OUTPUT_FPS);
@@ -2642,10 +2837,33 @@ void compressVideo() {
     string outPath = buildOutputPath(inputFile, "_compressed");
     auto ft = prepareFFmpegTarget(outPath, {inputFile});
 
+    VIDEO_PIX_FMT_FILTER = "";
+    bool useCPU = false;
+    AccelMode activeGpuForPfmt = getActiveGpuMode();
+    if (activeGpuForPfmt == ACCEL_NVIDIA || activeGpuForPfmt == ACCEL_AMD || activeGpuForPfmt == ACCEL_INTEL) {
+        string pixFmt = getVideoPixelFormat(inputFile);
+        if (!pixFmt.empty() && isPixelFormatIncompatible(pixFmt)) {
+            int pfmtChoice = dialogPixelFormatWarning(pixFmt, false);
+            if (pfmtChoice == 0) {
+                VIDEO_PIX_FMT_FILTER = "-vf format=yuv420p";
+            } else if (pfmtChoice == 1) {
+                useCPU = true;
+            } else {
+                waitForKey();
+                return;
+            }
+        }
+    }
+
     wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
-    cmd += utf8ToWstring(getHWAccelArg(true));
+    if (!useCPU) cmd += utf8ToWstring(getHWAccelArg(true));
     cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(inputFile)) + L"\"";
-    cmd += L" " + utf8ToWstring(getVideoCodecArgs());
+    if (!VIDEO_PIX_FMT_FILTER.empty()) cmd += L" " + utf8ToWstring(VIDEO_PIX_FMT_FILTER);
+    if (useCPU) {
+        cmd += L" -c:v libx264";
+    } else {
+        cmd += L" " + utf8ToWstring(getVideoCodecArgs());
+    }
     cmd += L" " + utf8ToWstring(getVideoQualityArgs(crf));
     cmd += L" " + utf8ToWstring(getVideoPresetArgs("slower"));
     cmd += L" " + utf8ToWstring(getAudioCodecArgs()) + L" -b:a 128k";
@@ -3110,8 +3328,8 @@ void addSubtitles() {
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = GetConsoleWindow();
     ofn.lpstrFilter = (CURRENT_LANG == LANG_RU) ?
-                      L"Файлы субтитров\0*.srt;*.ass;*.ssa;*.sub;*.vtt\0Все файлы (*.*)\0*.*\0" :
-                      L"Subtitle Files\0*.srt;*.ass;*.ssa;*.sub;*.vtt\0All Files (*.*)\0*.*\0";
+                      L"Файлы субтитров (*.srt;*.ass;*.ssa;*.sub;*.vtt)\0*.srt;*.ass;*.ssa;*.sub;*.vtt\0Все файлы (*.*)\0*.*\0" :
+                      L"Subtitle Files (*.srt;*.ass;*.ssa;*.sub;*.vtt)\0*.srt;*.ass;*.ssa;*.sub;*.vtt\0All Files (*.*)\0*.*\0";
     ofn.lpstrFile = fn;
     ofn.nMaxFile = MAX_PATH;
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
