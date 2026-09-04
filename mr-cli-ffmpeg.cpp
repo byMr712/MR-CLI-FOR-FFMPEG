@@ -371,7 +371,7 @@ void setUTF8() {
         dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
         SetConsoleMode(hOut, dwMode);
     }
-    SetConsoleTitleW(L"MR CLI FOR FFMPEG v1.1.1");
+    SetConsoleTitleW(L"MR CLI FOR FFMPEG v1.1.2");
 }
 
 void clearScreen() {
@@ -3665,6 +3665,89 @@ void settingsMenu() {
     }
 }
 
+// ========== PEER FFMPEG SHARING ==========
+bool checkAndCopyFromPeerFFmpeg() {
+    wchar_t docPath[MAX_PATH];
+    string peerConfigs = "";
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_PERSONAL, NULL, 0, docPath))) {
+        wstring p = wstring(docPath) + L"\\MR-CLI-FOR-YT-DLP\\configs\\";
+        peerConfigs = wstringToUtf8(p);
+    }
+    if (peerConfigs.empty() || !fileExists(peerConfigs + "ffmpeg.exe")) {
+        string fallback = "C:\\MR-CLI-FOR-YT-DLP\\configs\\";
+        if (fileExists(fallback + "ffmpeg.exe")) {
+            peerConfigs = fallback;
+        }
+    }
+    if (peerConfigs.empty() || !fileExists(peerConfigs + "ffmpeg.exe")) {
+        return false;
+    }
+
+    string otherAppName = "MR CLI FOR YT-DLP";
+    string title = tr("FOUND FFMPEG", "ОБНАРУЖЕН FFMPEG");
+    string desc = tr(
+        "The program just detected that you also use " + otherAppName + ".\n"
+        "It already has FFmpeg installed.\n"
+        "Would you like to use a shared copy to avoid downloading again?",
+        "Программа только что обнаружила, что вы также используете " + otherAppName + ".\n"
+        "У неё уже установлен FFmpeg.\n"
+        "Хотите использовать общую копию, чтобы не скачивать повторно?"
+    );
+    vector<string> opts = {
+        tr("Yes, use copy (fast and offline)", "Да, использовать копию (быстро и без интернета)"),
+        tr("No, download anew (download speed depends on your network)", "Нет, скачать заново (скорость загрузки зависит от вашей сети)")
+    };
+
+    int sel = arrowSelect(title, desc, opts, 0);
+    if (sel != 0) {
+        return false;
+    }
+
+    if (!dirExists(CONFIG_PATH)) {
+        createDirRecursive(CONFIG_PATH);
+    }
+
+    clearScreen();
+    printColor("========================================", CYAN);
+    printColor(" " + tr("COPYING FFMPEG FROM ", "КОПИРОВАНИЕ FFMPEG ИЗ ") + otherAppName, CYAN);
+    printColor("========================================", CYAN);
+    cout << "\n";
+    printColor(tr("[INFO] Copying FFmpeg components...", "[ИНФО] Копирование компонентов FFmpeg..."), CYAN);
+
+    vector<string> filesToCopy = {"ffmpeg.exe", "ffprobe.exe", "ffplay.exe"};
+    bool copiedAny = false;
+    for (const auto& f : filesToCopy) {
+        string src = peerConfigs + f;
+        string dst = CONFIG_PATH + f;
+        if (fileExists(src)) {
+            wstring wSrc = utf8ToWstring(src);
+            wstring wDst = utf8ToWstring(dst);
+            if (CopyFileW(wSrc.c_str(), wDst.c_str(), FALSE)) {
+                copiedAny = true;
+                printColor(tr("[OK] Copied: ", "[OK] Скопирован: ") + f, GREEN);
+            }
+            else {
+                printColor(tr("[ERROR] Failed to copy: ", "[ОШИБКА] Не удалось скопировать: ") + f, RED);
+            }
+        }
+    }
+
+    if (copiedAny && fileExists(CONFIG_PATH + "ffmpeg.exe")) {
+        FFMPEG_FOUND = true;
+        FFMPEG_PATH = CONFIG_PATH + "ffmpeg.exe";
+        FFPROBE_FOUND = fileExists(CONFIG_PATH + "ffprobe.exe");
+        if (FFPROBE_FOUND) {
+            FFPROBE_PATH = CONFIG_PATH + "ffprobe.exe";
+        }
+        cout << "\n";
+        printColor(tr("[OK] FFmpeg successfully copied!", "[OK] FFmpeg успешно скопирован!"), GREEN);
+        Sleep(1500);
+        return true;
+    }
+
+    return false;
+}
+
 // ========== DEPENDENCY CHECKS & AUTO INSTALLER ==========
 bool checkDependencies() {
     FFMPEG_PATH = CONFIG_PATH + "ffmpeg.exe";
@@ -3672,6 +3755,13 @@ bool checkDependencies() {
 
     FFMPEG_FOUND = fileExists(FFMPEG_PATH);
     FFPROBE_FOUND = fileExists(FFPROBE_PATH);
+
+    if (!FFMPEG_FOUND) {
+        if (checkAndCopyFromPeerFFmpeg()) {
+            FFMPEG_FOUND = fileExists(FFMPEG_PATH);
+            FFPROBE_FOUND = fileExists(FFPROBE_PATH);
+        }
+    }
 
     if (!FFMPEG_FOUND) {
         printColor("========================================", RED);
@@ -3762,7 +3852,7 @@ bool checkDependencies() {
 void displayMenu() {
     clearScreen();
     printColor("========================================", CYAN);
-    printColor(" MR CLI FOR FFMPEG v1.1.1", CYAN);
+    printColor(" MR CLI FOR FFMPEG v1.1.2", CYAN);
     printColor("========================================", CYAN);
     printColor("========================================", GREEN);
     printColor(" FFMPEG:  " + string(FFMPEG_FOUND ? tr("[OK] installed", "[OK] установлен") : tr("[ERROR] not found", "[ОШИБКА] не найден")), FFMPEG_FOUND ? GREEN : RED);
