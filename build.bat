@@ -28,8 +28,8 @@ echo.
 echo ========================================
 echo   Copying executables...
 echo ========================================
-copy /Y "x64\Release\mr-cli-ffmpeg.exe" "mr-cli-ffmpeg-v1.1.3-x64.exe"
-copy /Y "Release\mr-cli-ffmpeg.exe" "mr-cli-ffmpeg-v1.1.3-x86.exe"
+copy /Y "x64\Release\mr-cli-ffmpeg.exe" "mr-cli-ffmpeg-v1.1.4-x64.exe"
+copy /Y "Release\mr-cli-ffmpeg.exe" "mr-cli-ffmpeg-v1.1.4-x86.exe"
 
 echo.
 echo ========================================
