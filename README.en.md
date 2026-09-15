@@ -2,7 +2,7 @@
 
 > **Language:** English · [Русский](README.md)
 
-## 📋 Description
+## Description
 
 MR CLI FOR FFMPEG is a convenient command-line wrapper for FFmpeg, providing an intuitive menu for performing a variety of operations with video and audio files without having to remember complex FFmpeg commands.
 
@@ -10,7 +10,7 @@ MR CLI FOR FFMPEG is a convenient command-line wrapper for FFmpeg, providing an 
 [![Platform](https://img.shields.io/badge/platform-Windows-green.svg)]()
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 
-## ✨ Features
+## Features
 
 ### Video Operations
 - **Format Conversion** — MP4, MKV, WEBM, AVI, MOV with support for H.264, H.265/HEVC, AV1, VP9 codecs
@@ -39,7 +39,7 @@ MR CLI FOR FFMPEG is a convenient command-line wrapper for FFmpeg, providing an 
 - **Batch Video Compression** — compress all videos in a folder sequentially with track preservation and conflict resolution
 - **Batch Audio Compression** — compress all audio files in a folder sequentially with batch presets
 
-## ⚙️ Settings
+## Settings
 
 - Output Format (MP4, MKV, WEBM, MOV, AVI, MP3, M4A, WAV, FLAC, OGG) with preset and bitrate submenus
 - Resolution, FPS
@@ -54,7 +54,7 @@ MR CLI FOR FFMPEG is a convenient command-line wrapper for FFmpeg, providing an 
 - Automatic FFmpeg installation
 - Bilingual interface (English / Russian)
 
-## 🛠️ Build
+## Build
 
 Requirements:
 - Visual Studio 2022 (v143 toolset)
@@ -65,12 +65,12 @@ Requirements:
 msbuild mr-cli-ffmpeg.sln /p:Configuration=Release /p:Platform=x64
 ```
 
-## 📦 Installation
+## Installation
 
 When you first launch the program, it will automatically prompt you to download and install FFmpeg (~160 MB).
 
-## 📄 License
+## License
 1. [Apache 2.0] License (LICENSE) - use and modify freely!
 
-## 🙏 Many thanks to
+## Many thanks to
 1. [FFmpeg](https://ffmpeg.org/)
