@@ -6,7 +6,7 @@
 
 MR CLI FOR FFMPEG — это удобная консольная программа-обёртка над FFmpeg, предоставляющая интуитивное меню для выполнения разнообразных операций с видео и аудио файлами без необходимости запоминать сложные команды FFmpeg.
 
-[![Version](https://img.shields.io/badge/version-1.1.4-green.svg)]()
+[![Version](https://img.shields.io/badge/version-1.1.5-green.svg)]()
 [![Platform](https://img.shields.io/badge/platform-Windows-green.svg)]()
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 

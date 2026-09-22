@@ -41,6 +41,7 @@ bool KEEP_METADATA = true;
 bool VIDEO_CODEC_ASK = true;
 bool AUDIO_CODEC_ASK = false;
 string AUDIO_CODEC = "copy";
+string SUBTITLE_ACTION = "ask";
 string DELETE_ORIGINAL = "ask";
 bool g_ffmpegEscaped = false;
 
@@ -139,8 +140,8 @@ char normalizeKeyToEnglish(wint_t wc) {
         case 0x0419: case 0x0439: return 'q';  // й Й
         case 0x0426: case 0x0446: return 'w';  // ц Ц
         case 0x0423: case 0x0443: return 'e';  // у У
-        case 0x041A: case 0x043A: return 'k';  // к К
-        case 0x0415: case 0x0435: return 'e';  // е Е
+        case 0x041A: case 0x043A: return 'r';  // к К
+        case 0x0415: case 0x0435: return 't';  // е Е
         case 0x041D: case 0x043D: return 'y';  // н Н
         case 0x0413: case 0x0433: return 'u';  // г Г
         case 0x0428: case 0x0448: return 'i';  // ш Ш
@@ -168,6 +169,7 @@ char normalizeKeyToEnglish(wint_t wc) {
         case 0x044C: case 0x042C: return 'm';  // ь Ь
         case 0x0431: case 0x0411: return ',';  // б Б
         case 0x044E: case 0x042E: return '.';  // ю Ю
+        case 0x0401: case 0x0451: return '`';  // ё Ё
         default: return (char)(wc & 0xFF);
     }
 }
@@ -376,7 +378,7 @@ void setUTF8() {
         dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
         SetConsoleMode(hOut, dwMode);
     }
-    SetConsoleTitleW(L"MR CLI FOR FFMPEG v1.1.4");
+    SetConsoleTitleW(L"MR CLI FOR FFMPEG v1.1.5");
 }
 
 void clearScreen() {
@@ -1430,12 +1432,19 @@ vector<SubtitleTrack> getSubtitleTracks(const string& filePath) {
 enum SubtitleIncompatAction {
     SUB_ACT_CONVERT_TEXT = 0,
     SUB_ACT_BURN_HARD = 1,
-    SUB_ACT_CHANGE_TO_MKV = 2,
-    SUB_ACT_SKIP_CURRENT = 3,
-    SUB_ACT_CANCEL_ALL = 4
+    SUB_ACT_DROP_SUBS = 2,
+    SUB_ACT_CHANGE_TO_MKV = 3,
+    SUB_ACT_SKIP_CURRENT = 4,
+    SUB_ACT_CANCEL_ALL = 5
 };
 
-SubtitleIncompatAction dialogSubtitleIncompatibility(const string& filePath, const string& detectedSubTypes) {
+struct SubtitleDialogResult {
+    SubtitleIncompatAction action = SUB_ACT_SKIP_CURRENT;
+    bool applyToAll = false;
+};
+
+SubtitleDialogResult dialogSubtitleIncompatibility(const string& filePath, const string& detectedSubTypes, bool batchMode = false) {
+    SubtitleDialogResult result;
     string desc = tr(
         "Complex subtitles (" + detectedSubTypes + ") were found that are not supported by the MP4 container.\n\""
         + filePath + "\"\n\nChoose subtitle processing method:",
@@ -1448,6 +1457,8 @@ SubtitleIncompatAction dialogSubtitleIncompatibility(const string& filePath, con
            "Конвертировать субтитры (Рекомендуется, но будут как просто текст без изначального стиля)"),
         tr("Burn subtitles into video (Preserves style, but permanently embeds them in video frames)",
            "Вшить субтитры в видео (Сохраняет стиль, но вшивает субтитры прям в само видео, их нельзя будет отключить)"),
+        tr("Save video without subtitles",
+           "Сохранить видео без субтитров"),
         tr("Change format to MKV (Preserves all subtitles with full original styles)",
            "Изменить формат на MKV (Сохранит все субтитры без изменений)"),
         tr("Skip current video",
@@ -1461,6 +1472,8 @@ SubtitleIncompatAction dialogSubtitleIncompatibility(const string& filePath, con
            "Конвертирует субтитры в стандартный формат mov_text. Сохраняет отключаемые дорожки в MP4, но удаляет цвета, шрифты и позиционирование."),
         tr("Re-encodes video while burning subtitles into image frames. Retains 100% of fonts, colors and effects, but cannot be toggled off.",
            "Перекодирует видео с наложением субтитров прямо на кадры. Сохраняет 100% стилей, цветов и эффектов, но субтитры нельзя будет отключить."),
+        tr("Removes all subtitle tracks and outputs video with audio streams only.",
+           "Удаляет все дорожки субтитров и сохраняет видео только с аудиодорожками."),
         tr("Changes the output container to MKV. Retains all subtitle streams and complex styling bit-for-bit without loss.",
            "Переключает выходной контейнер на MKV. Сохраняет все дорожки субтитров и сложные стили бит-в-бит без потерь."),
         tr("Skips processing of this file and proceeds to the next one in queue.",
@@ -1470,8 +1483,53 @@ SubtitleIncompatAction dialogSubtitleIncompatibility(const string& filePath, con
     };
 
     int sel = arrowSelect(tr("SUBTITLE INCOMPATIBILITY", "НЕСОВМЕСТИМОСТЬ СУБТИТРОВ"), desc, opts, 0, hints, true);
-    if (sel < 0) return SUB_ACT_SKIP_CURRENT;
-    return (SubtitleIncompatAction)sel;
+    if (sel < 0) {
+        result.action = SUB_ACT_SKIP_CURRENT;
+        result.applyToAll = false;
+        return result;
+    }
+    result.action = (SubtitleIncompatAction)sel;
+
+    if (batchMode && result.action != SUB_ACT_CANCEL_ALL) {
+        vector<string> scopeOptions;
+        vector<string> scopeHints;
+        if (result.action == SUB_ACT_SKIP_CURRENT) {
+            scopeOptions = {
+                tr("Skip this video only", "Пропустить только это видео"),
+                tr("Skip ALL remaining videos with subtitles", "Пропустить ВСЕ оставшиеся видео с субтитрами")
+            };
+            scopeHints = {
+                tr("Only this video will be skipped. The batch continues with the next file.",
+                   "Только это видео будет пропущено. Пакет продолжится со следующего файла."),
+                tr("All remaining videos with incompatible subtitles in this batch will be skipped.",
+                   "Все оставшиеся видео с несовместимыми субтитрами в этом пакете будут пропущены.")
+            };
+        } else {
+            scopeOptions = {
+                tr("Apply to this video only", "Применить только к этому видео"),
+                tr("Apply to ALL remaining videos in this task", "Применить ко ВСЕМ оставшимся видео в этой задаче")
+            };
+            scopeHints = {
+                tr("The choice applies only to the current video. Global settings remain unchanged.",
+                   "Выбор применяется только к текущему видео. Глобальные настройки не изменяются."),
+                tr("The choice applies to all remaining videos with incompatible subtitles in this batch.",
+                   "Выбор применяется ко всем оставшимся видео с несовместимыми субтитрами в этом пакете.")
+            };
+        }
+
+        int scopeSel = arrowSelect(
+            tr("APPLY SCOPE", "ОБЛАСТЬ ПРИМЕНЕНИЯ"),
+            tr("Your current choice does NOT change global settings.\nYou can also make the same choice in the global settings to save it.",
+               "Ваш текущий выбор НЕ меняет глобальных настроек.\nТот же выбор можно сделать в глобальных настройках для сохранения."),
+            scopeOptions,
+            0,
+            scopeHints,
+            true
+        );
+        result.applyToAll = (scopeSel == 1);
+    }
+
+    return result;
 }
 
 struct AudioTrackPreference {
@@ -2382,6 +2440,7 @@ void saveConfig() {
       << "KEEP_METADATA=" << (KEEP_METADATA ? "true" : "false") << "\n"
       << "VIDEO_CODEC_ASK=" << (VIDEO_CODEC_ASK ? "true" : "false") << "\n"
       << "AUDIO_CODEC=" << AUDIO_CODEC << "\n"
+      << "SUBTITLE_ACTION=" << SUBTITLE_ACTION << "\n"
       << "DELETE_ORIGINAL=" << DELETE_ORIGINAL << "\n"
       << "LANGUAGE=" << (CURRENT_LANG == LANG_RU ? "ru" : "en") << "\n"
       << "SAVE_COVER=" << (SAVE_COVER ? "true" : "false") << "\n"
@@ -2418,6 +2477,7 @@ void loadConfig() {
                 else if (l.find("VIDEO_CODEC_ASK=") == 0) VIDEO_CODEC_ASK = (l.substr(16) == "true");
                 else if (l.find("AUDIO_CODEC=") == 0) AUDIO_CODEC = l.substr(12);
                 else if (l.find("AUDIO_CODEC_ASK=") == 0) { if (l.substr(16) == "true") AUDIO_CODEC = "ask"; else AUDIO_CODEC = "copy"; }
+                else if (l.find("SUBTITLE_ACTION=") == 0) SUBTITLE_ACTION = l.substr(16);
                 else if (l.find("DELETE_ORIGINAL=") == 0) DELETE_ORIGINAL = l.substr(16);
                 else if (l.find("LANGUAGE=") == 0) CURRENT_LANG = (l.substr(9) == "ru") ? LANG_RU : LANG_EN;
                 else if (l.find("SAVE_COVER=") == 0) SAVE_COVER = (l.substr(11) == "true");
@@ -3237,6 +3297,21 @@ bool promptAudioCodecSettings(string& chosenCodec) {
     return true;
 }
 
+// ========== SUBTITLE PROMPT HELPERS ==========
+string getSubtitleActionSettingName(const string& val = "") {
+    string s = val.empty() ? SUBTITLE_ACTION : val;
+    if (s == "convert") {
+        return tr("Always convert", "Всегда конвертировать");
+    } else if (s == "burn") {
+        return tr("Always burn into video", "Всегда вшивать в видео");
+    } else if (s == "skip") {
+        return tr("Always skip", "Всегда пропускать");
+    } else if (s == "remove" || s == "drop") {
+        return tr("Always remove subtitles", "Всегда удалять субтитры");
+    }
+    return tr("Always Ask", "Всегда спрашивать");
+}
+
 // ========== DELETE ORIGINAL HELPERS ==========
 string getDeleteOriginalSettingName() {
     if (DELETE_ORIGINAL == "ask") return tr("Always Ask", "Всегда спрашивать");
@@ -3547,10 +3622,13 @@ void batchCompressVideo() {
     if (!promptDeleteOriginal(true, deleteOrig)) return;
 
     int success = 0, fail = 0;
+    vector<string> skippedFiles;
     static int forceMode = -1;
     static string forcedFormat = "";
+    static int forceSubAction = -1;
     forceMode = -1;
     forcedFormat = "";
+    forceSubAction = -1;
 
     AudioTrackPreference batchAudioPref;
     vector<BatchAudioMismatchWarning> batchAudioWarnings;
@@ -3666,7 +3744,34 @@ void batchCompressVideo() {
                     }
                 }
                 if (hasComplexSubs) {
-                    SubtitleIncompatAction act = dialogSubtitleIncompatibility(filePath, detectedTypes);
+                    SubtitleIncompatAction act = SUB_ACT_SKIP_CURRENT;
+                    bool skipPrompt = false;
+
+                    if (SUBTITLE_ACTION == "convert") {
+                        act = SUB_ACT_CONVERT_TEXT;
+                        skipPrompt = true;
+                    } else if (SUBTITLE_ACTION == "burn") {
+                        act = SUB_ACT_BURN_HARD;
+                        skipPrompt = true;
+                    } else if (SUBTITLE_ACTION == "skip") {
+                        act = SUB_ACT_SKIP_CURRENT;
+                        skipPrompt = true;
+                    } else if (SUBTITLE_ACTION == "remove" || SUBTITLE_ACTION == "drop") {
+                        act = SUB_ACT_DROP_SUBS;
+                        skipPrompt = true;
+                    } else if (forceSubAction != -1) {
+                        act = (SubtitleIncompatAction)forceSubAction;
+                        skipPrompt = true;
+                    }
+
+                    if (!skipPrompt) {
+                        SubtitleDialogResult dr = dialogSubtitleIncompatibility(filePath, detectedTypes, true);
+                        act = dr.action;
+                        if (dr.applyToAll && act != SUB_ACT_CANCEL_ALL) {
+                            forceSubAction = (int)act;
+                        }
+                    }
+
                     if (act == SUB_ACT_CONVERT_TEXT) {
                         subExtraArgs = " -c:s mov_text";
                     } else if (act == SUB_ACT_BURN_HARD) {
@@ -3679,6 +3784,8 @@ void batchCompressVideo() {
                             else escaped += c;
                         }
                         subHardsubFilter = "subtitles='" + escaped + "'";
+                    } else if (act == SUB_ACT_DROP_SUBS) {
+                        subExtraArgs = " -sn";
                     } else if (act == SUB_ACT_CHANGE_TO_MKV) {
                         dialogChosenFormat = (currentFmt.find("H.265") != string::npos || currentFmt.find("HEVC") != string::npos) ? "MKV(H.265/HEVC)" : "MKV(H.264)";
                         OUTPUT_FORMAT = dialogChosenFormat;
@@ -3686,15 +3793,28 @@ void batchCompressVideo() {
                         ft = prepareFFmpegTarget(outPath, {filePath});
                         subExtraArgs = " -c:s copy";
                     } else if (act == SUB_ACT_SKIP_CURRENT) {
+                        cout << "\n";
+                        printColor(tr("[INFO] Skipped: Incompatible subtitles detected (",
+                                      "[ИНФО] Пропущено: Обнаружены несовместимые субтитры (")
+                                   + fs::u8path(filePath).filename().u8string() + ")", YELLOW);
+                        skippedFiles.push_back(fs::u8path(filePath).filename().u8string());
                         return PROC_FAIL;
                     } else if (act == SUB_ACT_CANCEL_ALL) {
                         return PROC_CANCEL_BATCH;
                     }
                 } else {
-                    subExtraArgs = " -c:s copy";
+                    if (SUBTITLE_ACTION == "remove" || SUBTITLE_ACTION == "drop") {
+                        subExtraArgs = " -sn";
+                    } else {
+                        subExtraArgs = " -c:s copy";
+                    }
                 }
             } else if (!subTracks.empty()) {
-                subExtraArgs = " -c:s copy";
+                if (SUBTITLE_ACTION == "remove" || SUBTITLE_ACTION == "drop") {
+                    subExtraArgs = " -sn";
+                } else {
+                    subExtraArgs = " -c:s copy";
+                }
             }
 
             wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
@@ -3757,6 +3877,7 @@ void batchCompressVideo() {
                 } else {
                     cout << "1\n";
                     printColor(tr("[INFO] File skipped.", "[ИНФО] Файл пропущен."), YELLOW);
+                    skippedFiles.push_back(fs::u8path(filePath).filename().u8string());
                     return PROC_FAIL;
                 }
             }
@@ -3838,6 +3959,7 @@ void batchCompressVideo() {
                 int selectedTrackIdx = -1;
                 if (!selectVideoTrackForFile(files[i], selectedMap, true, &applyToAllBatch, &selectedTrackIdx)) {
                     printColor(tr("[INFO] File skipped.", "[ИНФО] Файл пропущен."), YELLOW);
+                    skippedFiles.push_back(fs::u8path(files[i]).filename().u8string());
                     fail++;
                     i++;
                     continue;
@@ -3927,6 +4049,7 @@ void batchCompressVideo() {
                 int selectedTrackIdx = -1;
                 if (!selectAudioTrackForFile(files[i], selectedMap, true, true, &keepAllForBatch, &selectedTrackIdx)) {
                     printColor(tr("[INFO] File skipped.", "[ИНФО] Файл пропущен."), YELLOW);
+                    skippedFiles.push_back(fs::u8path(files[i]).filename().u8string());
                     fail++;
                     i++;
                     continue;
@@ -4067,6 +4190,7 @@ void batchCompressVideo() {
                 int selectedTrackIdx = -1;
                 if (!selectAudioTrackForFile(cf.filePath, selectedAudioMap, true, true, &keepAllBatch, &selectedTrackIdx)) {
                     printColor(tr("[INFO] File skipped.", "[ИНФО] Файл пропущен."), YELLOW);
+                    skippedFiles.push_back(fs::u8path(cf.filePath).filename().u8string());
                     fail++;
                     continue;
                 }
@@ -4134,14 +4258,30 @@ void batchCompressVideo() {
         printColor("================================================================================", YELLOW);
     }
 
+    // Skipped files list
+    if (!skippedFiles.empty()) {
+        cout << "\n";
+        printColor("========================================", YELLOW);
+        printColor(tr(" The following videos were skipped: ", " Следующие видео были пропущены: "), YELLOW);
+        printColor("========================================", YELLOW);
+        for (const auto& sf : skippedFiles) {
+            cout << "  " << sf << "\n";
+        }
+        printColor("========================================", YELLOW);
+    }
+
     // Final result summary
+    cout << "\n";
+    printColor("========================================", GREEN);
+    printColor(tr(" Batch processing completed successfully!", " Пакетная обработка успешно завершена!"), GREEN);
+    printColor("========================================", GREEN);
     cout << "\n";
     printColor("========================================", GREEN);
     char summary[128];
     snprintf(summary, sizeof(summary), " %s: %d %s, %d %s",
              tr("Result", "Результат").c_str(), success,
              tr("success", "успешно").c_str(), fail,
-             tr("failed", "ошибок").c_str());
+             tr("failed/skipped", "ошибок/пропущено").c_str());
     printColor(summary, fail > 0 ? YELLOW : GREEN);
     printColor("========================================", GREEN);
     cout << "\n";
@@ -4392,7 +4532,22 @@ void convertFormat() {
             }
         }
         if (hasComplexSubs) {
-            SubtitleIncompatAction act = dialogSubtitleIncompatibility(inputFile, detectedTypes);
+            SubtitleIncompatAction act = SUB_ACT_SKIP_CURRENT;
+            if (SUBTITLE_ACTION == "convert") {
+                act = SUB_ACT_CONVERT_TEXT;
+            } else if (SUBTITLE_ACTION == "burn") {
+                act = SUB_ACT_BURN_HARD;
+            } else if (SUBTITLE_ACTION == "skip") {
+                printColor(tr("[INFO] Video skipped due to subtitle settings.", "[ИНФО] Видео пропущено согласно настройкам субтитров."), YELLOW);
+                waitForKey();
+                return;
+            } else if (SUBTITLE_ACTION == "remove" || SUBTITLE_ACTION == "drop") {
+                act = SUB_ACT_DROP_SUBS;
+            } else {
+                SubtitleDialogResult dr = dialogSubtitleIncompatibility(inputFile, detectedTypes, false);
+                act = dr.action;
+            }
+
             if (act == SUB_ACT_CONVERT_TEXT) {
                 subExtraArgs = " -c:s mov_text";
             } else if (act == SUB_ACT_BURN_HARD) {
@@ -4405,6 +4560,8 @@ void convertFormat() {
                     else escaped += c;
                 }
                 subHardsubFilter = "subtitles='" + escaped + "'";
+            } else if (act == SUB_ACT_DROP_SUBS) {
+                subExtraArgs = " -sn";
             } else if (act == SUB_ACT_CHANGE_TO_MKV) {
                 chosenFormat = (currentFmt.find("H.265") != string::npos || currentFmt.find("HEVC") != string::npos) ? "MKV(H.265/HEVC)" : "MKV(H.264)";
                 outPath = buildOutputPath(inputFile, "_converted", "mkv");
@@ -4414,10 +4571,18 @@ void convertFormat() {
                 return;
             }
         } else {
-            subExtraArgs = " -c:s copy";
+            if (SUBTITLE_ACTION == "remove" || SUBTITLE_ACTION == "drop") {
+                subExtraArgs = " -sn";
+            } else {
+                subExtraArgs = " -c:s copy";
+            }
         }
     } else if (!mp.subtitleTracks.empty()) {
-        subExtraArgs = " -c:s copy";
+        if (SUBTITLE_ACTION == "remove" || SUBTITLE_ACTION == "drop") {
+            subExtraArgs = " -sn";
+        } else {
+            subExtraArgs = " -c:s copy";
+        }
     }
 
     printColor("\n" + tr("Output: ", "Выход: ") + outPath, GREEN);
@@ -5291,6 +5456,78 @@ void compressVideo() {
         }
     }
 
+    string subExtraArgs = "";
+    string subHardsubFilter = "";
+    string currentFmt = chosenFormat.empty() ? OUTPUT_FORMAT : chosenFormat;
+    bool isMp4Output = (currentFmt.find("MP4") != string::npos || currentFmt.find("MOV") != string::npos || currentFmt.find("M4V") != string::npos);
+
+    vector<SubtitleTrack> subTracks = getSubtitleTracks(inputFile);
+    if (isMp4Output && !subTracks.empty()) {
+        bool hasComplexSubs = false;
+        string detectedTypes = "";
+        for (const auto& st : subTracks) {
+            string lcodec = st.codec;
+            transform(lcodec.begin(), lcodec.end(), lcodec.begin(), ::tolower);
+            if (lcodec != "mov_text") {
+                hasComplexSubs = true;
+                if (!detectedTypes.empty()) detectedTypes += ", ";
+                detectedTypes += st.codec.empty() ? "unknown" : st.codec;
+            }
+        }
+        if (hasComplexSubs) {
+            SubtitleIncompatAction act = SUB_ACT_SKIP_CURRENT;
+            if (SUBTITLE_ACTION == "convert") {
+                act = SUB_ACT_CONVERT_TEXT;
+            } else if (SUBTITLE_ACTION == "burn") {
+                act = SUB_ACT_BURN_HARD;
+            } else if (SUBTITLE_ACTION == "skip") {
+                printColor(tr("[INFO] Video skipped due to subtitle settings.", "[ИНФО] Видео пропущено согласно настройкам субтитров."), YELLOW);
+                waitForKey();
+                return;
+            } else if (SUBTITLE_ACTION == "remove" || SUBTITLE_ACTION == "drop") {
+                act = SUB_ACT_DROP_SUBS;
+            } else {
+                SubtitleDialogResult dr = dialogSubtitleIncompatibility(inputFile, detectedTypes, false);
+                act = dr.action;
+            }
+
+            if (act == SUB_ACT_CONVERT_TEXT) {
+                subExtraArgs = " -c:s mov_text";
+            } else if (act == SUB_ACT_BURN_HARD) {
+                string safeIn = inputFile;
+                string escaped = "";
+                for (char c : safeIn) {
+                    if (c == '\\') escaped += "/";
+                    else if (c == ':') escaped += "\\:";
+                    else if (c == '\'') escaped += "'\\''";
+                    else escaped += c;
+                }
+                subHardsubFilter = "subtitles='" + escaped + "'";
+            } else if (act == SUB_ACT_DROP_SUBS) {
+                subExtraArgs = " -sn";
+            } else if (act == SUB_ACT_CHANGE_TO_MKV) {
+                chosenFormat = (currentFmt.find("H.265") != string::npos || currentFmt.find("HEVC") != string::npos) ? "MKV(H.265/HEVC)" : "MKV(H.264)";
+                outPath = buildOutputPath(inputFile, "_compressed", "mkv");
+                ft = prepareFFmpegTarget(outPath, {inputFile});
+                subExtraArgs = " -c:s copy";
+            } else if (act == SUB_ACT_SKIP_CURRENT || act == SUB_ACT_CANCEL_ALL) {
+                return;
+            }
+        } else {
+            if (SUBTITLE_ACTION == "remove" || SUBTITLE_ACTION == "drop") {
+                subExtraArgs = " -sn";
+            } else {
+                subExtraArgs = " -c:s copy";
+            }
+        }
+    } else if (!subTracks.empty()) {
+        if (SUBTITLE_ACTION == "remove" || SUBTITLE_ACTION == "drop") {
+            subExtraArgs = " -sn";
+        } else {
+            subExtraArgs = " -c:s copy";
+        }
+    }
+
     string savedFormat = OUTPUT_FORMAT;
     if (!chosenFormat.empty()) OUTPUT_FORMAT = chosenFormat;
 
@@ -5307,7 +5544,7 @@ void compressVideo() {
         if (!streamMapArg.empty()) {
             cmd += utf8ToWstring(streamMapArg);
         }
-        string vfSpec = buildVideoFilterSpec(inputFile, useAutoAlign, useDownscale4K);
+        string vfSpec = buildVideoFilterSpec(inputFile, useAutoAlign, useDownscale4K, subHardsubFilter);
         if (!vfSpec.empty()) {
             cmd += L" " + utf8ToWstring(vfSpec);
         }
@@ -5319,6 +5556,9 @@ void compressVideo() {
         cmd += L" " + utf8ToWstring(getVideoQualityArgs(crf, useCPU || useReverseHybrid));
         cmd += L" " + utf8ToWstring(getVideoPresetArgs("slower", useCPU || useReverseHybrid));
         cmd += L" " + utf8ToWstring(getAudioCodecArgs(opAudioCodec));
+        if (!subExtraArgs.empty() && subHardsubFilter.empty()) {
+            cmd += L" " + utf8ToWstring(subExtraArgs);
+        }
         if (OVERWRITE_FILES) cmd += L" -y";
         cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(ft.writePath)) + L"\"";
 
@@ -6368,6 +6608,53 @@ void selectAudioCodecMenu() {
     }
 }
 
+void selectSubtitleActionMenu() {
+    vector<string> keys = { "ask", "convert", "burn", "skip", "remove" };
+    vector<string> options = {
+        tr("Always ask",
+           "Всегда спрашивать"),
+        tr("Always convert subtitles (Recommended, plain text without original style)",
+           "Всегда Конвертировать субтитры (рекомендуется, будут как просто текст без изначального стиля)"),
+        tr("Always burn subtitles into video (Preserves style, permanently embedded in video)",
+           "Всегда вшивать субтитры в видео (Сохраняет стиль, но вшивает субтитры прям в само видео, их нельзя будет отключить)"),
+        tr("Always skip videos with subtitles",
+           "Всегда пропускать видео с субтитрами"),
+        tr("Always remove subtitles from video",
+           "Всегда удалять субтитры из видео")
+    };
+    vector<string> hints = {
+        tr("Prompts for action whenever incompatible subtitles are detected for the output container (e.g. MP4).",
+           "При обнаружении несовместимых со сложными форматами контейнеров (MP4) субтитров будет выводиться диалог выбора действия."),
+        tr("Automatically converts subtitles to standard mov_text format without showing the prompt.",
+           "Автоматически конвертирует субтитры в стандартный формат mov_text без запроса диалога."),
+        tr("Automatically burns subtitles into video frames, preserving fonts and styling.",
+           "Автоматически вшивает субтитры в видеокадры с сохранением шрифтов и стилей."),
+        tr("Automatically skips files with incompatible subtitles without processing.",
+           "Автоматически пропускает файлы со сложными субтитрами без обработки."),
+        tr("Automatically strips all subtitle tracks from the output video.",
+           "Автоматически удаляет все дорожки субтитров из выходного файла.")
+    };
+
+    int cur = 0;
+    for (int i = 0; i < (int)keys.size(); i++) {
+        if (keys[i] == SUBTITLE_ACTION || (keys[i] == "remove" && SUBTITLE_ACTION == "drop")) { cur = i; break; }
+    }
+
+    string desc = tr(
+        "Configure automatic subtitle handling when incompatible with container (e.g. MP4).\n"
+        "Controls whether to prompt or automatically apply a chosen method.",
+        "Настройка обработки несовместимых субтитров при создании MP4/MOV файлов.\n"
+        "Определяет, запрашивать ли действие каждый раз или применять выбранное автоматически.");
+
+    int sel = arrowSelect(tr("SUBTITLE PROMPT", "ЗАПРОС СУБТИТРОВ"), desc, options, cur, hints);
+    if (sel >= 0) {
+        SUBTITLE_ACTION = keys[sel];
+        saveConfig();
+        printColor(tr("[OK] Subtitle prompt: ", "[OK] Запрос субтитров: ") + getSubtitleActionSettingName(), GREEN);
+        waitForKey();
+    }
+}
+
 void selectDeleteOriginalMenu() {
     vector<string> keys = { "ask", "no", "yes" };
     vector<string> options = {
@@ -6474,11 +6761,12 @@ void settingsMenu() {
             "m. " + tr("Keep metadata: [", "Сохранять метаданные: [") + (KEEP_METADATA ? tr("ON", "ВКЛ") : tr("OFF", "ВЫКЛ")) + "]",
             "v. " + tr("Video codec prompt: [", "Запрос видеокодека: [") + (VIDEO_CODEC_ASK ? tr("Always Ask", "Всегда спрашивать") : tr("Always use configured settings", "Всегда как задано моими настройками")) + "]",
             "a. " + tr("Audio codec prompt: [", "Запрос аудиокодека: [") + getAudioCodecSettingName() + "]",
+            "t. " + tr("Subtitle prompt: [", "Запрос субтитров: [") + getSubtitleActionSettingName() + "]",
             "d. " + tr("Delete original prompt: [", "Запрос удаления оригинала: [") + getDeleteOriginalSettingName() + "]",
             "c. " + tr("Save video cover: [", "Сохранять обложку видео: [") + (SAVE_COVER ? tr("ON", "ВКЛ") : tr("OFF", "ВЫКЛ")) + "]",
             "u. " + tr("Update FFmpeg & components", "Обновить FFmpeg"),
         };
-        vector<int> actions = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
+        vector<int> actions = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
 
         string desc = "";
 
@@ -6656,8 +6944,9 @@ void settingsMenu() {
             break;
         }
         case 12: selectAudioCodecMenu(); break;
-        case 13: selectDeleteOriginalMenu(); break;
-        case 14: {
+        case 13: selectSubtitleActionMenu(); break;
+        case 14: selectDeleteOriginalMenu(); break;
+        case 15: {
             vector<string> opts = {tr("ON", "ВКЛ"), tr("OFF", "ВЫКЛ")};
             string desc = tr(
                 "When ON, the video cover/thumbnail is preserved and embedded\n"
@@ -6677,7 +6966,7 @@ void settingsMenu() {
             }
             break;
         }
-        case 15: updateComponentsMenu(); break;
+        case 16: updateComponentsMenu(); break;
         }
     }
 }
@@ -6909,7 +7198,7 @@ char mainMenuSelect() {
     while (true) {
         clearScreen();
         printColor("========================================", CYAN);
-        printColor(" MR CLI FOR FFMPEG v1.1.4", CYAN);
+        printColor(" MR CLI FOR FFMPEG v1.1.5", CYAN);
         printColor("========================================", CYAN);
         printColor("========================================", GREEN);
         printColor(" FFMPEG:  " + string(FFMPEG_FOUND ? tr("[OK] installed", "[OK] установлен") : tr("[ERROR] not found", "[ОШИБКА] не найден")), FFMPEG_FOUND ? GREEN : RED);
