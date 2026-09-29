@@ -10,15 +10,18 @@
 #include <shlobj.h>
 #include <commdlg.h>
 #include <filesystem>
-#include <wininet.h>
 #include <iomanip>
 #include <intrin.h>
+
+// Component downloads use the Windows BITS COM API (AGENTS.md 4.5).
+// Both the coclass and the interface carry a uuid attribute, so __uuidof() resolves
+// them without pulling in <initguid.h>.
+#include <bits.h>
 
 #pragma comment(lib, "Shell32.lib")
 #pragma comment(lib, "Ole32.lib")
 #pragma comment(lib, "OleAut32.lib")
 #pragma comment(lib, "Comdlg32.lib")
-#pragma comment(lib, "Wininet.lib")
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "Advapi32.lib")
 
@@ -378,7 +381,7 @@ void setUTF8() {
         dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
         SetConsoleMode(hOut, dwMode);
     }
-    SetConsoleTitleW(L"MR CLI FOR FFMPEG v1.1.5");
+    SetConsoleTitleW(L"MR CLI FOR FFMPEG v1.1.6");
 }
 
 void clearScreen() {
@@ -541,29 +544,6 @@ bool createDirRecursive(const string& p) {
     return fs::create_directories(fs::u8path(p), ec) || dirExists(p);
 }
 
-int runProcessWait(const wstring& cmdLine) {
-    STARTUPINFOW si;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&pi, sizeof(pi));
-
-    wstring mutableCmd = cmdLine;
-    if (!CreateProcessW(NULL, &mutableCmd[0], NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-        return -1;
-    }
-
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD exitCode = 0;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    return (int)exitCode;
-}
-
 // ========== NATIVE DOWNLOADER & ZIP EXTRACTOR ==========
 void printComponentProgress(const string& label, double percent, const string& extraInfo = "") {
     if (percent < 0) percent = 0;
@@ -592,87 +572,589 @@ void printComponentProgress(const string& label, double percent, const string& e
     cout << line << flush;
 }
 
+// Downloads a component over the Windows BITS COM API.
+//
+// AGENTS.md 4.5 forbids raw WinINet here: an "InternetOpen + InternetOpenUrl +
+// InternetReadFile" stream inside a binary that also spawns child processes is the
+// canonical dropper signature that ML classifiers (Wacatac.*!ml, Elastic, SecureAge)
+// score highly. BITS runs the transfer inside the trusted Windows service, so this
+// binary no longer contains a network client at all and WININET.dll leaves the
+// import table entirely.
+//
+// Progress is polled through IBackgroundCopyJob::QueryStatus so the user still sees
+// a live progress bar; a foreground priority keeps the transfer at normal speed.
 bool downloadFile(const string& url, const string& destFile, const string& label = "") {
-    HINTERNET hSession = InternetOpenW(
-        L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-        INTERNET_OPEN_TYPE_PRECONFIG,
-        NULL, NULL, 0
-    );
-    if (!hSession) return false;
+    // main() already initialises COM, but keep this function self-contained so it can
+    // never be reached from an uninitialised apartment.
+    const HRESULT initHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool needUninit = SUCCEEDED(initHr);
 
-    wstring wUrl = utf8ToWstring(url);
-    DWORD httpFlags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_DONT_CACHE | INTERNET_FLAG_NO_UI;
-    HINTERNET hReq = InternetOpenUrlW(hSession, wUrl.c_str(), NULL, 0, httpFlags, 0);
-    if (!hReq) {
-        InternetCloseHandle(hSession);
+    IBackgroundCopyManager* mgr = nullptr;
+    IBackgroundCopyJob* job = nullptr;
+
+    auto cleanup = [&]() {
+        if (job) job->Release();
+        if (mgr) mgr->Release();
+        if (needUninit) CoUninitialize();
+    };
+
+    HRESULT hr = CoCreateInstance(__uuidof(BackgroundCopyManager), nullptr, CLSCTX_ALL,
+                                  __uuidof(IBackgroundCopyManager), (void**)&mgr);
+    if (FAILED(hr) || !mgr) {
+        // The transfer service itself is unavailable, which needs a different answer
+        // than a plain network failure: nothing is wrong with the connection.
+        printColor(tr("[ERROR] Windows transfer service (BITS) is unavailable on this system!",
+                      "[ОШИБКА] Служба передачи данных Windows (BITS) недоступна на этой системе!"), RED);
+        printColor(tr("[INFO] Enable it in Services, or download FFmpeg manually.",
+                      "[ИНФО] Включите её в службах или скачайте FFmpeg вручную."), YELLOW);
+        cleanup();
         return false;
     }
 
-    DWORD contentLength = 0;
-    DWORD clLen = sizeof(contentLength);
-    DWORD idx = 0;
-    HttpQueryInfoW(hReq, HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER, &contentLength, &clLen, &idx);
+    GUID jobId = {};
+    hr = mgr->CreateJob(L"MR CLI for FFmpeg component", BG_JOB_TYPE_DOWNLOAD, &jobId, &job);
+    if (FAILED(hr) || !job) { cleanup(); return false; }
 
-    string tmpFile = destFile + ".tmp";
-    wstring wTmp = utf8ToWstring(tmpFile);
+    // BITS transfers into the .tmp name and only publishes it on success, so the
+    // previous archive stays intact if the transfer dies half way through.
+    const wstring wTmp = utf8ToWstring(destFile + ".tmp");
+    hr = job->AddFile(utf8ToWstring(url).c_str(), wTmp.c_str());
+    if (FAILED(hr)) { job->Cancel(); cleanup(); return false; }
 
-    HANDLE hFile = CreateFileW(
-        wTmp.c_str(), GENERIC_WRITE, 0, NULL,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL
-    );
-    if (hFile == INVALID_HANDLE_VALUE) {
-        InternetCloseHandle(hReq);
-        InternetCloseHandle(hSession);
-        return false;
-    }
+    // Foreground priority: the service would otherwise throttle an interactive
+    // download down to background-trickle speed.
+    job->SetPriority(BG_JOB_PRIORITY_FOREGROUND);
+    job->SetNotifyFlags(BG_NOTIFY_JOB_TRANSFERRED | BG_NOTIFY_JOB_ERROR);
+    // Retry transient network failures in a few seconds rather than the 3 minute default.
+    job->SetMinimumRetryDelay(3);
+    job->SetNoProgressTimeout(60);
 
-    char buf[32768];
-    DWORD dwRead = 0;
-    DWORD totalRead = 0;
+    hr = job->Resume();
+    if (FAILED(hr)) { job->Cancel(); cleanup(); return false; }
 
-    while (InternetReadFile(hReq, buf, sizeof(buf), &dwRead) && dwRead > 0) {
-        DWORD dwWritten = 0;
-        WriteFile(hFile, buf, dwRead, &dwWritten, NULL);
-        totalRead += dwRead;
-        if (contentLength > 0) {
-            double pct = (double)totalRead / (double)contentLength * 100.0;
-            double curMB = (double)totalRead / (1048576.0);
-            double totMB = (double)contentLength / (1048576.0);
+    // BITS retries transient errors on its own and can therefore wait indefinitely.
+    // Cap the wait so the console never hangs on a dead connection.
+    const ULONGLONG startTick = GetTickCount64();
+    const ULONGLONG maxWaitMs = 30ULL * 60ULL * 1000ULL;
+    bool transferred = false;
+
+    while (GetTickCount64() - startTick < maxWaitMs) {
+        Sleep(400);
+
+        BG_JOB_STATE state = BG_JOB_STATE_QUEUED;
+        if (FAILED(job->GetState(&state))) break;
+
+        if (state == BG_JOB_STATE_TRANSFERRED) { transferred = true; break; }
+        if (state == BG_JOB_STATE_ERROR || state == BG_JOB_STATE_CANCELLED) break;
+
+        BG_JOB_PROGRESS prog = {};
+        if (SUCCEEDED(job->GetProgress(&prog)) && prog.BytesTotal > 0) {
+            double pct = (double)prog.BytesTransferred * 100.0 / (double)prog.BytesTotal;
             char info[64];
-            snprintf(info, sizeof(info), "(%.1f / %.1f MB)", curMB, totMB);
+            snprintf(info, sizeof(info), "(%.1f / %.1f MB)",
+                     (double)prog.BytesTransferred / 1048576.0,
+                     (double)prog.BytesTotal / 1048576.0);
             printComponentProgress(label, pct, info);
         }
     }
 
-    CloseHandle(hFile);
-    InternetCloseHandle(hReq);
-    InternetCloseHandle(hSession);
+    if (transferred) {
+        // Acknowledge the job. This is also what releases BITS' lock on the finished
+        // file, so the rename below cannot hit a sharing violation.
+        job->Complete();
+        const wstring wDst = utf8ToWstring(destFile);
+        MoveFileExW(wTmp.c_str(), wDst.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
+    } else {
+        // Drop the job from the service store and remove any partial transfer.
+        job->Cancel();
+    }
 
-    // Move temp file to destination
-    wstring wDst = utf8ToWstring(destFile);
-    MoveFileExW(wTmp.c_str(), wDst.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
-
+    cleanup();
     cout << "\n";
-    return fileExists(destFile) && (totalRead > 1000);
+
+    if (!transferred) return false;
+
+    std::error_code ec;
+    const uintmax_t sz = fs::file_size(fs::u8path(destFile), ec);
+    return !ec && sz > 1000;
 }
 
-bool extractZip(const string& zipPath, const string& destDir) {
+// ========== NATIVE ZIP EXTRACTION ==========
+// AGENTS.md 4.5: never hand a freshly downloaded archive to an external unpacker.
+// Running System32\tar.exe over an archive that was just fetched is the remaining half
+// of the drop-and-execute pattern that ML classifiers weight, and it was enough to keep
+// the binary flagged after the downloader itself was moved to BITS. Windows ships no
+// DEFLATE decoder, so the container is parsed here and each entry is inflated by the
+// RFC 1951 decoder below.
+namespace zipx {
+
+const size_t WIN_SIZE = 32768;
+
+// Reads the compressed bytes of one entry straight from the archive, so a 160 MB zip
+// is never held in memory.
+struct BitIn {
+    HANDLE h = INVALID_HANDLE_VALUE;
+    unsigned long long left = 0;
+    unsigned char buf[1 << 16];
+    size_t bufPos = 0;
+    size_t bufLen = 0;
+    unsigned held = 0;
+    bool bad = false;
+
+    bool fill() {
+        if (bufPos < bufLen) return true;
+        if (left == 0) return false;
+        DWORD want = (DWORD)((left < sizeof(buf)) ? left : (unsigned long long)sizeof(buf));
+        DWORD got = 0;
+        bufPos = 0;
+        bufLen = 0;
+        if (!ReadFile(h, buf, want, &got, nullptr) || got == 0) { bad = true; return false; }
+        bufLen = got;
+        left -= got;
+        return true;
+    }
+
+    int bit() {
+        if (!fill()) { bad = true; return 0; }
+        int b = (buf[bufPos] >> held) & 1;
+        if (++held == 8) { held = 0; bufPos++; }
+        return b;
+    }
+
+    int bits(int need) {
+        int val = 0;
+        for (int i = 0; i < need; i++) val |= bit() << i;
+        return val;
+    }
+
+    // DEFLATE is LSB-first inside a byte, so only a partially consumed byte is skipped.
+    void alignByte() {
+        if (held) { held = 0; bufPos++; }
+    }
+
+    int rawByte() {
+        if (!fill()) { bad = true; return -1; }
+        return buf[bufPos++];
+    }
+};
+
+// 32 KB sliding window: a back reference reaches at most this far back, and the ring is
+// flushed to disk every time it fills.
+struct Win {
+    HANDLE h = INVALID_HANDLE_VALUE;
+    unsigned char ring[WIN_SIZE];
+    size_t pos = 0;
+    unsigned long long emitted = 0;
+    bool bad = false;
+
+    void put(unsigned char c) {
+        ring[pos++] = c;
+        emitted++;
+        if (pos == WIN_SIZE) flush();
+    }
+
+    void flush() {
+        if (!pos) return;
+        DWORD wr = 0;
+        if (!WriteFile(h, ring, (DWORD)pos, &wr, nullptr) || wr != pos) bad = true;
+        pos = 0;
+    }
+
+    unsigned char back(size_t dist) { return ring[(pos + WIN_SIZE - dist) & (WIN_SIZE - 1)]; }
+};
+
+struct Huff {
+    short count[16];
+    vector<short> symbol;
+};
+
+bool buildHuff(Huff& h, const short* lengths, int n) {
+    for (int len = 0; len <= 15; len++) h.count[len] = 0;
+    for (int sym = 0; sym < n; sym++) h.count[lengths[sym]]++;
+    h.symbol.assign(n, 0);
+    if (h.count[0] == n) return true;
+    int left = 1;
+    for (int len = 1; len <= 15; len++) {
+        left <<= 1;
+        left -= h.count[len];
+        if (left < 0) return false;
+    }
+    short offs[16];
+    offs[0] = 0;
+    offs[1] = 0;
+    for (int len = 1; len < 15; len++) offs[len + 1] = (short)(offs[len] + h.count[len]);
+    for (int sym = 0; sym < n; sym++) if (lengths[sym]) h.symbol[offs[lengths[sym]]++] = (short)sym;
+    return true;
+}
+
+int decodeSym(BitIn& s, const Huff& h) {
+    int code = 0, first = 0, index = 0;
+    for (int len = 1; len <= 15; len++) {
+        int b = s.bit();
+        if (s.bad) return -1;
+        code |= b;
+        int count = h.count[len];
+        if (code - count < first) return h.symbol[index + (code - first)];
+        index += count;
+        first += count;
+        first <<= 1;
+        code <<= 1;
+    }
+    return -1;
+}
+
+const short LEN_BASE[29] = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
+const short LEN_EXTRA[29] = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
+const short DIST_BASE[30] = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
+const short DIST_EXTRA[30] = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
+
+bool inflateCodes(BitIn& s, Win& w, const Huff& lencode, const Huff& distcode, unsigned long long cap) {
+    for (;;) {
+        int sym = decodeSym(s, lencode);
+        if (sym < 0) return false;
+        if (sym < 256) {
+            w.put((unsigned char)sym);
+        } else if (sym == 256) {
+            return true;
+        } else {
+            sym -= 257;
+            if (sym >= 29) return false;
+            size_t len = LEN_BASE[sym] + (size_t)s.bits(LEN_EXTRA[sym]);
+            int dsym = decodeSym(s, distcode);
+            if (dsym < 0 || dsym >= 30) return false;
+            size_t dist = DIST_BASE[dsym] + (size_t)s.bits(DIST_EXTRA[dsym]);
+            if (dist == 0 || dist > WIN_SIZE) return false;
+            if (w.emitted + len > cap) return false;
+            for (size_t i = 0; i < len; i++) w.put(w.back(dist));
+        }
+        if (s.bad || w.bad) return false;
+    }
+}
+
+bool inflateStored(BitIn& s, Win& w, unsigned long long cap) {
+    s.alignByte();
+    int b0 = s.rawByte(), b1 = s.rawByte(), n0 = s.rawByte(), n1 = s.rawByte();
+    if (b0 < 0 || b1 < 0 || n0 < 0 || n1 < 0) return false;
+    unsigned len = (unsigned)b0 | ((unsigned)b1 << 8);
+    unsigned nlen = (unsigned)n0 | ((unsigned)n1 << 8);
+    if ((len ^ 0xFFFFu) != nlen) return false;
+    if (w.emitted + len > cap) return false;
+    for (unsigned i = 0; i < len; i++) {
+        int c = s.rawByte();
+        if (c < 0) return false;
+        w.put((unsigned char)c);
+    }
+    return !w.bad;
+}
+
+bool inflateFixed(BitIn& s, Win& w, unsigned long long cap) {
+    short lengths[288];
+    int i = 0;
+    for (; i < 144; i++) lengths[i] = 8;
+    for (; i < 256; i++) lengths[i] = 9;
+    for (; i < 280; i++) lengths[i] = 7;
+    for (; i < 288; i++) lengths[i] = 8;
+    Huff lencode, distcode;
+    if (!buildHuff(lencode, lengths, 288)) return false;
+    for (i = 0; i < 30; i++) lengths[i] = 5;
+    if (!buildHuff(distcode, lengths, 30)) return false;
+    return inflateCodes(s, w, lencode, distcode, cap);
+}
+
+bool inflateDynamic(BitIn& s, Win& w, unsigned long long cap) {
+    static const short ORDER[19] = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
+    int nlen = s.bits(5) + 257;
+    int ndist = s.bits(5) + 1;
+    int ncode = s.bits(4) + 4;
+    if (s.bad || nlen > 286 || ndist > 30) return false;
+
+    short lengths[320];
+    for (int i = 0; i < 19; i++) lengths[i] = 0;
+    for (int i = 0; i < ncode; i++) lengths[ORDER[i]] = (short)s.bits(3);
+
+    Huff clen;
+    if (!buildHuff(clen, lengths, 19)) return false;
+
+    int index = 0;
+    while (index < nlen + ndist) {
+        int sym = decodeSym(s, clen);
+        if (sym < 0) return false;
+        if (sym < 16) {
+            lengths[index++] = (short)sym;
+            continue;
+        }
+        int repeat = 0, filler = 0;
+        if (sym == 16) {
+            if (index == 0) return false;
+            filler = lengths[index - 1];
+            repeat = 3 + s.bits(2);
+        } else if (sym == 17) {
+            repeat = 3 + s.bits(3);
+        } else {
+            repeat = 11 + s.bits(7);
+        }
+        if (s.bad || index + repeat > nlen + ndist) return false;
+        while (repeat-- > 0) lengths[index++] = (short)filler;
+    }
+    if (lengths[256] == 0) return false;
+
+    Huff lencode, distcode;
+    if (!buildHuff(lencode, lengths, nlen)) return false;
+    if (!buildHuff(distcode, lengths + nlen, ndist)) return false;
+    return inflateCodes(s, w, lencode, distcode, cap);
+}
+
+bool inflateDeflate(HANDLE zip, unsigned long long dataOff, unsigned long long compSize,
+                    unsigned long long uncompSize, HANDLE out) {
+    LARGE_INTEGER li;
+    li.QuadPart = (LONGLONG)dataOff;
+    if (!SetFilePointerEx(zip, li, nullptr, FILE_BEGIN)) return false;
+
+    BitIn s;
+    s.h = zip;
+    s.left = compSize;
+    Win w;
+    w.h = out;
+
+    for (;;) {
+        int last = s.bit();
+        int type = s.bits(2);
+        if (s.bad) return false;
+        bool ok;
+        if (type == 0) ok = inflateStored(s, w, uncompSize);
+        else if (type == 1) ok = inflateFixed(s, w, uncompSize);
+        else if (type == 2) ok = inflateDynamic(s, w, uncompSize);
+        else return false;
+        if (!ok) return false;
+        if (last) break;
+    }
+
+    w.flush();
+    return !w.bad && w.emitted == uncompSize;
+}
+
+bool copyStored(HANDLE zip, unsigned long long off, unsigned long long size, HANDLE out) {
+    LARGE_INTEGER li;
+    li.QuadPart = (LONGLONG)off;
+    if (!SetFilePointerEx(zip, li, nullptr, FILE_BEGIN)) return false;
+    unsigned char buf[1 << 16];
+    unsigned long long left = size;
+    while (left) {
+        DWORD want = (DWORD)((left < sizeof(buf)) ? left : (unsigned long long)sizeof(buf));
+        DWORD got = 0;
+        if (!ReadFile(zip, buf, want, &got, nullptr) || got == 0) return false;
+        DWORD wr = 0;
+        if (!WriteFile(out, buf, got, &wr, nullptr) || wr != got) return false;
+        left -= got;
+    }
+    return true;
+}
+
+bool readAt(HANDLE h, unsigned long long off, void* dst, size_t n) {
+    LARGE_INTEGER li;
+    li.QuadPart = (LONGLONG)off;
+    if (!SetFilePointerEx(h, li, nullptr, FILE_BEGIN)) return false;
+    unsigned char* d = (unsigned char*)dst;
+    size_t got = 0;
+    while (got < n) {
+        DWORD r = 0;
+        if (!ReadFile(h, d + got, (DWORD)(n - got), &r, nullptr) || r == 0) return false;
+        got += r;
+    }
+    return true;
+}
+
+struct CentralEntry {
+    string name;
+    unsigned method = 0;
+    unsigned long long compSize = 0;
+    unsigned long long uncompSize = 0;
+    unsigned long long localOffset = 0;
+};
+
+unsigned rd16(const unsigned char* p) { return (unsigned)p[0] | ((unsigned)p[1] << 8); }
+unsigned long rd32(const unsigned char* p) {
+    return (unsigned long)p[0] | ((unsigned long)p[1] << 8) |
+           ((unsigned long)p[2] << 16) | ((unsigned long)p[3] << 24);
+}
+unsigned long long rd64(const unsigned char* p) {
+    return (unsigned long long)rd32(p) | ((unsigned long long)rd32(p + 4) << 32);
+}
+
+// Rejects absolute paths, drive letters and "..", so a hostile archive cannot write
+// anywhere outside the destination directory.
+bool safeRelativePath(const string& rawName, string& outRel, bool& isDir) {
+    string rel;
+    rel.reserve(rawName.size());
+    for (char c : rawName) rel.push_back((c == '\\') ? '/' : c);
+
+    isDir = !rel.empty() && rel.back() == '/';
+    if (rel.empty() || rel.front() == '/') return false;
+    if (rel.size() >= 2 && rel[1] == ':') return false;
+
+    vector<string> parts;
+    string cur;
+    for (size_t i = 0; i <= rel.size(); i++) {
+        char c = (i < rel.size()) ? rel[i] : '/';
+        if (c == '/') {
+            if (cur == "..") return false;
+            if (!cur.empty() && cur != ".") parts.push_back(cur);
+            cur.clear();
+        } else {
+            cur.push_back(c);
+        }
+    }
+    if (parts.empty()) return false;
+
+    outRel.clear();
+    for (size_t i = 0; i < parts.size(); i++) {
+        if (i) outRel += "/";
+        outRel += parts[i];
+    }
+    return true;
+}
+
+} // namespace zipx
+
+bool extractZip(const string& zipPath, const string& destDir,
+                const string& label = "", const string& info = "") {
+    using namespace zipx;
     if (!fileExists(zipPath) || !dirExists(destDir)) return false;
 
-    wchar_t sysDir[MAX_PATH];
-    if (GetSystemDirectoryW(sysDir, MAX_PATH) <= 0) return false;
+    HANDLE zip = CreateFileW(utf8ToWstring(zipPath).c_str(), GENERIC_READ, FILE_SHARE_READ,
+                             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (zip == INVALID_HANDLE_VALUE) return false;
 
-    wstring tarExe = wstring(sysDir) + L"\\tar.exe";
-    if (GetFileAttributesW(tarExe.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
+    LARGE_INTEGER fileSizeLi;
+    if (!GetFileSizeEx(zip, &fileSizeLi)) { CloseHandle(zip); return false; }
+    const unsigned long long fileSize = (unsigned long long)fileSizeLi.QuadPart;
+    if (fileSize < 22) { CloseHandle(zip); return false; }
 
-    wstring wDest = utf8ToWstring(destDir);
-    while (!wDest.empty() && (wDest.back() == L'\\' || wDest.back() == L'/')) wDest.pop_back();
+    // The end-of-central-directory record sits in the tail; its offset is needed because
+    // a comment of unknown length may follow it.
+    const unsigned long long tailStart = (fileSize > 66000ULL) ? (fileSize - 66000ULL) : 0ULL;
+    const size_t tailLen = (size_t)(fileSize - tailStart);
+    vector<unsigned char> tail(tailLen);
+    if (!readAt(zip, tailStart, tail.data(), tailLen)) { CloseHandle(zip); return false; }
 
-    wstring wZip = utf8ToWstring(zipPath);
-    while (!wZip.empty() && (wZip.back() == L'\\' || wZip.back() == L'/')) wZip.pop_back();
+    long eocd = -1;
+    for (size_t i = tailLen - 21; i-- > 0;) {
+        if (tail[i] == 0x50 && tail[i + 1] == 0x4b && tail[i + 2] == 0x05 && tail[i + 3] == 0x06) {
+            if (i + 22 + rd16(&tail[i + 20]) == tailLen) { eocd = (long)i; break; }
+        }
+    }
+    if (eocd < 0) { CloseHandle(zip); return false; }
 
-    wstring cmd = L"\"" + tarExe + L"\" -xf \"" + wZip + L"\" -C \"" + wDest + L"\"";
-    return (runProcessWait(cmd) == 0);
+    unsigned long long entryCount = rd16(&tail[eocd + 10]);
+    unsigned long long cdOffset = rd32(&tail[eocd + 16]);
+
+    // ZIP64 fallback for archives past 4 GB or with more than 65535 entries.
+    if (entryCount == 0xFFFFULL || cdOffset == 0xFFFFFFFFULL) {
+        if ((size_t)eocd < 20) { CloseHandle(zip); return false; }
+        const unsigned char* loc = &tail[eocd - 20];
+        if (!(loc[0] == 0x50 && loc[1] == 0x4b && loc[2] == 0x06 && loc[3] == 0x07)) {
+            CloseHandle(zip); return false;
+        }
+        unsigned char hdr[56];
+        if (!readAt(zip, rd64(loc + 8), hdr, 56)) { CloseHandle(zip); return false; }
+        if (!(hdr[0] == 0x50 && hdr[1] == 0x4b && hdr[2] == 0x06 && hdr[3] == 0x06)) {
+            CloseHandle(zip); return false;
+        }
+        entryCount = rd64(hdr + 32);
+        cdOffset = rd64(hdr + 48);
+    }
+
+    vector<CentralEntry> entries;
+    unsigned long long p = cdOffset;
+    for (unsigned long long i = 0; i < entryCount; i++) {
+        unsigned char h[46];
+        if (!readAt(zip, p, h, 46)) break;
+        if (h[0] != 0x50 || h[1] != 0x4b || h[2] != 0x01 || h[3] != 0x02) break;
+
+        CentralEntry e;
+        e.method = rd16(h + 10);
+        e.compSize = rd32(h + 20);
+        e.uncompSize = rd32(h + 24);
+        const unsigned nameLen = rd16(h + 28);
+        const unsigned extraLen = rd16(h + 30);
+        const unsigned commLen = rd16(h + 32);
+        e.localOffset = rd32(h + 42);
+
+        vector<unsigned char> var((size_t)nameLen + extraLen + commLen);
+        if (!var.empty() && !readAt(zip, p + 46, var.data(), var.size())) break;
+        e.name.assign((const char*)var.data(), nameLen);
+
+        // A ZIP64 extra field overrides whichever 32-bit fields were left as 0xFFFFFFFF.
+        size_t ex = nameLen;
+        while (ex + 4 <= (size_t)nameLen + extraLen) {
+            const unsigned hid = rd16(&var[ex]);
+            const unsigned hsz = rd16(&var[ex + 2]);
+            if (ex + 4 + hsz > (size_t)nameLen + extraLen) break;
+            if (hid == 0x0001) {
+                size_t q = ex + 4;
+                const size_t end = ex + 4 + hsz;
+                if (e.uncompSize == 0xFFFFFFFFULL && q + 8 <= end) { e.uncompSize = rd64(&var[q]); q += 8; }
+                if (e.compSize == 0xFFFFFFFFULL && q + 8 <= end) { e.compSize = rd64(&var[q]); q += 8; }
+                if (e.localOffset == 0xFFFFFFFFULL && q + 8 <= end) { e.localOffset = rd64(&var[q]); }
+            }
+            ex += 4 + hsz;
+        }
+
+        entries.push_back(e);
+        p += 46 + nameLen + extraLen + commLen;
+    }
+
+    bool ok = !entries.empty();
+    unsigned long long totalOut = 0;
+    if (ok) {
+        for (const auto& e : entries) totalOut += e.uncompSize;
+        unsigned long long done = 0;
+
+        for (const auto& e : entries) {
+            string rel;
+            bool isDir = false;
+            if (!safeRelativePath(e.name, rel, isDir)) continue;
+
+            fs::path outPath = fs::u8path(destDir) / fs::u8path(rel);
+            std::error_code ec;
+            if (isDir) {
+                fs::create_directories(outPath, ec);
+                continue;
+            }
+            if (outPath.has_parent_path()) fs::create_directories(outPath.parent_path(), ec);
+            if (ec) continue;
+
+            // The local header repeats the name and extra lengths, which is what fixes
+            // the real start of the compressed data.
+            unsigned char lh[30];
+            if (!readAt(zip, e.localOffset, lh, 30)) { ok = false; break; }
+            if (lh[0] != 0x50 || lh[1] != 0x4b || lh[2] != 0x03 || lh[3] != 0x04) { ok = false; break; }
+            const unsigned long long dataOff = e.localOffset + 30 + rd16(lh + 26) + rd16(lh + 28);
+
+            HANDLE out = CreateFileW(outPath.wstring().c_str(), GENERIC_WRITE, 0, nullptr,
+                                     CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (out == INVALID_HANDLE_VALUE) continue;
+
+            bool entryOk = false;
+            if (e.method == 0) {
+                entryOk = copyStored(zip, dataOff, e.compSize, out);
+            } else if (e.method == 8) {
+                entryOk = inflateDeflate(zip, dataOff, e.compSize, e.uncompSize, out);
+            }
+            CloseHandle(out);
+
+            if (!entryOk) { ok = false; break; }
+
+            done += e.uncompSize;
+            if (totalOut) {
+                printComponentProgress(label, (double)done * 100.0 / (double)totalOut, info);
+            }
+        }
+    }
+
+    cout << "\n";
+    CloseHandle(zip);
+    return ok;
 }
 
 void organizeExtractedTool(const string& targetExe, const string& destDir) {
@@ -939,29 +1421,26 @@ vector<AudioTrack> getAudioTracks(const string& filePath) {
     return tracks;
 }
 
-bool selectAudioTrackForFile(const string& filePath, string& mapArgs, bool allowAllTracks = true, bool isBatchMode = false, bool* outKeepAllForBatch = nullptr, int* outSelectedTrackIndex = nullptr) {
+bool selectAudioTrackForFile(const string& filePath, string& mapArgs, bool allowAllTracks = true, bool isBatchMode = false, bool* outKeepAllForBatch = nullptr, int* outSelectedTrackIndex = nullptr, bool* outApplyToAllBatch = nullptr) {
     mapArgs.clear();
     if (outKeepAllForBatch) *outKeepAllForBatch = false;
     if (outSelectedTrackIndex) *outSelectedTrackIndex = -1;
+    if (outApplyToAllBatch) *outApplyToAllBatch = false;
 
     vector<AudioTrack> tracks = getAudioTracks(filePath);
     if (tracks.size() <= 1) {
         return true;
     }
 
+    // A single list of choices (keep all + one entry per track), followed by a separate
+    // "apply scope" screen in batch mode. Showing every track twice (once for "this video"
+    // and once for "ALL videos") doubles the list length and makes long titles unreadable.
     vector<string> opts;
     vector<string> hints;
-    if (allowAllTracks) {
-        if (isBatchMode) {
-            opts.push_back(tr("Keep all audio tracks for current video", "Сохранить все аудиодорожки для текущего видео"));
-            hints.push_back(tr("Preserves all audio streams only for this video file.", "Сохраняет все аудиопотоки только для этого видеофайла."));
 
-            opts.push_back(tr("Keep all audio tracks for all videos in batch", "Сохранить все аудиодорожки для всех видео в пакете"));
-            hints.push_back(tr("Preserves all audio streams for all videos in this batch without asking again.", "Сохраняет все аудиопотоки для всех видео в этом пакете без повторных запросов."));
-        } else {
-            opts.push_back(tr("Keep all audio tracks for current video", "Сохранить все аудиодорожки для текущего видео"));
-            hints.push_back(tr("Preserves all audio streams in the output file.", "Сохраняет все аудиопотоки в выходном файле."));
-        }
+    if (allowAllTracks) {
+        opts.push_back(tr("Keep all audio tracks", "Сохранить все аудиодорожки"));
+        hints.push_back(tr("Preserves every audio stream of this file.", "Сохраняет все аудиопотоки этого файла."));
     }
     for (size_t i = 0; i < tracks.size(); i++) {
         opts.push_back(tr("Track ", "Дорожка ") + to_string(i + 1) + ": " + tracks[i].getDisplayString());
@@ -976,35 +1455,106 @@ bool selectAudioTrackForFile(const string& filePath, string& mapArgs, bool allow
         return false;
     }
 
-    if (allowAllTracks) {
-        if (isBatchMode) {
-            if (sel == 0) {
-                mapArgs = " -map 0:a?";
-                if (outKeepAllForBatch) *outKeepAllForBatch = false;
-                if (outSelectedTrackIndex) *outSelectedTrackIndex = -2;
-            } else if (sel == 1) {
-                mapArgs = " -map 0:a?";
-                if (outKeepAllForBatch) *outKeepAllForBatch = true;
-                if (outSelectedTrackIndex) *outSelectedTrackIndex = -1;
-            } else {
-                int trackIdx = tracks[sel - 2].audioIndex;
-                mapArgs = " -map 0:a:" + to_string(trackIdx);
-                if (outKeepAllForBatch) *outKeepAllForBatch = false;
-                if (outSelectedTrackIndex) *outSelectedTrackIndex = (int)(sel - 2);
-            }
-        } else {
-            if (sel == 0) {
-                mapArgs = " -map 0:a?";
-            } else {
-                int trackIdx = tracks[sel - 1].audioIndex;
-                mapArgs = " -map 0:a:" + to_string(trackIdx);
-            }
-        }
-    } else {
-        int trackIdx = tracks[sel].audioIndex;
-        mapArgs = " -map 0:a:" + to_string(trackIdx);
+    bool keepAll = allowAllTracks && sel == 0;
+    int trackIdx = allowAllTracks ? sel - 1 : sel;
+
+    bool applyToAll = false;
+    if (isBatchMode) {
+        vector<string> scopeOptions = {
+            tr("Apply to this video only", "Применить только к этому видео"),
+            tr("Apply to ALL remaining videos in this task", "Применить ко ВСЕМ оставшимся видео в этой задаче")
+        };
+        vector<string> scopeHints = {
+            tr("The choice applies only to the current video. It will be asked again for the next file.",
+               "Выбор применяется только к текущему видео. Для следующего файла вопрос будет задан снова."),
+            tr("The choice applies to all remaining videos in this batch, matching by language and title.",
+               "Выбор применяется ко всем оставшимся видео в этом пакете, с подбором по языку и названию.")
+        };
+
+        int scopeSel = arrowSelect(
+            tr("APPLY SCOPE", "ОБЛАСТЬ ПРИМЕНЕНИЯ"),
+            tr("Your current choice does NOT change global settings.\nYou can also make the same choice in the global settings to save it.",
+               "Ваш текущий выбор НЕ меняет глобальных настроек.\nТот же выбор можно сделать в глобальных настройках для сохранения."),
+            scopeOptions,
+            0,
+            scopeHints,
+            true
+        );
+        applyToAll = (scopeSel == 1);
     }
+
+    if (keepAll) {
+        mapArgs = " -map 0:a?";
+        if (outKeepAllForBatch) *outKeepAllForBatch = applyToAll;
+        if (outSelectedTrackIndex) *outSelectedTrackIndex = applyToAll ? -1 : -2;
+    } else {
+        mapArgs = " -map 0:a:" + to_string(tracks[trackIdx].audioIndex);
+        if (outKeepAllForBatch) *outKeepAllForBatch = false;
+        if (outSelectedTrackIndex) *outSelectedTrackIndex = trackIdx;
+    }
+    if (outApplyToAllBatch) *outApplyToAllBatch = applyToAll;
     return true;
+}
+
+// ========== NUMBER FORMATTING / PARSING HELPERS ==========
+// snprintf("%f") follows LC_NUMERIC, and setlocale(LC_ALL, ".UTF8") resolves that to the
+// user locale (Russian_Russia.utf8 on a Russian system). The result is "23,98" instead of
+// "23.98", which is harmless on screen but breaks every FFmpeg filter expression:
+// "setpts=0,5*PTS" is read by FFmpeg as two filters and fails with "No such filter".
+// Always use formatDot() for values that end up in a command line.
+static string formatDot(double value, int decimals = 2) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.*f", decimals, value);
+    string s = buf;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == ',') s[i] = '.';
+    }
+    return s;
+}
+
+// Parses a number written with either decimal separator ("23.98" or "23,98").
+// Returns false when the text does not start with a number.
+static bool parseNumberLoose(const string& s, double& out) {
+    size_t i = 0;
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) i++;
+    size_t start = i;
+    if (i < s.size() && (s[i] == '+' || s[i] == '-')) i++;
+    bool anyDigit = false;
+    while (i < s.size() && s[i] >= '0' && s[i] <= '9') { i++; anyDigit = true; }
+    if (i < s.size() && (s[i] == '.' || s[i] == ',')) {
+        size_t sepPos = i;
+        i++;
+        bool fracDigit = false;
+        while (i < s.size() && s[i] >= '0' && s[i] <= '9') { i++; fracDigit = true; }
+        if (!fracDigit) i = sepPos;   // trailing separator, e.g. "90000,"
+    }
+    if (!anyDigit) return false;
+    string num = s.substr(start, i - start);
+    for (size_t k = 0; k < num.size(); k++) {
+        if (num[k] == ',') num[k] = '.';
+    }
+    try { out = stod(num); } catch (...) { return false; }
+    return true;
+}
+
+// Drops a trailing ".00" so that whole frame rates are shown as "24" and not "24.00".
+static string trimZeroDecimals(const string& s) {
+    size_t dot = s.find('.');
+    if (dot == string::npos) return s;
+    for (size_t k = dot + 1; k < s.size(); k++) {
+        if (s[k] != '0') return s;
+    }
+    return s.substr(0, dot);
+}
+
+// Numbers typed by the user may use a comma decimal separator ("0,5"). FFmpeg only
+// understands a dot, so normalize such input before it reaches the command line.
+static string sanitizeNumberArg(const string& s) {
+    string out = s;
+    for (size_t i = 0; i < out.size(); i++) {
+        if (out[i] == ',') out[i] = '.';
+    }
+    return out;
 }
 
 // ========== VIDEO TRACK DETECTION & STRUCTS ==========
@@ -1023,8 +1573,14 @@ struct VideoTrack {
 
     bool isCoverOrAttachedPic() const {
         if (isAttachedPic) return true;
+        // Cover art is a single still image stored as a video stream. Release groups tag it
+        // as mjpeg/png/bmp with r_frame_rate 90000/1 (or 0/0); real video never looks like that.
+        // The fps text is compared numerically because the decimal separator depends on the
+        // console locale ("90000,00" on a Russian system).
         if (codec == "mjpeg" || codec == "png" || codec == "bmp") {
-            if (fps.empty() || fps == "90000" || fps == "90000.00" || fps == "0" || fps == "0.00") return true;
+            double f = 0;
+            if (fps.empty() || !parseNumberLoose(fps, f)) return true;
+            return (f <= 0.0 || f >= 1000.0);
         }
         return false;
     }
@@ -1092,11 +1648,7 @@ vector<VideoTrack> getVideoTracks(const string& filePath) {
     auto pushCurrent = [&]() {
         if (inTrack) {
             cur.videoIndex = currentVideoIdx++;
-            if (cur.codec == "mjpeg" || cur.codec == "png" || cur.codec == "bmp") {
-                if (cur.isAttachedPic || cur.fps.empty() || cur.fps == "90000" || cur.fps == "90000.00" || cur.fps == "0") {
-                    cur.isAttachedPic = true;
-                }
-            }
+            if (cur.isCoverOrAttachedPic()) cur.isAttachedPic = true;
             tracks.push_back(cur);
             cur = VideoTrack();
             inTrack = false;
@@ -1130,11 +1682,7 @@ vector<VideoTrack> getVideoTracks(const string& filePath) {
                         double num = stod(val.substr(0, slash));
                         double den = stod(val.substr(slash + 1));
                         if (den > 0) {
-                            char b[32];
-                            snprintf(b, sizeof(b), "%.2f", num / den);
-                            string s = b;
-                            if (s.find(".00") != string::npos) s = s.substr(0, s.find(".00"));
-                            cur.fps = s;
+                            cur.fps = trimZeroDecimals(formatDot(num / den, 2));
                         }
                     } catch (...) { cur.fps = val; }
                 } else {
@@ -1177,69 +1725,27 @@ bool selectVideoTrackForFile(const string& filePath, string& mapArgs, bool allow
         return true;
     }
 
+    // One single list of choices, followed by a separate "apply scope" screen in batch mode.
+    // Never duplicate the track list per scope: it doubles the menu and makes long titles
+    // (language + name + codec) unreadable. See AGENTS.md 5.11 "Two-step dialog pattern".
+    //
+    // Layout: [0] = special option ("keep all" / "primary"), [1..N] = one entry per stream.
+    const int FIRST_STREAM_CHOICE = 1;
+
     vector<string> opts;
     vector<string> hints;
 
+    int primaryIdx = realIndices.empty() ? 0 : realIndices[0];
     if (allowAllTracks) {
-        if (isBatchMode) {
-            opts.push_back(tr("Keep all video streams for current video", "Сохранить все видеопотоки для текущего видео"));
-            hints.push_back(tr("Preserves all video streams only for this video file.", "Сохраняет все видеопотоки только для этого видеофайла."));
-
-            opts.push_back(tr("Keep all video streams for ALL videos in batch", "Сохранить все видеопотоки для ВСЕХ видео в пакете"));
-            hints.push_back(tr("Preserves all video streams for all videos in this batch without asking again.",
-                               "Сохраняет все видеопотоки для всех видео в этом пакете без повторных запросов."));
-
-            opts.push_back(tr("Use primary video stream for this video", "Использовать основной видеопоток для текущего видео"));
-            hints.push_back(tr("Selects the first real video stream only for this file.", "Выбирает первый основной видеопоток только для этого файла."));
-
-            opts.push_back(tr("Use primary video stream for ALL videos in batch", "Использовать основной видеопоток для ВСЕХ видео в пакете"));
-            hints.push_back(tr("Automatically selects the first real video stream for all files in this batch without asking again.",
-                               "Автоматически выбирает первый основной видеопоток для всех файлов в этом пакете без повторных вопросов."));
-
-            for (size_t i = 0; i < tracks.size(); i++) {
-                opts.push_back(tr("Stream ", "Поток ") + to_string(i + 1) + " (" + tr("this video only", "только это видео") + "): " + tracks[i].getDisplayString());
-                hints.push_back(tr("Select this video stream only for this file.", "Выбрать этот видеопоток только для текущего файла."));
-            }
-
-            for (size_t i = 0; i < tracks.size(); i++) {
-                opts.push_back(tr("Stream ", "Поток ") + to_string(i + 1) + " (" + tr("ALL videos in batch", "ВСЕ видео в пакете") + "): " + tracks[i].getDisplayString());
-                hints.push_back(tr("Select this video stream (or matching resolution/codec) for all files in this batch.",
-                                   "Выбрать этот видеопоток (или совпадающий по разрешению/кодеку) для всех файлов пакета."));
-            }
-        } else {
-            opts.push_back(tr("Keep all video streams for current video", "Сохранить все видеопотоки для текущего видео"));
-            hints.push_back(tr("Preserves all video streams in the output file.", "Сохраняет все видеопотоки в выходном файле."));
-
-            for (size_t i = 0; i < tracks.size(); i++) {
-                opts.push_back(tr("Stream ", "Поток ") + to_string(i + 1) + ": " + tracks[i].getDisplayString());
-                hints.push_back(tr("Select this video stream for processing.", "Выбрать этот видеопоток для обработки."));
-            }
-        }
+        opts.push_back(tr("Keep all video streams", "Сохранить все видеопотоки"));
+        hints.push_back(tr("Preserves every video stream of this file.", "Сохраняет все видеопотоки этого файла."));
     } else {
-        if (isBatchMode) {
-            opts.push_back(tr("Use primary video stream for this video", "Использовать основной видеопоток для текущего видео"));
-            hints.push_back(tr("Selects the first real video stream only for this file.", "Выбирает первый основной видеопоток только для этого файла."));
-
-            opts.push_back(tr("Use primary video stream for ALL videos in batch", "Использовать основной видеопоток для ВСЕХ видео в пакете"));
-            hints.push_back(tr("Automatically selects the first real video stream for all files in this batch without asking again.",
-                               "Автоматически выбирает первый основной видеопоток для всех файлов в этом пакете без повторных вопросов."));
-
-            for (size_t i = 0; i < tracks.size(); i++) {
-                opts.push_back(tr("Stream ", "Поток ") + to_string(i + 1) + " (" + tr("this video only", "только это видео") + "): " + tracks[i].getDisplayString());
-                hints.push_back(tr("Select this video stream only for this file.", "Выбрать этот видеопоток только для текущего файла."));
-            }
-
-            for (size_t i = 0; i < tracks.size(); i++) {
-                opts.push_back(tr("Stream ", "Поток ") + to_string(i + 1) + " (" + tr("ALL videos in batch", "ВСЕ видео в пакете") + "): " + tracks[i].getDisplayString());
-                hints.push_back(tr("Select this video stream (or matching resolution/codec) for all files in this batch.",
-                                   "Выбрать этот видеопоток (или совпадающий по разрешению/кодеку) для всех файлов пакета."));
-            }
-        } else {
-            for (size_t i = 0; i < tracks.size(); i++) {
-                opts.push_back(tr("Stream ", "Поток ") + to_string(i + 1) + ": " + tracks[i].getDisplayString());
-                hints.push_back(tr("Select this video stream for processing.", "Выбрать этот видеопоток для обработки."));
-            }
-        }
+        opts.push_back(tr("Use primary video stream", "Использовать основной видеопоток"));
+        hints.push_back(tr("Selects the first real video stream, ignoring cover art.", "Выбирает первый основной видеопоток, игнорируя обложку."));
+    }
+    for (size_t i = 0; i < tracks.size(); i++) {
+        opts.push_back(tr("Stream ", "Поток ") + to_string(i + 1) + ": " + tracks[i].getDisplayString());
+        hints.push_back(tr("Select this video stream for processing.", "Выбрать этот видеопоток для обработки."));
     }
 
     string desc = tr("This file contains multiple video streams (" + to_string(tracks.size()) + ").\n\"" + filePath + "\"\n\nSelect which video stream to process:",
@@ -1250,75 +1756,46 @@ bool selectVideoTrackForFile(const string& filePath, string& mapArgs, bool allow
         return false;
     }
 
-    if (allowAllTracks) {
-        if (isBatchMode) {
-            if (sel == 0) {
-                mapArgs = " -map 0:v?";
-                if (outApplyToAllBatch) *outApplyToAllBatch = false;
-                if (outSelectedTrackIndex) *outSelectedTrackIndex = -4; // keep all for current video
-            } else if (sel == 1) {
-                mapArgs = " -map 0:v?";
-                if (outApplyToAllBatch) *outApplyToAllBatch = true;
-                if (outSelectedTrackIndex) *outSelectedTrackIndex = -3; // keep all for ALL videos in batch
-            } else if (sel == 2) {
-                int realIdx = realIndices.empty() ? 0 : realIndices[0];
-                mapArgs = " -map 0:v:" + to_string(tracks[realIdx].videoIndex);
-                if (outApplyToAllBatch) *outApplyToAllBatch = false;
-                if (outSelectedTrackIndex) *outSelectedTrackIndex = -2; // primary for current
-            } else if (sel == 3) {
-                int realIdx = realIndices.empty() ? 0 : realIndices[0];
-                mapArgs = " -map 0:v:" + to_string(tracks[realIdx].videoIndex);
-                if (outApplyToAllBatch) *outApplyToAllBatch = true;
-                if (outSelectedTrackIndex) *outSelectedTrackIndex = -1; // primary for all
-            } else if (sel < 4 + (int)tracks.size()) {
-                int trackIdx = sel - 4;
-                mapArgs = " -map 0:v:" + to_string(tracks[trackIdx].videoIndex);
-                if (outApplyToAllBatch) *outApplyToAllBatch = false;
-                if (outSelectedTrackIndex) *outSelectedTrackIndex = trackIdx;
-            } else {
-                int trackIdx = sel - 4 - (int)tracks.size();
-                mapArgs = " -map 0:v:" + to_string(tracks[trackIdx].videoIndex);
-                if (outApplyToAllBatch) *outApplyToAllBatch = true;
-                if (outSelectedTrackIndex) *outSelectedTrackIndex = trackIdx;
-            }
+    bool applyToAll = false;
+    if (isBatchMode) {
+        vector<string> scopeOptions = {
+            tr("Apply to this video only", "Применить только к этому видео"),
+            tr("Apply to ALL remaining videos in this task", "Применить ко ВСЕМ оставшимся видео в этой задаче")
+        };
+        vector<string> scopeHints = {
+            tr("The choice applies only to the current video. It will be asked again for the next file.",
+               "Выбор применяется только к текущему видео. Для следующего файла вопрос будет задан снова."),
+            tr("The choice applies to all remaining videos in this batch, matching by resolution, language and title.",
+               "Выбор применяется ко всем оставшимся видео в этом пакете, с подбором по разрешению, языку и названию.")
+        };
+
+        int scopeSel = arrowSelect(
+            tr("APPLY SCOPE", "ОБЛАСТЬ ПРИМЕНЕНИЯ"),
+            tr("Your current choice does NOT change global settings.\nYou can also make the same choice in the global settings to save it.",
+               "Ваш текущий выбор НЕ меняет глобальных настроек.\nТот же выбор можно сделать в глобальных настройках для сохранения."),
+            scopeOptions,
+            0,
+            scopeHints,
+            true
+        );
+        applyToAll = (scopeSel == 1);
+    }
+    if (outApplyToAllBatch) *outApplyToAllBatch = applyToAll;
+
+    if (sel == 0) {
+        if (allowAllTracks) {
+            mapArgs = " -map 0:v?";
+            // -3 = keep all for ALL remaining videos, -4 = keep all for the current file only.
+            if (outSelectedTrackIndex) *outSelectedTrackIndex = (isBatchMode && !applyToAll) ? -4 : -3;
         } else {
-            if (sel == 0) {
-                mapArgs = " -map 0:v?";
-                if (outSelectedTrackIndex) *outSelectedTrackIndex = -3;
-            } else {
-                int trackIdx = sel - 1;
-                mapArgs = " -map 0:v:" + to_string(tracks[trackIdx].videoIndex);
-                if (outSelectedTrackIndex) *outSelectedTrackIndex = trackIdx;
-            }
+            mapArgs = " -map 0:v:" + to_string(tracks[primaryIdx].videoIndex);
+            // -1 = primary for ALL remaining videos, -2 = primary for the current file only.
+            if (outSelectedTrackIndex) *outSelectedTrackIndex = applyToAll ? -1 : -2;
         }
     } else {
-        if (isBatchMode) {
-            if (sel == 0) {
-                int realIdx = realIndices.empty() ? 0 : realIndices[0];
-                mapArgs = " -map 0:v:" + to_string(tracks[realIdx].videoIndex);
-                if (outApplyToAllBatch) *outApplyToAllBatch = false;
-                if (outSelectedTrackIndex) *outSelectedTrackIndex = -2;
-            } else if (sel == 1) {
-                int realIdx = realIndices.empty() ? 0 : realIndices[0];
-                mapArgs = " -map 0:v:" + to_string(tracks[realIdx].videoIndex);
-                if (outApplyToAllBatch) *outApplyToAllBatch = true;
-                if (outSelectedTrackIndex) *outSelectedTrackIndex = -1;
-            } else if (sel < 2 + (int)tracks.size()) {
-                int trackIdx = sel - 2;
-                mapArgs = " -map 0:v:" + to_string(tracks[trackIdx].videoIndex);
-                if (outApplyToAllBatch) *outApplyToAllBatch = false;
-                if (outSelectedTrackIndex) *outSelectedTrackIndex = trackIdx;
-            } else {
-                int trackIdx = sel - 2 - (int)tracks.size();
-                mapArgs = " -map 0:v:" + to_string(tracks[trackIdx].videoIndex);
-                if (outApplyToAllBatch) *outApplyToAllBatch = true;
-                if (outSelectedTrackIndex) *outSelectedTrackIndex = trackIdx;
-            }
-        } else {
-            int trackIdx = tracks[sel].videoIndex;
-            mapArgs = " -map 0:v:" + to_string(trackIdx);
-            if (outSelectedTrackIndex) *outSelectedTrackIndex = (int)sel;
-        }
+        int trackIdx = sel - FIRST_STREAM_CHOICE;
+        mapArgs = " -map 0:v:" + to_string(tracks[trackIdx].videoIndex);
+        if (outSelectedTrackIndex) *outSelectedTrackIndex = trackIdx;
     }
 
     return true;
@@ -1841,6 +2318,8 @@ EncodingDialogResult dialogEncodingProblem(const EncodingProblem& ep, bool batch
 
     vector<string> options;
     vector<string> hints;
+    int formatOptIdx = -1;
+    int skipOptIdx = -1;
 
     if (ep.isOddDimensions) {
         string evenDimStr = to_string(ep.evenWidth) + "x" + to_string(ep.evenHeight);
@@ -1872,6 +2351,8 @@ EncodingDialogResult dialogEncodingProblem(const EncodingProblem& ep, bool batch
             tr("Do not process this video, move to the next one.",
                "Не обрабатывать это видео, перейти к следующему.")
         };
+        formatOptIdx = 2;  // "Choose a different output codec"
+        skipOptIdx = 5;    // "Skip video"
     } else if (ep.isUltraHighRes) {
         options = {
             tr("Use software encoder libx264 on CPU (No resolution limits)",
@@ -1897,6 +2378,8 @@ EncodingDialogResult dialogEncodingProblem(const EncodingProblem& ep, bool batch
             tr("Do not process this video, move to the next one.",
                "Не обрабатывать это видео, перейти к следующему.")
         };
+        formatOptIdx = 2;  // "Choose a different output codec"
+        skipOptIdx = 4;    // "Skip video"
     } else {
         options = {
             tr("Use software encoder libx264 on your CPU (Recommended if unsure)", "Использовать программный кодировщик libx264 на вашем процессоре (Рекомендуется, если не знаете что выбрать)"),
@@ -1920,6 +2403,8 @@ EncodingDialogResult dialogEncodingProblem(const EncodingProblem& ep, bool batch
             tr("Do not process this video, move to the next one.",
               "Не обрабатывать это видео, перейти к следующему.")
         };
+        formatOptIdx = 1;  // "Choose a different output codec (may help)"
+        skipOptIdx = 5;    // "Skip video"
     }
 
     int sel = arrowSelect(
@@ -1948,7 +2433,7 @@ EncodingDialogResult dialogEncodingProblem(const EncodingProblem& ep, bool batch
         result.action = sel;
     }
 
-    if (sel == 1) {
+    if (sel == formatOptIdx) {
         vector<string> fmtKeys = {
             "MP4(H.264)", "MP4(H.265/HEVC)", "MP4(AV1)",
             "MKV(H.264)", "MKV(H.265/HEVC)",
@@ -2003,7 +2488,7 @@ EncodingDialogResult dialogEncodingProblem(const EncodingProblem& ep, bool batch
     if (sel >= 0 && batchMode) {
         vector<string> scopeOptions;
         vector<string> scopeHints;
-        if (sel == 5) {
+        if (sel == skipOptIdx) {
             scopeOptions = {
                 tr("Skip this video only", "Пропустить только это видео"),
                 tr("Skip ALL remaining videos", "Пропустить ВСЕ оставшиеся видео")
@@ -3554,6 +4039,99 @@ void compareFiles() {
     waitForKey();
 }
 
+// ========== BATCH TRACK PREFERENCE MATCHING ==========
+// Returns an index into tracks, 9999 for "keep all", or -1 when nothing matched.
+static int matchAudioPreference(const vector<AudioTrack>& tracks, const AudioTrackPreference& pref) {
+    if (pref.keepAll) return 9999;
+    int matchIdx = -1;
+    if (!pref.preferredLanguage.empty() && pref.preferredLanguage != "und") {
+        for (size_t t = 0; t < tracks.size(); t++) {
+            if (!tracks[t].language.empty() && _stricmp(tracks[t].language.c_str(), pref.preferredLanguage.c_str()) == 0) {
+                matchIdx = (int)t;
+                break;
+            }
+        }
+    }
+    if (matchIdx == -1 && !pref.preferredTitle.empty()) {
+        for (size_t t = 0; t < tracks.size(); t++) {
+            if (!tracks[t].title.empty() &&
+                (tracks[t].title.find(pref.preferredTitle) != string::npos ||
+                 pref.preferredTitle.find(tracks[t].title) != string::npos)) {
+                matchIdx = (int)t;
+                break;
+            }
+        }
+    }
+    if (matchIdx == -1 && pref.preferredLanguage.empty() && pref.preferredTitle.empty()) {
+        if (pref.preferredAudioIndex >= 0 && pref.preferredAudioIndex < (int)tracks.size()) {
+            matchIdx = pref.preferredAudioIndex;
+        }
+    }
+    return matchIdx;
+}
+
+// Returns an index into vTracks, 9999 for "keep all", or -1 when nothing matched.
+static int matchVideoPreference(const vector<VideoTrack>& vTracks, const vector<int>& realVideoIndices, const VideoTrackPreference& pref) {
+    if (pref.keepAll) return 9999;
+    if (pref.usePrimaryOnly) return realVideoIndices.empty() ? 0 : realVideoIndices[0];
+    int matchIdx = -1;
+    if (pref.preferredWidth > 0 && pref.preferredHeight > 0) {
+        for (size_t t = 0; t < vTracks.size(); t++) {
+            if (vTracks[t].width == pref.preferredWidth && vTracks[t].height == pref.preferredHeight) {
+                matchIdx = (int)t;
+                break;
+            }
+        }
+    }
+    if (matchIdx == -1 && !pref.preferredLanguage.empty() && pref.preferredLanguage != "und") {
+        for (size_t t = 0; t < vTracks.size(); t++) {
+            if (!vTracks[t].language.empty() && _stricmp(vTracks[t].language.c_str(), pref.preferredLanguage.c_str()) == 0) {
+                matchIdx = (int)t;
+                break;
+            }
+        }
+    }
+    if (matchIdx == -1 && !pref.preferredTitle.empty()) {
+        for (size_t t = 0; t < vTracks.size(); t++) {
+            if (!vTracks[t].title.empty() &&
+                (vTracks[t].title.find(pref.preferredTitle) != string::npos ||
+                 pref.preferredTitle.find(vTracks[t].title) != string::npos)) {
+                matchIdx = (int)t;
+                break;
+            }
+        }
+    }
+    if (matchIdx == -1 && pref.preferredVideoIndex >= 0 && pref.preferredVideoIndex < (int)vTracks.size()) {
+        matchIdx = pref.preferredVideoIndex;
+    }
+    return matchIdx;
+}
+
+// Remember a "for ALL remaining videos" video stream choice.
+static void recordVideoPreference(VideoTrackPreference& pref, int selectedTrackIdx, const vector<VideoTrack>& vTracks) {
+    pref.hasPreference = true;
+    if (selectedTrackIdx == -3) {
+        pref.keepAll = true;
+        pref.usePrimaryOnly = false;
+        pref.displayName = tr("All video streams (All videos in batch)", "Все видеопотоки (для всех видео в пакете)");
+    } else if (selectedTrackIdx == -1) {
+        pref.keepAll = false;
+        pref.usePrimaryOnly = true;
+        pref.displayName = tr("Primary video stream (All videos in batch)", "Основной видеопоток (для всех видео в пакете)");
+    } else if (selectedTrackIdx >= 0 && selectedTrackIdx < (int)vTracks.size()) {
+        pref.keepAll = false;
+        pref.usePrimaryOnly = false;
+        const auto& trk = vTracks[selectedTrackIdx];
+        pref.preferredVideoIndex = trk.videoIndex;
+        pref.preferredWidth = trk.width;
+        pref.preferredHeight = trk.height;
+        pref.preferredCodec = trk.codec;
+        pref.preferredLanguage = trk.language;
+        pref.preferredTitle = trk.title;
+        pref.displayName = trk.getDisplayString() + tr(" (All videos in batch)", " (для всех видео в пакете)");
+    }
+}
+
 // ========== BATCH VIDEO COMPRESSION ==========
 void batchCompressVideo() {
     clearScreen();
@@ -3727,6 +4305,7 @@ void batchCompressVideo() {
 
             string subExtraArgs = "";
             string subHardsubFilter = "";
+            bool subsConverted = false;
             string currentFmt = OUTPUT_FORMAT;
             bool isMp4Output = (currentFmt.find("MP4") != string::npos || currentFmt.find("MOV") != string::npos || currentFmt.find("M4V") != string::npos);
 
@@ -3774,6 +4353,7 @@ void batchCompressVideo() {
 
                     if (act == SUB_ACT_CONVERT_TEXT) {
                         subExtraArgs = " -c:s mov_text";
+                        subsConverted = true;
                     } else if (act == SUB_ACT_BURN_HARD) {
                         string safeIn = filePath;
                         string escaped = "";
@@ -3850,7 +4430,7 @@ void batchCompressVideo() {
             bool ok = execFFmpegWithProgress(cmd, duration);
             ok = finalizeFFmpegTarget(ft, ok);
 
-            if (savedFormat != OUTPUT_FORMAT && !(forceMode == 1)) OUTPUT_FORMAT = savedFormat;
+            if (savedFormat != OUTPUT_FORMAT) OUTPUT_FORMAT = savedFormat;
 
             if (g_ffmpegEscaped) {
                 finalizeFFmpegTarget(ft, false);
@@ -3883,7 +4463,11 @@ void batchCompressVideo() {
             }
 
             if (ok) {
-                printColor(tr("[OK] Done", "[OK] Готово"), GREEN);
+                if (subsConverted) {
+                    printColor(tr("[OK] Subtitles converted", "[OK] Субтитры конвертированы"), GREEN);
+                } else {
+                    printColor(tr("[OK] Done", "[OK] Готово"), GREEN);
+                }
                 handleOriginalDeletion(filePath, outPath, ft.isTemp, deleteOrig);
                 return PROC_SUCCESS;
             } else {
@@ -3965,67 +4549,9 @@ void batchCompressVideo() {
                     continue;
                 }
                 videoMapArg = selectedMap;
-                if (applyToAllBatch) {
-                    batchVideoPref.hasPreference = true;
-                    if (selectedTrackIdx == -3) {
-                        batchVideoPref.keepAll = true;
-                        batchVideoPref.usePrimaryOnly = false;
-                        batchVideoPref.displayName = tr("All video streams (All videos in batch)", "Все видеопотоки (для всех видео в пакете)");
-                    } else if (selectedTrackIdx == -1) {
-                        batchVideoPref.keepAll = false;
-                        batchVideoPref.usePrimaryOnly = true;
-                        batchVideoPref.displayName = tr("Primary video stream (All videos in batch)", "Основной видеопоток (для всех видео в пакете)");
-                    } else if (selectedTrackIdx >= 0 && selectedTrackIdx < (int)vTracks.size()) {
-                        batchVideoPref.keepAll = false;
-                        batchVideoPref.usePrimaryOnly = false;
-                        const auto& trk = vTracks[selectedTrackIdx];
-                        batchVideoPref.preferredVideoIndex = trk.videoIndex;
-                        batchVideoPref.preferredWidth = trk.width;
-                        batchVideoPref.preferredHeight = trk.height;
-                        batchVideoPref.preferredCodec = trk.codec;
-                        batchVideoPref.preferredLanguage = trk.language;
-                        batchVideoPref.preferredTitle = trk.title;
-                        batchVideoPref.displayName = trk.getDisplayString();
-                    }
-                }
+                if (applyToAllBatch) recordVideoPreference(batchVideoPref, selectedTrackIdx, vTracks);
             } else {
-                int matchIdx = -1;
-                if (batchVideoPref.keepAll) {
-                    matchIdx = 9999;
-                } else if (batchVideoPref.usePrimaryOnly) {
-                    matchIdx = realVideoIndices.empty() ? 0 : realVideoIndices[0];
-                } else {
-                    if (batchVideoPref.preferredWidth > 0 && batchVideoPref.preferredHeight > 0) {
-                        for (size_t t = 0; t < vTracks.size(); t++) {
-                            if (vTracks[t].width == batchVideoPref.preferredWidth && vTracks[t].height == batchVideoPref.preferredHeight) {
-                                matchIdx = (int)t;
-                                break;
-                            }
-                        }
-                    }
-                    if (matchIdx == -1 && !batchVideoPref.preferredLanguage.empty() && batchVideoPref.preferredLanguage != "und") {
-                        for (size_t t = 0; t < vTracks.size(); t++) {
-                            if (!vTracks[t].language.empty() && _stricmp(vTracks[t].language.c_str(), batchVideoPref.preferredLanguage.c_str()) == 0) {
-                                matchIdx = (int)t;
-                                break;
-                            }
-                        }
-                    }
-                    if (matchIdx == -1 && !batchVideoPref.preferredTitle.empty()) {
-                        for (size_t t = 0; t < vTracks.size(); t++) {
-                            if (!vTracks[t].title.empty() &&
-                                (vTracks[t].title.find(batchVideoPref.preferredTitle) != string::npos ||
-                                 batchVideoPref.preferredTitle.find(vTracks[t].title) != string::npos)) {
-                                matchIdx = (int)t;
-                                break;
-                            }
-                        }
-                    }
-                    if (matchIdx == -1 && batchVideoPref.preferredVideoIndex >= 0 && batchVideoPref.preferredVideoIndex < (int)vTracks.size()) {
-                        matchIdx = batchVideoPref.preferredVideoIndex;
-                    }
-                }
-
+                int matchIdx = matchVideoPreference(vTracks, realVideoIndices, batchVideoPref);
                 if (matchIdx != -1) {
                     if (batchVideoPref.keepAll) {
                         videoMapArg = " -map 0:v?";
@@ -4046,8 +4572,9 @@ void batchCompressVideo() {
             if (!batchAudioPref.hasPreference) {
                 string selectedMap;
                 bool keepAllForBatch = false;
+                bool applyToAllAudio = false;
                 int selectedTrackIdx = -1;
-                if (!selectAudioTrackForFile(files[i], selectedMap, true, true, &keepAllForBatch, &selectedTrackIdx)) {
+                if (!selectAudioTrackForFile(files[i], selectedMap, true, true, &keepAllForBatch, &selectedTrackIdx, &applyToAllAudio)) {
                     printColor(tr("[INFO] File skipped.", "[ИНФО] Файл пропущен."), YELLOW);
                     skippedFiles.push_back(fs::u8path(files[i]).filename().u8string());
                     fail++;
@@ -4055,13 +4582,13 @@ void batchCompressVideo() {
                     continue;
                 }
                 audioMapArg = selectedMap;
-                if (keepAllForBatch) {
+                if (!applyToAllAudio) {
+                    // "This video only": remember nothing so the next file asks again.
+                    batchAudioPref.hasPreference = false;
+                } else if (keepAllForBatch || selectedTrackIdx == -1) {
                     batchAudioPref.hasPreference = true;
                     batchAudioPref.keepAll = true;
                     batchAudioPref.displayName = tr("All audio tracks (All videos in batch)", "Все аудиодорожки (для всех видео в пакете)");
-                } else if (selectedTrackIdx == -2) {
-                    // Applied only to current video, do not set global preference
-                    batchAudioPref.hasPreference = false;
                 } else if (selectedTrackIdx >= 0 && selectedTrackIdx < (int)tracks.size()) {
                     batchAudioPref.hasPreference = true;
                     batchAudioPref.keepAll = false;
@@ -4070,37 +4597,10 @@ void batchCompressVideo() {
                     batchAudioPref.preferredLanguage = trk.language;
                     batchAudioPref.preferredTitle = trk.title;
                     batchAudioPref.preferredCodec = trk.codec;
-                    batchAudioPref.displayName = trk.getDisplayString();
+                    batchAudioPref.displayName = trk.getDisplayString() + tr(" (All videos in batch)", " (для всех видео в пакете)");
                 }
             } else {
-                int matchIdx = -1;
-                if (batchAudioPref.keepAll) {
-                    matchIdx = 9999;
-                } else {
-                    if (!batchAudioPref.preferredLanguage.empty() && batchAudioPref.preferredLanguage != "und") {
-                        for (size_t t = 0; t < tracks.size(); t++) {
-                            if (!tracks[t].language.empty() && _stricmp(tracks[t].language.c_str(), batchAudioPref.preferredLanguage.c_str()) == 0) {
-                                matchIdx = (int)t;
-                                break;
-                            }
-                        }
-                    }
-                    if (matchIdx == -1 && !batchAudioPref.preferredTitle.empty()) {
-                        for (size_t t = 0; t < tracks.size(); t++) {
-                            if (!tracks[t].title.empty() &&
-                                (tracks[t].title.find(batchAudioPref.preferredTitle) != string::npos ||
-                                 batchAudioPref.preferredTitle.find(tracks[t].title) != string::npos)) {
-                                matchIdx = (int)t;
-                                break;
-                            }
-                        }
-                    }
-                    if (matchIdx == -1 && batchAudioPref.preferredLanguage.empty() && batchAudioPref.preferredTitle.empty()) {
-                        if (batchAudioPref.preferredAudioIndex >= 0 && batchAudioPref.preferredAudioIndex < (int)tracks.size()) {
-                            matchIdx = batchAudioPref.preferredAudioIndex;
-                        }
-                    }
-                }
+                int matchIdx = matchAudioPreference(tracks, batchAudioPref);
 
                 if (matchIdx != -1) {
                     if (batchAudioPref.keepAll) {
@@ -4170,6 +4670,7 @@ void batchCompressVideo() {
                    " Следующие файлы имеют несколько аудиодорожек, отличных от выбранного предпочтения.\n Пожалуйста, выберите аудиодорожку для каждого файла:\n");
 
         bool keepAllForAllRemaining = false;
+        bool useRememberedAudioPref = false;
 
         for (size_t c = 0; c < conflictedFiles.size(); c++) {
             const auto& cf = conflictedFiles[c];
@@ -4185,18 +4686,41 @@ void batchCompressVideo() {
                 selectedAudioMap = " -map 0:a?";
                 printColor(tr("[INFO] Using all audio tracks (applied to all remaining files)",
                               "[ИНФО] Сохранение всех аудиодорожек (применено ко всем оставшимся файлам)"), GREEN);
-            } else {
+            } else if (useRememberedAudioPref) {
+                int matchIdx = matchAudioPreference(cf.tracks, batchAudioPref);
+                if (matchIdx != -1 && matchIdx != 9999) {
+                    selectedAudioMap = " -map 0:a:" + to_string(cf.tracks[matchIdx].audioIndex);
+                    printColor(tr("[INFO] Using remembered audio track (applied to all remaining files)",
+                                  "[ИНФО] Использование запомненной аудиодорожки (применено ко всем оставшимся файлам)"), GREEN);
+                } else {
+                    useRememberedAudioPref = false;
+                }
+            }
+            if (selectedAudioMap.empty()) {
                 bool keepAllBatch = false;
+                bool applyToAllAudio = false;
                 int selectedTrackIdx = -1;
-                if (!selectAudioTrackForFile(cf.filePath, selectedAudioMap, true, true, &keepAllBatch, &selectedTrackIdx)) {
+                if (!selectAudioTrackForFile(cf.filePath, selectedAudioMap, true, true, &keepAllBatch, &selectedTrackIdx, &applyToAllAudio)) {
                     printColor(tr("[INFO] File skipped.", "[ИНФО] Файл пропущен."), YELLOW);
                     skippedFiles.push_back(fs::u8path(cf.filePath).filename().u8string());
                     fail++;
                     continue;
                 }
-                if (keepAllBatch) {
-                    keepAllForAllRemaining = true;
-                    selectedAudioMap = " -map 0:a?";
+                if (applyToAllAudio) {
+                    if (keepAllBatch || selectedTrackIdx == -1) {
+                        keepAllForAllRemaining = true;
+                        selectedAudioMap = " -map 0:a?";
+                    } else if (selectedTrackIdx >= 0 && selectedTrackIdx < (int)cf.tracks.size()) {
+                        batchAudioPref.hasPreference = true;
+                        batchAudioPref.keepAll = false;
+                        const auto& trk = cf.tracks[selectedTrackIdx];
+                        batchAudioPref.preferredAudioIndex = trk.audioIndex;
+                        batchAudioPref.preferredLanguage = trk.language;
+                        batchAudioPref.preferredTitle = trk.title;
+                        batchAudioPref.preferredCodec = trk.codec;
+                        batchAudioPref.displayName = trk.getDisplayString() + tr(" (All videos in batch)", " (для всех видео в пакете)");
+                        useRememberedAudioPref = true;
+                    }
                 }
             }
 
@@ -4210,7 +4734,22 @@ void batchCompressVideo() {
                 int realIdx = realVideoIndices.empty() ? 0 : realVideoIndices[0];
                 videoMap = " -map 0:v:" + to_string(vTracks[realIdx].videoIndex);
             } else if (realVideoIndices.size() > 1) {
-                selectVideoTrackForFile(cf.filePath, videoMap, true);
+                int matchIdx = batchVideoPref.hasPreference ? matchVideoPreference(vTracks, realVideoIndices, batchVideoPref) : -1;
+                if (matchIdx != -1) {
+                    videoMap = batchVideoPref.keepAll ? " -map 0:v?" : " -map 0:v:" + to_string(vTracks[matchIdx].videoIndex);
+                } else {
+                    string selMap;
+                    bool applyAllVideo = false;
+                    int selVideoIdx = -1;
+                    if (!selectVideoTrackForFile(cf.filePath, selMap, true, &applyAllVideo, &selVideoIdx)) {
+                        printColor(tr("[INFO] File skipped.", "[ИНФО] Файл пропущен."), YELLOW);
+                        skippedFiles.push_back(fs::u8path(cf.filePath).filename().u8string());
+                        fail++;
+                        continue;
+                    }
+                    videoMap = selMap;
+                    if (applyAllVideo) recordVideoPreference(batchVideoPref, selVideoIdx, vTracks);
+                }
             }
             string streamMapArg = buildStreamMapArgs(videoMap, selectedAudioMap);
 
@@ -5185,15 +5724,14 @@ void changeSpeed() {
     bool deleteOrig = false;
     if (!promptDeleteOriginal(false, deleteOrig)) return;
 
-    char speedBuf[32];
-    snprintf(speedBuf, sizeof(speedBuf), "%.2f", speed);
-    string outPath = buildOutputPath(inputFile, "_speed" + string(speedBuf));
+    string speedStr = formatDot(speed, 2);
+    string outPath = buildOutputPath(inputFile, "_speed" + speedStr);
     auto ft = prepareFFmpegTarget(outPath, {inputFile});
 
     // Video: setpts=PTS/speed, Audio: atempo=speed (atempo only supports 0.5-2.0 range, chain for wider)
+    // These go straight into the FFmpeg command line, so they must use a dot decimal separator.
     double videoFactor = 1.0 / speed;
-    char vfBuf[64];
-    snprintf(vfBuf, sizeof(vfBuf), "setpts=%.4f*PTS", videoFactor);
+    string vfFilter = "setpts=" + formatDot(videoFactor, 4) + "*PTS";
 
     // Build atempo chain for audio (each atempo supports 0.5-2.0)
     string atempoChain;
@@ -5208,17 +5746,15 @@ void changeSpeed() {
         atempoChain += "atempo=0.5";
         remainingSpeed /= 0.5;
     }
-    char atBuf[64];
-    snprintf(atBuf, sizeof(atBuf), "atempo=%.4f", remainingSpeed);
     if (!atempoChain.empty()) atempoChain += ",";
-    atempoChain += atBuf;
+    atempoChain += "atempo=" + formatDot(remainingSpeed, 4);
 
     wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
     cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(inputFile)) + L"\"";
     if (!streamMapArg.empty()) {
         cmd += utf8ToWstring(streamMapArg);
     }
-    string vfSpec = buildVideoFilterSpec(inputFile, false, false, string(vfBuf), "original");
+    string vfSpec = buildVideoFilterSpec(inputFile, false, false, vfFilter, "original");
     if (!vfSpec.empty()) {
         cmd += L" " + utf8ToWstring(vfSpec);
     }
@@ -5766,16 +6302,19 @@ void createGif() {
     cout << tr("Duration in seconds (Enter=5):\n", "Длительность в секундах (Enter=5):\n");
     if (!inputLineWithEscape(gifDuration, "> ")) { gifDuration = "5"; }
     if (gifDuration.empty()) gifDuration = "5";
+    gifDuration = sanitizeNumberArg(gifDuration);
 
     cout << "\n" << tr("GIF width (Enter=480):\n", "Ширина GIF (Enter=480):\n");
     string gifWidth;
     if (!inputLineWithEscape(gifWidth, "> ")) { gifWidth = "480"; }
     if (gifWidth.empty()) gifWidth = "480";
+    gifWidth = sanitizeNumberArg(gifWidth);
 
     cout << "\n" << tr("FPS (Enter=15):\n", "FPS (Enter=15):\n");
     string gifFps;
     if (!inputLineWithEscape(gifFps, "> ")) { gifFps = "15"; }
     if (gifFps.empty()) gifFps = "15";
+    gifFps = sanitizeNumberArg(gifFps);
 
     string videoMapArg;
     int selectedVideoIdx = -1;
@@ -6078,7 +6617,7 @@ void extractFrames() {
             string interval;
             cout << tr("Interval in seconds: ", "Интервал в секундах: ");
             if (!inputLineWithEscape(interval, "")) return;
-            cmd += L" -vf \"fps=1/" + utf8ToWstring(interval) + L"\" -q:v 2";
+            cmd += L" -vf \"fps=1/" + utf8ToWstring(sanitizeNumberArg(interval)) + L"\" -q:v 2";
             if (OVERWRITE_FILES) cmd += L" -y";
             cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(framesDir + "frame_%04d.png")) + L"\"";
             break;
@@ -6715,8 +7254,8 @@ void updateComponentsMenu() {
         printColor("========================================", CYAN);
         string zipFile = CONFIG_PATH + "ffmpeg.zip";
         if (downloadFile("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip", zipFile, "FFmpeg")) {
-            printComponentProgress("FFmpeg", 100.0, tr("Extracting components...", "Извлечение компонентов..."));
-            if (extractZip(zipFile, CONFIG_PATH)) {
+            if (extractZip(zipFile, CONFIG_PATH, "FFmpeg",
+                           tr("Extracting components...", "Извлечение компонентов..."))) {
                 organizeExtractedTool("ffmpeg.exe", CONFIG_PATH);
                 FFMPEG_FOUND = fileExists(CONFIG_PATH + "ffmpeg.exe");
                 FFPROBE_FOUND = fileExists(CONFIG_PATH + "ffprobe.exe");
@@ -7107,8 +7646,8 @@ bool checkDependencies() {
         printColor("\n" + tr("[INFO] Installing FFmpeg (~160MB)...", "[ИНФО] Установка FFmpeg (~160MB)..."), CYAN);
         string zipFile = CONFIG_PATH + "ffmpeg.zip";
         if (downloadFile("https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip", zipFile, "FFmpeg")) {
-            printComponentProgress("FFmpeg", 100.0, tr("Extracting components...", "Распаковка компонентов..."));
-            if (extractZip(zipFile, CONFIG_PATH)) {
+            if (extractZip(zipFile, CONFIG_PATH, "FFmpeg",
+                           tr("Extracting components...", "Распаковка компонентов..."))) {
                 organizeExtractedTool("ffmpeg.exe", CONFIG_PATH);
                 FFMPEG_FOUND = fileExists(CONFIG_PATH + "ffmpeg.exe");
                 FFPROBE_FOUND = fileExists(CONFIG_PATH + "ffprobe.exe");
@@ -7198,7 +7737,7 @@ char mainMenuSelect() {
     while (true) {
         clearScreen();
         printColor("========================================", CYAN);
-        printColor(" MR CLI FOR FFMPEG v1.1.5", CYAN);
+        printColor(" MR CLI FOR FFMPEG v1.1.6", CYAN);
         printColor("========================================", CYAN);
         printColor("========================================", GREEN);
         printColor(" FFMPEG:  " + string(FFMPEG_FOUND ? tr("[OK] installed", "[OK] установлен") : tr("[ERROR] not found", "[ОШИБКА] не найден")), FFMPEG_FOUND ? GREEN : RED);

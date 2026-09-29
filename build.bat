@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-set MSBUILD="C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\amd64\MSBuild.exe"
+set MSBUILD="C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\amd64\MSBuild.exe"
 
 echo ========================================
 echo   Building x64 Release...
@@ -28,8 +28,8 @@ echo.
 echo ========================================
 echo   Copying executables...
 echo ========================================
-copy /Y "x64\Release\mr-cli-ffmpeg.exe" "mr-cli-ffmpeg-v1.1.4-x64.exe"
-copy /Y "Release\mr-cli-ffmpeg.exe" "mr-cli-ffmpeg-v1.1.4-x86.exe"
+copy /Y "x64\Release\mr-cli-ffmpeg.exe" "mr-cli-ffmpeg-v1.1.6-x64.exe"
+copy /Y "Release\mr-cli-ffmpeg.exe" "mr-cli-ffmpeg-v1.1.6-x86.exe"
 
 echo.
 echo ========================================
