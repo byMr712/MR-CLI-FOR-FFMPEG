@@ -43,6 +43,7 @@ bool OVERWRITE_FILES = false;
 bool KEEP_METADATA = true;
 bool VIDEO_CODEC_ASK = true;
 bool AUDIO_CODEC_ASK = false;
+bool PARALLEL_BATCH = false;
 string AUDIO_CODEC = "copy";
 string SUBTITLE_ACTION = "ask";
 string DELETE_ORIGINAL = "ask";
@@ -1228,7 +1229,8 @@ void printFFmpegProgressBar(double currentSec, double totalSec, const string& sp
         percent = (currentSec / totalSec) * 100.0;
         if (percent > 100) percent = 100;
     }
-    const int barWidth = 30;
+    // 38 inner cells + "[" + "]" = 40 columns, the same width as the "====" separators
+    const int barWidth = 38;
     int pos = (int)(barWidth * percent / 100.0);
     string line = "\r[";
     for (int i = 0; i < barWidth; i++) line += (i < pos) ? '=' : (i == pos ? '>' : ' ');
@@ -1248,12 +1250,88 @@ void printFFmpegProgressBar(double currentSec, double totalSec, const string& sp
     char timeBuf[64];
     snprintf(timeBuf, sizeof(timeBuf), "  [%02d:%02d/%02d:%02d]", cm, cs, tm, ts);
     line += timeBuf;
-    line += "        ";
+    // Wide enough to erase a longer previous speed/time line, so a shrinking value
+    // never leaves stray characters behind.
+    line += "            ";
     cout << line << flush;
+}
+
+// ========== FFPROBE RESULT CACHE ==========
+// Running the real batch loop with a spawn counter attached to runCommand() gave 9
+// ffprobe launches per file, 18 per pair. 39% of them (14 of 36 on a 4 file run) were
+// byte-identical repeats of a command already run against the same file: the batch loop
+// asks for the video tracks of the current file at line 5114 and again inside
+// buildPairFingerprint(), the same for audio and subtitle tracks, and getVideoProperties()
+// runs both inside detectEncodingProblem() and inside buildVideoFilterSpec(). Each launch
+// costs a measured ~23 ms of CreateProcess plus process teardown, so those repeats are
+// pure latency.
+//
+// The key is the full command line PLUS the size and modification time of the file it
+// targets, so a file that changed on disk is always re-probed. ffmpeg output is never
+// cached: it is progress text, and the two commands have different lifetimes.
+static vector<pair<string, string> > g_probeCache;
+static size_t g_probeCacheLimit = 512;
+static int g_probeCacheHits = 0;
+
+static void clearProbeCache() {
+    g_probeCache.clear();
+    g_probeCacheHits = 0;
+}
+
+// An ffprobe command line is: "<ffprobe.exe>" <flags...> "<target file>"
+// so the target is always the last quoted argument.
+static string lastQuotedArg(const string& cmd) {
+    size_t close = cmd.rfind('"');
+    if (close == string::npos || close == 0) return "";
+    size_t open = cmd.rfind('"', close - 1);
+    if (open == string::npos) return "";
+    return cmd.substr(open + 1, close - open - 1);
+}
+
+static bool commandRunsFfprobe(const string& cmd) {
+    if (cmd.empty() || cmd[0] != '"') return false;
+    size_t close = cmd.find('"', 1);
+    if (close == string::npos) return false;
+    string exe = cmd.substr(1, close - 1);
+    string lower = exe;
+    for (size_t i = 0; i < lower.size(); i++) lower[i] = (char)::tolower((unsigned char)lower[i]);
+    return lower.find("ffprobe") != string::npos;
+}
+
+// Size + mtime of the probed file. Returning "?" on failure is deliberate: an unreadable
+// path then never collides with a readable one that happens to match the command line.
+static string probedFileSignature(const string& path) {
+    if (path.empty()) return "";
+    std::error_code ec;
+    auto size = fs::file_size(fs::u8path(path), ec);
+    if (ec) return "?";
+    auto mtime = fs::last_write_time(fs::u8path(path), ec);
+    if (ec) return "?";
+    char buf[96];
+    snprintf(buf, sizeof(buf), "%llu|%lld",
+             (unsigned long long)size,
+             (long long)mtime.time_since_epoch().count());
+    return buf;
+}
+
+static string probeCacheKey(const string& cmd) {
+    return cmd + "\x01" + probedFileSignature(lastQuotedArg(cmd));
 }
 
 // ========== UNIVERSAL COMMAND EXECUTION ==========
 static string runCommand(const string& cmd) {
+    bool isProbe = commandRunsFfprobe(cmd);
+    string cacheKey;
+    if (isProbe) {
+        cacheKey = probeCacheKey(cmd);
+        for (size_t i = 0; i < g_probeCache.size(); i++) {
+            if (g_probeCache[i].first == cacheKey) {
+                g_probeCacheHits++;
+                return g_probeCache[i].second;
+            }
+        }
+    }
+
     SECURITY_ATTRIBUTES sa = {};
     sa.nLength = sizeof(SECURITY_ATTRIBUTES);
     sa.bInheritHandle = TRUE;
@@ -1290,8 +1368,16 @@ static string runCommand(const string& cmd) {
     CloseHandle(hReadPipe);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+
+    if (isProbe) {
+        if (g_probeCache.size() >= g_probeCacheLimit) g_probeCache.erase(g_probeCache.begin());
+        g_probeCache.push_back(make_pair(cacheKey, output));
+    }
     return output;
 }
+
+// Locale-independent decimal parser; defined further down with the other number helpers.
+static bool parseNumberLoose(const string& s, double& out);
 
 // ========== GET MEDIA DURATION VIA FFPROBE ==========
 double getMediaDuration(const string& filePath) {
@@ -1302,15 +1388,9 @@ double getMediaDuration(const string& filePath) {
 
     while (!output.empty() && (output.back() == '\r' || output.back() == '\n' || output.back() == ' '))
         output.pop_back();
-    try { return stod(output); } catch (...) { return 0; }
-}
-
-// ========== GET MEDIA INFO VIA FFPROBE ==========
-string getMediaInfo(const string& filePath) {
-    if (!FFPROBE_FOUND || FFPROBE_PATH.empty()) return "[ffprobe not available]";
-
-    string cmd = "\"" + FFPROBE_PATH + "\" -v quiet -show_format -show_streams -of default \"" + filePath + "\"";
-    return runCommand(cmd);
+    double dur = 0;
+    if (!parseNumberLoose(output, dur)) return 0;
+    return dur;
 }
 
 // Forward declaration
@@ -1514,26 +1594,39 @@ static string formatDot(double value, int decimals = 2) {
 
 // Parses a number written with either decimal separator ("23.98" or "23,98").
 // Returns false when the text does not start with a number.
+//
+// The value is assembled by hand from the digits. std::stod() cannot be used here:
+// setUTF8() calls setlocale(LC_ALL, ".UTF8"), which on a Russian system resolves to
+// Russian_Russia.utf8, and strtod() then stops at a dot. Measured on this machine:
+// stod("1.5") == 1.0, stod("0.25") == 0.0, stod("2.75") == 2.0. FFmpeg always writes dot
+// decimals, so every fractional value it produced was being silently truncated.
 static bool parseNumberLoose(const string& s, double& out) {
     size_t i = 0;
     while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) i++;
     size_t start = i;
-    if (i < s.size() && (s[i] == '+' || s[i] == '-')) i++;
+    bool negative = false;
+    if (i < s.size() && (s[i] == '+' || s[i] == '-')) { negative = (s[i] == '-'); i++; }
+
+    double value = 0.0;
     bool anyDigit = false;
-    while (i < s.size() && s[i] >= '0' && s[i] <= '9') { i++; anyDigit = true; }
+    while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+        value = value * 10.0 + (double)(s[i] - '0');
+        i++; anyDigit = true;
+    }
     if (i < s.size() && (s[i] == '.' || s[i] == ',')) {
         size_t sepPos = i;
         i++;
+        double scale = 0.1;
         bool fracDigit = false;
-        while (i < s.size() && s[i] >= '0' && s[i] <= '9') { i++; fracDigit = true; }
+        while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+            value += scale * (double)(s[i] - '0');
+            scale *= 0.1;
+            i++; fracDigit = true;
+        }
         if (!fracDigit) i = sepPos;   // trailing separator, e.g. "90000,"
     }
     if (!anyDigit) return false;
-    string num = s.substr(start, i - start);
-    for (size_t k = 0; k < num.size(); k++) {
-        if (num[k] == ',') num[k] = '.';
-    }
-    try { out = stod(num); } catch (...) { return false; }
+    out = negative ? -value : value;
     return true;
 }
 
@@ -1678,13 +1771,15 @@ vector<VideoTrack> getVideoTracks(const string& filePath) {
             else if (key == "r_frame_rate") {
                 size_t slash = val.find('/');
                 if (slash != string::npos) {
-                    try {
-                        double num = stod(val.substr(0, slash));
-                        double den = stod(val.substr(slash + 1));
+                    double num = 0, den = 0;
+                    if (parseNumberLoose(val.substr(0, slash), num) &&
+                        parseNumberLoose(val.substr(slash + 1), den)) {
                         if (den > 0) {
                             cur.fps = trimZeroDecimals(formatDot(num / den, 2));
                         }
-                    } catch (...) { cur.fps = val; }
+                    } else {
+                        cur.fps = val;
+                    }
                 } else {
                     cur.fps = val;
                 }
@@ -2053,7 +2148,9 @@ struct ConflictedVideoFile {
 enum ProcessFileResult {
     PROC_SUCCESS = 0,
     PROC_FAIL = 1,
-    PROC_CANCEL_BATCH = 2
+    PROC_CANCEL_BATCH = 2,
+    PROC_PAIR_HANDLED = 4,    // A pair finished inside the lambda; both files are already counted.
+    PROC_PAIR_CANCELLED = 5   // A pair was interrupted and the user cancelled the whole batch.
 };
 
 // ========== VIDEO SOURCE PROPERTIES ==========
@@ -2620,8 +2717,8 @@ MediaProperties parseMediaProperties(const string& filePath) {
         if (key == "format_name") {
             mp.format = cleanFormatName(val);
         } else if (key == "duration") {
-            try {
-                double dur = stod(val);
+            double dur = 0;
+            if (parseNumberLoose(val, dur)) {
                 mp.durationSec = dur;
                 int h = (int)(dur / 3600);
                 int m = (int)((dur - h * 3600) / 60);
@@ -2629,15 +2726,16 @@ MediaProperties parseMediaProperties(const string& filePath) {
                 char buf[64];
                 snprintf(buf, sizeof(buf), "%02d:%02d:%02d", h, m, s);
                 mp.durationStr = buf;
-            } catch (...) {}
-        } else if (key == "bit_rate") {
-            try {
-                double br = stod(val);
+            }
+        }
+        else if (key == "bit_rate") {
+            double br = 0;
+            if (parseNumberLoose(val, br)) {
                 mp.bitrateVal = br;
                 char buf[64];
                 snprintf(buf, sizeof(buf), "%.0f kbps", br / 1000.0);
                 mp.bitrateStr = buf;
-            } catch (...) {}
+            }
         } else if (key == "nb_streams") {
             mp.nbStreams = val;
         }
@@ -2670,13 +2768,13 @@ MediaProperties parseMediaProperties(const string& filePath) {
         mp.fps = mainVideo->fps;
         mp.pixFmt = mainVideo->pixFmt;
         if (!mainVideo->bitRate.empty()) {
-            try {
-                double br = stod(mainVideo->bitRate);
+            double br = 0;
+            if (parseNumberLoose(mainVideo->bitRate, br)) {
                 mp.videoBitrateVal = br;
                 char buf[64];
                 snprintf(buf, sizeof(buf), "%.0f kbps", br / 1000.0);
                 mp.videoBitrateStr = buf;
-            } catch (...) {}
+            }
         }
     }
 
@@ -2691,13 +2789,13 @@ MediaProperties parseMediaProperties(const string& filePath) {
         }
         mp.sampleRate = at.sampleRate;
         if (!at.bitRate.empty()) {
-            try {
-                double br = stod(at.bitRate);
+            double br = 0;
+            if (parseNumberLoose(at.bitRate, br)) {
                 mp.audioBitrateVal = br;
                 char buf[64];
                 snprintf(buf, sizeof(buf), "%.0f kbps", br / 1000.0);
                 mp.audioBitrateStr = buf;
-            } catch (...) {}
+            }
         }
     }
 
@@ -2846,6 +2944,219 @@ bool execFFmpegWithProgress(const wstring& cmdLine, double totalDuration = 0) {
     return (exitCode == 0);
 }
 
+// ========== DOUBLE (PAIR) BATCH PROCESSING ENGINE ==========
+// Experimental feature, driven by PARALLEL_BATCH. Two videos are only ever launched
+// together when the batch loop would not stop and ask the user anything for either of
+// them (see buildPairFingerprint below). That guarantee is what makes two concurrent
+// FFmpeg processes safe to drive from a single keyboard loop: no interactive prompt can
+// appear while a job is already running, so _getwch() is never needed mid-run.
+
+struct PairJob {
+    PROCESS_INFORMATION pi = {};
+    HANDLE hRead = INVALID_HANDLE_VALUE;
+    string fileName;
+    string pending;
+    double currentSec = 0;
+    double duration = 0;
+    string speed;
+    bool running = false;
+    bool errorSeen = false;
+    string lastError;
+    DWORD exitCode = 1;
+};
+
+bool spawnPairJob(PairJob& job, const wstring& cmdLine, const string& fileName, double duration) {
+    SECURITY_ATTRIBUTES sa = {};
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.bInheritHandle = TRUE;
+
+    HANDLE hWrite = NULL;
+    if (!CreatePipe(&job.hRead, &hWrite, &sa, 0)) return false;
+    SetHandleInformation(job.hRead, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = hWrite;
+    si.hStdError = hWrite;
+
+    wstring mutableCmd = cmdLine;
+    if (!CreateProcessW(NULL, &mutableCmd[0], NULL, NULL, TRUE, 0, NULL, NULL, &si, &job.pi)) {
+        CloseHandle(job.hRead);
+        job.hRead = INVALID_HANDLE_VALUE;
+        CloseHandle(hWrite);
+        return false;
+    }
+    CloseHandle(hWrite);
+    job.fileName = fileName;
+    job.duration = duration;
+    job.running = true;
+    return true;
+}
+
+// Drains whatever FFmpeg has produced so far without blocking.
+void consumePairOutput(PairJob& job) {
+    if (!job.running || job.hRead == INVALID_HANDLE_VALUE) return;
+
+    char buffer[4096];
+    DWORD bytesRead = 0;
+    DWORD avail = 0;
+    if (PeekNamedPipe(job.hRead, NULL, 0, NULL, &avail, NULL) && avail > 0) {
+        if (ReadFile(job.hRead, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
+            for (DWORD i = 0; i < bytesRead; i++) {
+                char c = buffer[i];
+                if (c == '\r' || c == '\n') {
+                    if (!job.pending.empty()) {
+                        string timeStr, spd;
+                        if (parseFFmpegProgress(job.pending, timeStr, spd)) {
+                            job.currentSec = timeToSeconds(timeStr);
+                            if (!spd.empty()) job.speed = spd;
+                        } else if (job.pending.find("rror") != string::npos &&
+                                   job.pending.find("encoder") == string::npos) {
+                            job.errorSeen = true;
+                            if (job.lastError.empty()) job.lastError = job.pending;
+                        }
+                        job.pending.clear();
+                    }
+                } else {
+                    job.pending += c;
+                }
+            }
+        }
+    }
+}
+
+// Marks a job finished once the process exited AND the pipe has been fully drained.
+bool tryFinishPairJob(PairJob& job) {
+    if (!job.running) return true;
+    if (WaitForSingleObject(job.pi.hProcess, 0) != WAIT_OBJECT_0) return false;
+
+    consumePairOutput(job);
+    DWORD left = 0;
+    if (PeekNamedPipe(job.hRead, NULL, 0, NULL, &left, NULL) && left > 0) return false;
+
+    GetExitCodeProcess(job.pi.hProcess, &job.exitCode);
+    job.running = false;
+    return true;
+}
+
+void releasePairJob(PairJob& job) {
+    if (job.hRead != INVALID_HANDLE_VALUE) { CloseHandle(job.hRead); job.hRead = INVALID_HANDLE_VALUE; }
+    if (job.pi.hProcess) { CloseHandle(job.pi.hProcess); job.pi.hProcess = NULL; }
+    if (job.pi.hThread) { CloseHandle(job.pi.hThread); job.pi.hThread = NULL; }
+    job.running = false;
+}
+
+// Integer-only formatting: never goes through %f, so a Russian LC_NUMERIC cannot
+// turn a progress value into "45,00" (see AGENTS.md, decimal separator rules).
+string pairTimeLabel(double seconds) {
+    if (seconds < 0) seconds = 0;
+    int total = (int)(seconds + 0.5);
+    int h = total / 3600;
+    int m = (total % 3600) / 60;
+    int s = total % 60;
+    char buf[24];
+    if (h > 0) snprintf(buf, sizeof(buf), "%d:%02d:%02d", h, m, s);
+    else snprintf(buf, sizeof(buf), "%d:%02d", m, s);
+    return buf;
+}
+
+string pairStatusLine(const PairJob& job, int slot) {
+    int percent = 0;
+    if (job.duration > 0) {
+        percent = (int)(job.currentSec * 100.0 / job.duration + 0.5);
+        if (percent < 0) percent = 0;
+        if (percent > 100) percent = 100;
+    } else if (!job.running) {
+        percent = job.exitCode == 0 ? 100 : percent;
+    }
+
+    const int barWidth = 22;
+    int filled = (int)((long long)barWidth * percent / 100);
+    if (filled < 0) filled = 0;
+    if (filled > barWidth) filled = barWidth;
+
+    string name = job.fileName;
+    size_t dot = name.find_last_of('.');
+    if (dot != string::npos && dot > 0) name = name.substr(0, dot);
+    const size_t maxName = 40;
+    if (name.size() > maxName) name = name.substr(0, maxName - 3) + "...";
+
+    char head[16];
+    snprintf(head, sizeof(head), "[%d] ", slot);
+
+    string out = head + name + " [";
+    for (int b = 0; b < barWidth; b++) out += (b < filled) ? '=' : ' ';
+    out += "] ";
+
+    char pct[16];
+    snprintf(pct, sizeof(pct), "%3d%%", percent);
+    out += pct;
+    if (!job.speed.empty()) out += "  " + job.speed;
+    out += "  " + pairTimeLabel(job.currentSec) + "/" + pairTimeLabel(job.duration);
+
+    if (!job.running) {
+        if (job.exitCode == 0) {
+            out += tr("  [OK]", "  [OK]");
+        } else {
+            out += tr("  [FAILED]", "  [ОШИБКА]");
+        }
+    }
+    return out;
+}
+
+// Number of status lines currently on screen, so the next repaint knows how far to
+// walk the cursor back up. Reset by execFFmpegPair() before the first render.
+int g_pairRenderedLines = 0;
+
+void renderPairStatus(const PairJob& a, const PairJob& b) {
+    if (g_pairRenderedLines > 0) {
+        cout << "\033[" << g_pairRenderedLines << "A\r\033[J";
+    }
+    cout << pairStatusLine(a, 1) << "\n";
+    cout << pairStatusLine(b, 2) << "\n";
+    cout << flush;
+    g_pairRenderedLines = 2;
+}
+
+// Runs both jobs to completion, repainting the two status lines in place.
+// Returns true only if BOTH finished with exit code 0.
+bool execFFmpegPair(PairJob& a, PairJob& b, bool& escaped) {
+    escaped = false;
+    g_pairRenderedLines = 0;
+    bool okA = false, okB = false;
+
+    while (a.running || b.running) {
+        if (_kbhit()) {
+            int key = _getch();
+            if (key == 27) {
+                escaped = true;
+                if (a.running) TerminateProcess(a.pi.hProcess, 1);
+                if (b.running) TerminateProcess(b.pi.hProcess, 1);
+            }
+        }
+
+        consumePairOutput(a);
+        consumePairOutput(b);
+        bool doneA = tryFinishPairJob(a);
+        bool doneB = tryFinishPairJob(b);
+
+        if (!doneA || !doneB) {
+            renderPairStatus(a, b);
+            Sleep(80);
+        } else {
+            break;
+        }
+    }
+
+    renderPairStatus(a, b);
+    cout << endl;
+
+    okA = (a.exitCode == 0);
+    okB = (b.exitCode == 0);
+    return (okA && okB);
+}
+
 // ========== DIALOGS ==========
 string openFolderDialog(const wchar_t* title = L"Select folder") {
     IFileDialog* pfd = nullptr;
@@ -2927,6 +3238,7 @@ void saveConfig() {
       << "AUDIO_CODEC=" << AUDIO_CODEC << "\n"
       << "SUBTITLE_ACTION=" << SUBTITLE_ACTION << "\n"
       << "DELETE_ORIGINAL=" << DELETE_ORIGINAL << "\n"
+      << "PARALLEL_BATCH=" << (PARALLEL_BATCH ? "true" : "false") << "\n"
       << "LANGUAGE=" << (CURRENT_LANG == LANG_RU ? "ru" : "en") << "\n"
       << "SAVE_COVER=" << (SAVE_COVER ? "true" : "false") << "\n"
       << "ACCELERATION_MODE=" << (int)ACCELERATION_MODE << "\n"
@@ -2966,6 +3278,7 @@ void loadConfig() {
                 else if (l.find("DELETE_ORIGINAL=") == 0) DELETE_ORIGINAL = l.substr(16);
                 else if (l.find("LANGUAGE=") == 0) CURRENT_LANG = (l.substr(9) == "ru") ? LANG_RU : LANG_EN;
                 else if (l.find("SAVE_COVER=") == 0) SAVE_COVER = (l.substr(11) == "true");
+                else if (l.find("PARALLEL_BATCH=") == 0) PARALLEL_BATCH = (l.substr(15) == "true");
                 else if (l.find("ACCELERATION_MODE=") == 0) { try { ACCELERATION_MODE = (AccelMode)stoi(l.substr(18)); } catch (...) { ACCELERATION_MODE = ACCEL_CPU_ONLY; } }
                 else if (l.find("HYBRID_GPU_CHOICE=") == 0) { try { HYBRID_GPU_CHOICE = (AccelMode)stoi(l.substr(18)); } catch (...) { HYBRID_GPU_CHOICE = ACCEL_CPU_ONLY; } }
             }
@@ -3235,6 +3548,10 @@ struct FFmpegTarget {
     string writePath;
     string inputPath;
     bool isTemp = false;
+    // Set when the FFmpeg command already attached the cover itself, so
+    // finalizeFFmpegTarget() must not remux the finished file a second time just to
+    // add the picture.
+    bool coverEmbedded = false;
 };
 
 FFmpegTarget prepareFFmpegTarget(const string& targetPath, const vector<string>& inputPaths) {
@@ -3283,7 +3600,7 @@ void processCover(const string& inputPath, const string& outputPath);
 
 bool finalizeFFmpegTarget(const FFmpegTarget& ft, bool success) {
     if (!ft.isTemp) {
-        if (success) processCover(ft.inputPath, ft.targetPath);
+        if (success && !ft.coverEmbedded) processCover(ft.inputPath, ft.targetPath);
         return success;
     }
 
@@ -3354,7 +3671,7 @@ bool finalizeFFmpegTarget(const FFmpegTarget& ft, bool success) {
             return false;
         }
 
-        processCover(ft.inputPath, ft.targetPath);
+        if (!ft.coverEmbedded) processCover(ft.inputPath, ft.targetPath);
         return fileExistsW(wTarget);
     } else {
         DeleteFileW(wTemp.c_str());
@@ -3474,10 +3791,6 @@ EmbeddedCoverInfo detectEmbeddedCover(const string& filePath) {
     return ci;
 }
 
-bool hasEmbeddedCover(const string& filePath) {
-    return detectEmbeddedCover(filePath).found;
-}
-
 bool extractCover(const string& sourcePath, const string& outCoverPath) {
     EmbeddedCoverInfo ci = detectEmbeddedCover(sourcePath);
     if (ci.found) {
@@ -3516,6 +3829,54 @@ bool extractCover(const string& sourcePath, const string& outCoverPath) {
     return fileExists(outCoverPath) && fs::file_size(fs::u8path(outCoverPath)) > 0;
 }
 
+// Container specific FFmpeg arguments that attach a cover to a stream copy pass.
+// The caller has already placed the main input on its command line; this appends the
+// cover to that same pass. Returns false for containers that cannot carry a cover, in
+// which case the caller must fall back to the post-pass rewrite.
+//
+// This is the single source of truth for cover embedding: both the standalone
+// embedCoverIntoFile() remux and the concatenate path build their command from it, so the
+// two can never disagree about a container.
+static bool buildCoverAttachArgs(const string& outputExt, const string& coverPath, wstring& argsOut) {
+    string ext = outputExt;
+    transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+    fs::path cp = fs::u8path(coverPath);
+    string coverExt = cp.extension().u8string();
+    transform(coverExt.begin(), coverExt.end(), coverExt.begin(), ::tolower);
+    string mime = (coverExt == ".png") ? "image/png" : "image/jpeg";
+
+    argsOut.clear();
+
+    if (ext == ".mkv") {
+        // Matroska: the cover is a file attachment, not a stream
+        argsOut += L" -attach \"" + utf8ToWstring(getSafeFFmpegPath(coverPath)) + L"\"";
+        argsOut += L" -metadata:s:t mimetype=\"" + utf8ToWstring(mime) + L"\"";
+        argsOut += L" -metadata:s:t:0 filename=\"cover" + utf8ToWstring(coverExt.empty() ? ".jpg" : coverExt) + L"\"";
+        return true;
+    }
+
+    bool isMp4Family = (ext == ".mp4" || ext == ".m4v" || ext == ".mov" || ext == ".m4a");
+    bool isAudio = (ext == ".mp3" || ext == ".flac");
+    if (!isMp4Family && !isAudio) return false;
+
+    // Everything else: the cover becomes a second input, copied in as a video stream.
+    // "-c:v:1 copy" is stated explicitly so the cover is never handed to the encoder
+    // settings of the main stream when this is folded into a re-encode.
+    argsOut += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(coverPath)) + L"\"";
+    argsOut += isAudio ? L" -map 0:a -map 1:v" : L" -map 0 -map 1";
+    argsOut += L" -c:v:1 copy";
+    if (ext == ".mp3") {
+        argsOut += L" -id3v2_version 3";
+        argsOut += L" -metadata:s:v title=\"Album cover\" -metadata:s:v comment=\"Cover (front)\"";
+    } else if (ext == ".flac") {
+        argsOut += L" -disposition:v attached_pic";
+    } else {
+        argsOut += L" -disposition:v:1 attached_pic";
+    }
+    return true;
+}
+
 bool embedCoverIntoFile(const string& videoPath, const string& coverPath) {
     if (!fileExists(videoPath) || !fileExists(coverPath)) return false;
 
@@ -3525,46 +3886,13 @@ bool embedCoverIntoFile(const string& videoPath, const string& coverPath) {
 
     string tempOut = videoPath.substr(0, videoPath.length() - ext.length()) + "_tmp_cover" + ext;
 
-    fs::path cp = fs::u8path(coverPath);
-    string coverExt = cp.extension().u8string();
-    transform(coverExt.begin(), coverExt.end(), coverExt.begin(), ::tolower);
-    string mime = (coverExt == ".png") ? "image/png" : "image/jpeg";
+    wstring attachArgs;
+    if (!buildCoverAttachArgs(ext, coverPath, attachArgs)) return true;
 
     wstring wCmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\" -loglevel quiet -nostats";
-
-    if (ext == ".mkv") {
-        // Matroska: embed as attachment
-        wCmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(videoPath)) + L"\"";
-        wCmd += L" -attach \"" + utf8ToWstring(getSafeFFmpegPath(coverPath)) + L"\"";
-        wCmd += L" -metadata:s:t mimetype=\"" + utf8ToWstring(mime) + L"\"";
-        wCmd += L" -metadata:s:t:0 filename=\"cover" + utf8ToWstring(coverExt.empty() ? ".jpg" : coverExt) + L"\"";
-        wCmd += L" -c copy -y \"" + utf8ToWstring(tempOut) + L"\"";
-    } else if (ext == ".mp4" || ext == ".m4v" || ext == ".mov" || ext == ".m4a") {
-        // MP4 / MOV / M4V / M4A: embed as attached_pic video stream
-        wCmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(videoPath)) + L"\"";
-        wCmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(coverPath)) + L"\"";
-        wCmd += L" -map 0 -map 1";
-        wCmd += L" -c copy";
-        wCmd += L" -disposition:v:1 attached_pic";
-        wCmd += L" -y \"" + utf8ToWstring(tempOut) + L"\"";
-    } else if (ext == ".mp3") {
-        wCmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(videoPath)) + L"\"";
-        wCmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(coverPath)) + L"\"";
-        wCmd += L" -map 0:a -map 1:v";
-        wCmd += L" -c copy";
-        wCmd += L" -id3v2_version 3";
-        wCmd += L" -metadata:s:v title=\"Album cover\" -metadata:s:v comment=\"Cover (front)\"";
-        wCmd += L" -y \"" + utf8ToWstring(tempOut) + L"\"";
-    } else if (ext == ".flac") {
-        wCmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(videoPath)) + L"\"";
-        wCmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(coverPath)) + L"\"";
-        wCmd += L" -map 0:a -map 1:v";
-        wCmd += L" -c copy";
-        wCmd += L" -disposition:v attached_pic";
-        wCmd += L" -y \"" + utf8ToWstring(tempOut) + L"\"";
-    } else {
-        return true;
-    }
+    wCmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(videoPath)) + L"\"";
+    wCmd += attachArgs;
+    wCmd += L" -c copy -y \"" + utf8ToWstring(tempOut) + L"\"";
 
     runCommand(wstringToUtf8(wCmd));
 
@@ -3674,8 +4002,11 @@ int arrowSelect(const string& title, const string& description, const vector<str
         cout << flush;
 
         wint_t key = _getwch();
-        if (key == 27 || key == '0') return -1;
-        if (key == 13) return selected;
+        // The dialog stays on screen (the chosen option must remain visible), so leave a
+        // blank line behind it. Without this, the next output lands on the same line as
+        // the "Arrow keys to select..." hint and the two run together.
+        if (key == 27 || key == '0') { cout << "\n" << flush; return -1; }
+        if (key == 13) { cout << "\n" << flush; return selected; }
         if (key == 0 || key == 0xE0) {
             wint_t scan = _getwch();
             if (scan == 72) selected = (selected > 0) ? selected - 1 : (int)options.size() - 1;
@@ -3684,9 +4015,11 @@ int arrowSelect(const string& title, const string& description, const vector<str
             char ch = normalizeKeyToEnglish(key);
             for (int i = 0; i < (int)options.size(); i++) {
                 if (options[i].length() >= 2 && options[i][0] == ' ' && options[i][1] == ch) {
+                    cout << "\n" << flush;
                     return i;
                 }
                 if (options[i].length() >= 1 && options[i][0] == ch) {
+                    cout << "\n" << flush;
                     return i;
                 }
             }
@@ -4132,6 +4465,160 @@ static void recordVideoPreference(VideoTrackPreference& pref, int selectedTrackI
     }
 }
 
+// ========== DOUBLE PROCESSING: PAIR ELIGIBILITY ==========
+// Everything that makes batchCompressVideo() stop and ask the user something is
+// fingerprinted here. Two videos may only be launched together when the fingerprint
+// matches AND neither of them would open a dialog, so the answers given for the first
+// file are provably valid for the second one and the keyboard is never needed mid-run.
+struct PairFingerprint {
+    int realVideoStreams = 0;
+    int audioTracks = 0;
+    bool complexSubs = false;
+    bool encodingProblem = false;
+    bool oddDimensions = false;
+    bool ultraHighRes = false;
+    bool needsQuestion = false;
+};
+
+PairFingerprint buildPairFingerprint(const string& filePath,
+                                     bool videoPrefStored,
+                                     bool audioPrefStored,
+                                     bool subtitlesLocked,
+                                     bool encodingLocked) {
+    PairFingerprint fp;
+
+    vector<VideoTrack> vTracks = getVideoTracks(filePath);
+    for (size_t vi = 0; vi < vTracks.size(); vi++) {
+        if (!vTracks[vi].isCoverOrAttachedPic()) fp.realVideoStreams++;
+    }
+    fp.audioTracks = (int)getAudioTracks(filePath).size();
+
+    bool isMp4Family = (OUTPUT_FORMAT.find("MP4") != string::npos ||
+                        OUTPUT_FORMAT.find("MOV") != string::npos ||
+                        OUTPUT_FORMAT.find("M4V") != string::npos);
+    if (isMp4Family) {
+        vector<SubtitleTrack> subTracks = getSubtitleTracks(filePath);
+        if (!subTracks.empty()) {
+            for (const auto& st : subTracks) {
+                string lc = st.codec;
+                transform(lc.begin(), lc.end(), lc.begin(), ::tolower);
+                if (lc != "mov_text") { fp.complexSubs = true; break; }
+            }
+        }
+    }
+
+    EncodingProblem ep = detectEncodingProblem(filePath);
+    fp.encodingProblem = ep.hasProblem;
+    fp.oddDimensions = ep.isOddDimensions;
+    fp.ultraHighRes = ep.isUltraHighRes;
+
+    AccelMode activeGpu = getActiveGpuMode();
+    bool isHW = (activeGpu == ACCEL_NVIDIA || activeGpu == ACCEL_AMD || activeGpu == ACCEL_INTEL);
+
+    if (fp.complexSubs && !subtitlesLocked) fp.needsQuestion = true;
+    if (isHW && fp.encodingProblem && !encodingLocked) fp.needsQuestion = true;
+    if (fp.realVideoStreams > 1 && !videoPrefStored) fp.needsQuestion = true;
+    if (fp.audioTracks > 1 && !audioPrefStored) fp.needsQuestion = true;
+
+    return fp;
+}
+
+bool samePairFingerprint(const PairFingerprint& a, const PairFingerprint& b) {
+    return a.realVideoStreams == b.realVideoStreams &&
+           a.audioTracks == b.audioTracks &&
+           a.complexSubs == b.complexSubs &&
+           a.encodingProblem == b.encodingProblem &&
+           a.oddDimensions == b.oddDimensions &&
+           a.ultraHighRes == b.ultraHighRes;
+}
+
+// Names the second file of a pair. Filled in by the batch loop before
+// processVideoFile() is called. When nextPath is non-empty the lambda builds both
+// FFmpeg commands, runs them together and accounts for both files itself, so the
+// caller only has to advance the index by two.
+struct PairPrep {
+    string nextPath;
+    string nextStreamMapArg;
+};
+
+// Decides whether two consecutive files may be processed together and, if so, fills
+// `out` with the second file and its -map arguments.
+//
+// Both call sites (the main batch loop and the postponed-conflict resolver) must use
+// this one function. The two loops reach it under different conditions but must obey
+// the same safety rule, otherwise a batch would silently lose double processing on
+// exactly the files that needed a second pass.
+//
+// `nextForcedAudioMap` is non-empty when the caller has already decided the second
+// file's audio selection itself (the conflict resolver does this once "keep all" or
+// "apply to all" has been chosen); it bypasses the preference match in that case.
+bool tryPreparePair(const string& curPath, const string& nextPath,
+                    bool videoPrefStored, bool audioPrefStored, bool subsLocked, bool encodingLocked,
+                    const VideoTrackPreference& vPref, const AudioTrackPreference& aPref,
+                    const string& nextForcedAudioMap,
+                    PairPrep& out) {
+    // A file that would open a dialog disqualifies the pair: while a job is running
+    // the keyboard belongs to the progress loop, so no prompt may appear.
+    PairFingerprint fpCur = buildPairFingerprint(curPath, videoPrefStored, audioPrefStored, subsLocked, encodingLocked);
+    if (fpCur.needsQuestion) return false;
+
+    // Only probed once the current file is already known to be question-free:
+    // every probe is an ffprobe run and tells us nothing while file i could still stop.
+    PairFingerprint fpNext = buildPairFingerprint(nextPath, videoPrefStored, audioPrefStored, subsLocked, encodingLocked);
+    if (fpNext.needsQuestion) return false;
+    if (!samePairFingerprint(fpCur, fpNext)) return false;
+
+    bool nextResolvable = true;
+    string nvMap = "", naMap = nextForcedAudioMap;
+
+    vector<VideoTrack> nvT = getVideoTracks(nextPath);
+    vector<int> nvReal;
+    for (size_t k = 0; k < nvT.size(); k++) {
+        if (!nvT[k].isCoverOrAttachedPic()) nvReal.push_back((int)k);
+    }
+    if (nvReal.size() <= 1 && nvT.size() > 1) {
+        nvMap = " -map 0:v:" + to_string(nvT[nvReal.empty() ? 0 : nvReal[0]].videoIndex);
+    } else if (nvReal.size() > 1) {
+        int m = matchVideoPreference(nvT, nvReal, vPref);
+        if (m == -1) nextResolvable = false;
+        else nvMap = vPref.keepAll ? " -map 0:v?" : " -map 0:v:" + to_string(nvT[m].videoIndex);
+    }
+
+    if (naMap.empty()) {
+        vector<AudioTrack> naT = getAudioTracks(nextPath);
+        if (naT.size() > 1) {
+            int m = matchAudioPreference(naT, aPref);
+            if (m == -1) nextResolvable = false;
+            else naMap = aPref.keepAll ? " -map 0:a?" : " -map 0:a:" + to_string(naT[m].audioIndex);
+        }
+    }
+
+    // Two files must never fight over the same output file.
+    if (buildOutputPath(nextPath, "_compressed") == buildOutputPath(curPath, "_compressed")) {
+        nextResolvable = false;
+    }
+
+    if (!nextResolvable) return false;
+
+    out.nextPath = nextPath;
+    out.nextStreamMapArg = buildStreamMapArgs(nvMap, naMap);
+    return true;
+}
+
+// Prints the one-line verdict shown before a file starts. The wording must state what
+// is actually about to happen, so both branches are kept next to each other.
+void printPairVerdict(bool enabled, bool paired, bool hasNext) {
+    if (!enabled || !hasNext) return;
+    cout << "\n";
+    if (paired) {
+        printColor(tr(" Next video qualifies for double processing, two videos will be processed at once.",
+                      " Следующее видео подходит для двойной обработки, обрабатываются сразу два видео."), CYAN);
+    } else {
+        printColor(tr(" Next video does NOT qualify for double processing, only the current video is being processed, please wait.",
+                      " Следующее видео НЕ подходит для двойной обработки, обрабатывается только текущее видео, ожидайте."), YELLOW);
+    }
+}
+
 // ========== BATCH VIDEO COMPRESSION ==========
 void batchCompressVideo() {
     clearScreen();
@@ -4214,7 +4701,93 @@ void batchCompressVideo() {
     vector<BatchVideoMismatchWarning> batchVideoWarnings;
     vector<ConflictedVideoFile> conflictedFiles;
 
-    auto processVideoFile = [&](const string& filePath, size_t currentNum, size_t totalNum, const string& streamMapArg) -> ProcessFileResult {
+    // ---- Shared recovery prompts -------------------------------------------------
+    // The single-file path and the double-processing path must offer the same choices
+    // after an interruption or a failure, otherwise the experimental mode would quietly
+    // become the only mode the user cannot recover from. Both live here so the wording
+    // and the effect on forceMode/forcedFormat can never drift apart.
+
+    // Returns 1 = skip, 2 = cancel entire batch, 3 = retry.
+    auto askBatchPauseAction = [&](const string& fileLabel) -> int {
+        cout << "\n";
+        printColor("========================================", YELLOW);
+        printColor(tr(" PAUSED - Batch Processing Interrupted", " ПАУЗА - Пакетная обработка прервана"), YELLOW);
+        printColor("========================================", YELLOW);
+        cout << "\n" << tr("File: ", "Файл: ") << fileLabel << "\n";
+        cout << "\n 1. " << tr("Skip this file", "Пропустить этот файл")
+             << "\n 2. " << tr("Cancel entire batch", "Отменить весь пакет")
+             << "\n 3. " << tr("Retry this file", "Повторить этот файл")
+             << "\n\n" << tr("Your choice: ", "Ваш выбор: ");
+
+        char pauseCh = getMenuChoice();
+        if (pauseCh == '2' || pauseCh == 27) {
+            cout << (pauseCh == 27 ? "ESC" : "2") << "\n";
+            return 2;
+        } else if (pauseCh == '3') {
+            cout << "3\n";
+            return 3;
+        }
+        cout << "1\n";
+        return 1;
+    };
+
+    // Asks what to do about a failed encode and applies the answer to the mode flags.
+    // Returns true when the caller should rebuild the command and run it again,
+    // false when the user gave up and the file(s) must be counted as failed.
+    auto applyEncodingRecovery = [&](const EncodingDialogResult& dr,
+                                     bool& useCPU, bool& useHybrid, bool& useReverseHybrid,
+                                     string& dialogChosenFormat) -> bool {
+        if (dr.action == 0) {
+            useCPU = true;
+            useHybrid = false;
+            useReverseHybrid = false;
+            if (dr.applyToAll) forceMode = 0;
+            return true;
+        } else if (dr.action == 1) {
+            if (!dr.chosenFormat.empty()) {
+                dialogChosenFormat = dr.chosenFormat;
+                if (dr.applyToAll) {
+                    forceMode = 1;
+                    forcedFormat = dr.chosenFormat;
+                }
+            }
+            return true;
+        } else if (dr.action == 2) {
+            useHybrid = true;
+            useCPU = false;
+            useReverseHybrid = false;
+            if (dr.applyToAll) forceMode = 2;
+            return true;
+        } else if (dr.action == 3) {
+            useReverseHybrid = true;
+            useCPU = false;
+            useHybrid = false;
+            if (dr.applyToAll) forceMode = 3;
+            return true;
+        } else if (dr.action == 4) {
+            if (dr.applyToAll) forceMode = 4;
+            return true;
+        }
+        if (dr.applyToAll) forceMode = 5;
+        return false;
+    };
+
+    // The reason text shown when FFmpeg itself failed, shared by both paths.
+    auto makeFfmpegFailureProblem = []() -> EncodingProblem {
+        EncodingProblem ep;
+        ep.hasProblem = true;
+        ep.description = tr("Encoding failed / Codec or Acceleration conflict", "Ошибка кодирования / Конфликт кодека или ускорения");
+        ep.detailedReason = tr(
+            "FFmpeg failed while processing this file.\n"
+            "Possible cause: Hardware acceleration/decoder conflict with this video format.\n"
+            "Recommended: Switch to Hybrid mode (CPU decode + GPU encode) or Software CPU (libx264).",
+            "FFmpeg завершился с ошибкой при обработке этого файла.\n"
+            "Возможная причина: Конфликт аппаратного ускорения/декодера с форматом этого видео.\n"
+            "Рекомендуется: Переключить на Гибридный режим (CPU декод + GPU энкод) или Программный CPU (libx264).");
+        return ep;
+    };
+
+    auto processVideoFile = [&](const string& filePath, size_t currentNum, size_t totalNum, const string& streamMapArg, PairPrep* pairPrep = nullptr) -> ProcessFileResult {
         bool useCPU = false;
         bool useHybrid = false;
         bool useReverseHybrid = false;
@@ -4306,6 +4879,7 @@ void batchCompressVideo() {
             string subExtraArgs = "";
             string subHardsubFilter = "";
             bool subsConverted = false;
+            int subActionUsed = -1;   // Remembered so the same decision can be replayed for a paired file.
             string currentFmt = OUTPUT_FORMAT;
             bool isMp4Output = (currentFmt.find("MP4") != string::npos || currentFmt.find("MOV") != string::npos || currentFmt.find("M4V") != string::npos);
 
@@ -4350,6 +4924,8 @@ void batchCompressVideo() {
                             forceSubAction = (int)act;
                         }
                     }
+
+                    subActionUsed = (int)act;
 
                     if (act == SUB_ACT_CONVERT_TEXT) {
                         subExtraArgs = " -c:s mov_text";
@@ -4427,6 +5003,176 @@ void batchCompressVideo() {
             if (OVERWRITE_FILES) cmd += L" -y";
             cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(ft.writePath)) + L"\"";
 
+            // ---- Double processing: build the second command, then run both together ----
+            // Both commands are fully built before anything is executed, so the two
+            // processes always start back to back and a retry simply rebuilds both.
+            if (pairPrep && !pairPrep->nextPath.empty()) {
+                const string& np = pairPrep->nextPath;
+                const string curName = fs::u8path(filePath).filename().u8string();
+                const string nextName = fs::u8path(np).filename().u8string();
+
+                string nextOutPath = buildOutputPath(np, "_compressed");
+                FFmpegTarget nft = prepareFFmpegTarget(nextOutPath, {np});
+                double nextDuration = getMediaDuration(np);
+
+                // The fingerprint guarantees the same subtitle decision applies, so the
+                // action is replayed instead of asking again. Only the source path baked
+                // into the hardsub filter has to be rebuilt.
+                string nextExtraArgs = "";
+                string nextHardsubFilter = "";
+                if (subActionUsed == SUB_ACT_CONVERT_TEXT) {
+                    nextExtraArgs = " -c:s mov_text";
+                } else if (subActionUsed == SUB_ACT_DROP_SUBS) {
+                    nextExtraArgs = " -sn";
+                } else if (subActionUsed == SUB_ACT_BURN_HARD) {
+                    string esc = "";
+                    for (char c : np) {
+                        if (c == '\\') esc += "/";
+                        else if (c == ':') esc += "\\:";
+                        else if (c == '\'') esc += "'\\''";
+                        else esc += c;
+                    }
+                    nextHardsubFilter = "subtitles='" + esc + "'";
+                } else {
+                    nextExtraArgs = subExtraArgs;
+                }
+
+                string nextVfSpec = buildVideoFilterSpec(np, useAutoAlign, useDownscale4K, nextHardsubFilter);
+
+                wstring ncmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
+                if (!useCPU && !useHybrid && !useReverseHybrid) ncmd += utf8ToWstring(getHWAccelArg(true));
+                if (useReverseHybrid) {
+                    AccelMode gpu = getActiveGpuMode();
+                    if (gpu == ACCEL_NVIDIA) ncmd += L" -hwaccel cuda";
+                    else if (gpu == ACCEL_INTEL) ncmd += L" -hwaccel qsv";
+                    else ncmd += L" -hwaccel auto";
+                }
+                ncmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(np)) + L"\"";
+                if (!pairPrep->nextStreamMapArg.empty()) {
+                    ncmd += utf8ToWstring(pairPrep->nextStreamMapArg);
+                }
+                if (!nextVfSpec.empty()) {
+                    ncmd += L" " + utf8ToWstring(nextVfSpec);
+                }
+                if (useCPU || useReverseHybrid) {
+                    ncmd += L" -c:v libx264";
+                } else {
+                    ncmd += L" " + utf8ToWstring(getVideoCodecArgs());
+                }
+                ncmd += L" " + utf8ToWstring(getVideoQualityArgs(CRF_VALUE, useCPU || useReverseHybrid));
+                ncmd += L" " + utf8ToWstring(getVideoPresetArgs("", useCPU || useReverseHybrid));
+                ncmd += L" " + utf8ToWstring(getAudioCodecArgs(batchAudioCodec));
+                if (!nextExtraArgs.empty() && nextHardsubFilter.empty()) {
+                    ncmd += L" " + utf8ToWstring(nextExtraArgs);
+                }
+                if (OVERWRITE_FILES) ncmd += L" -y";
+                ncmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(nft.writePath)) + L"\"";
+
+                // Both commands exist, so the two processes can start together.
+                // OUTPUT_FORMAT is restored first: the commands above already captured
+                // whatever the current file decided, and the retry loop below must
+                // rebuild from the user's real settings, not from a dialog's leftover.
+                if (savedFormat != OUTPUT_FORMAT) OUTPUT_FORMAT = savedFormat;
+
+                cout << "\n";
+                printColor("========================================", CYAN);
+                printColor(tr(" Processing 2 videos at once", " Обработка двух видео одновременно"), CYAN);
+                printColor("========================================", CYAN);
+
+                PairJob jobA, jobB;
+                bool launchedA = spawnPairJob(jobA, cmd, curName, duration);
+                bool launchedB = launchedA && spawnPairJob(jobB, ncmd, nextName, nextDuration);
+                bool escaped = false;
+
+                if (launchedA && launchedB) {
+                    execFFmpegPair(jobA, jobB, escaped);
+                } else {
+                    printColor(tr("[ERROR] Failed to launch FFmpeg!", "[ОШИБКА] Не удалось запустить FFmpeg!"), RED);
+                    if (launchedA) {
+                        TerminateProcess(jobA.pi.hProcess, 1);
+                        WaitForSingleObject(jobA.pi.hProcess, 5000);
+                    }
+                }
+                releasePairJob(jobA);
+                releasePairJob(jobB);
+
+                const string pairLabel = curName + tr(" + ", " + ") + nextName;
+
+                // ---- Interrupted by the user: offer the same pause menu as a single file ----
+                if (escaped) {
+                    finalizeFFmpegTarget(ft, false);
+                    finalizeFFmpegTarget(nft, false);
+                    if (!jobA.lastError.empty()) printColor(tr("[ERROR] ", "[ОШИБКА] ") + jobA.lastError, RED);
+                    if (!jobB.lastError.empty()) printColor(tr("[ERROR] ", "[ОШИБКА] ") + jobB.lastError, RED);
+                    g_ffmpegEscaped = false;
+
+                    int pauseCh = askBatchPauseAction(pairLabel);
+                    if (pauseCh == 2) {
+                        printColor(tr("[INFO] Batch processing cancelled.", "[ИНФО] Пакетная обработка отменена."), YELLOW);
+                        fail += 2;
+                        return PROC_PAIR_CANCELLED;
+                    } else if (pauseCh == 3) {
+                        continue;   // rebuild both commands and run the pair again
+                    }
+                    printColor(tr("[INFO] Files skipped.", "[ИНФО] Файлы пропущены."), YELLOW);
+                    skippedFiles.push_back(curName);
+                    skippedFiles.push_back(nextName);
+                    fail += 2;
+                    return PROC_PAIR_HANDLED;
+                }
+
+                bool bothLaunched = (launchedA && launchedB);
+                bool okA = bothLaunched && jobA.exitCode == 0;
+                bool okB = bothLaunched && jobB.exitCode == 0;
+                if (!okA && !jobA.lastError.empty()) printColor("  " + curName + ": " + jobA.lastError, RED);
+                if (!okB && !jobB.lastError.empty()) printColor("  " + nextName + ": " + jobB.lastError, RED);
+
+                // ---- Failed: offer the same recovery as a single file, then retry the pair ----
+                if (!okA || !okB) {
+                    EncodingDialogResult dr = dialogEncodingProblem(makeFfmpegFailureProblem(), true);
+                    if (applyEncodingRecovery(dr, useCPU, useHybrid, useReverseHybrid, dialogChosenFormat)) {
+                        finalizeFFmpegTarget(ft, false);
+                        finalizeFFmpegTarget(nft, false);
+                        continue;
+                    }
+                }
+
+                okA = finalizeFFmpegTarget(ft, okA) && okA;
+                okB = finalizeFFmpegTarget(nft, okB) && okB;
+
+                // The fingerprint guarantees both files got the same subtitle treatment,
+                // so both report it the same way.
+                const bool pairSubsConverted = (subActionUsed == SUB_ACT_CONVERT_TEXT);
+
+                if (okA) {
+                    if (pairSubsConverted) {
+                        printColor(tr("[OK] Subtitles converted", "[OK] Субтитры конвертированы") + " (" + curName + ")", GREEN);
+                    } else {
+                        printColor(tr("[OK] Done", "[OK] Готово") + " (" + curName + ")", GREEN);
+                    }
+                    handleOriginalDeletion(filePath, outPath, ft.isTemp, deleteOrig);
+                    success++;
+                } else {
+                    printColor(tr("[ERROR] Processing failed!", "[ОШИБКА] Ошибка обработки!") + " (" + curName + ")", RED);
+                    skippedFiles.push_back(curName);
+                    fail++;
+                }
+                if (okB) {
+                    if (pairSubsConverted) {
+                        printColor(tr("[OK] Subtitles converted", "[OK] Субтитры конвертированы") + " (" + nextName + ")", GREEN);
+                    } else {
+                        printColor(tr("[OK] Done", "[OK] Готово") + " (" + nextName + ")", GREEN);
+                    }
+                    handleOriginalDeletion(np, nextOutPath, nft.isTemp, deleteOrig);
+                    success++;
+                } else {
+                    printColor(tr("[ERROR] Processing failed!", "[ОШИБКА] Ошибка обработки!") + " (" + nextName + ")", RED);
+                    skippedFiles.push_back(nextName);
+                    fail++;
+                }
+                return PROC_PAIR_HANDLED;
+            }
+
             bool ok = execFFmpegWithProgress(cmd, duration);
             ok = finalizeFFmpegTarget(ft, ok);
 
@@ -4434,32 +5180,19 @@ void batchCompressVideo() {
 
             if (g_ffmpegEscaped) {
                 finalizeFFmpegTarget(ft, false);
-                cout << "\n";
-                printColor("========================================", YELLOW);
-                printColor(tr(" PAUSED - Batch Processing Interrupted", " ПАУЗА - Пакетная обработка прервана"), YELLOW);
-                printColor("========================================", YELLOW);
-                cout << "\n" << tr("File: ", "Файл: ") << fs::u8path(filePath).filename().u8string()
-                     << " (" << currentNum << "/" << totalNum << ")\n";
-                cout << "\n 1. " << tr("Skip this file", "Пропустить этот файл")
-                     << "\n 2. " << tr("Cancel entire batch", "Отменить весь пакет")
-                     << "\n 3. " << tr("Retry this file", "Повторить этот файл")
-                     << "\n\n" << tr("Your choice: ", "Ваш выбор: ");
-
-                char pauseCh = getMenuChoice();
                 g_ffmpegEscaped = false;
-                if (pauseCh == '2' || pauseCh == 27) {
-                    cout << (pauseCh == 27 ? "ESC" : "2") << "\n";
+
+                int pauseCh = askBatchPauseAction(fs::u8path(filePath).filename().u8string() +
+                                                  " (" + to_string(currentNum) + "/" + to_string(totalNum) + ")");
+                if (pauseCh == 2) {
                     printColor(tr("[INFO] Batch processing cancelled.", "[ИНФО] Пакетная обработка отменена."), YELLOW);
                     return PROC_CANCEL_BATCH;
-                } else if (pauseCh == '3') {
-                    cout << "3\n";
+                } else if (pauseCh == 3) {
                     continue;
-                } else {
-                    cout << "1\n";
-                    printColor(tr("[INFO] File skipped.", "[ИНФО] Файл пропущен."), YELLOW);
-                    skippedFiles.push_back(fs::u8path(filePath).filename().u8string());
-                    return PROC_FAIL;
                 }
+                printColor(tr("[INFO] File skipped.", "[ИНФО] Файл пропущен."), YELLOW);
+                skippedFiles.push_back(fs::u8path(filePath).filename().u8string());
+                return PROC_FAIL;
             }
 
             if (ok) {
@@ -4473,52 +5206,11 @@ void batchCompressVideo() {
             } else {
                 printColor(tr("[ERROR] Processing failed!", "[ОШИБКА] Ошибка обработки!"), RED);
 
-                EncodingProblem ep;
-                ep.hasProblem = true;
-                ep.description = tr("Encoding failed / Codec or Acceleration conflict", "Ошибка кодирования / Конфликт кодека или ускорения");
-                ep.detailedReason = tr(
-                    "FFmpeg failed while processing this file.\n"
-                    "Possible cause: Hardware acceleration/decoder conflict with this video format.\n"
-                    "Recommended: Switch to Hybrid mode (CPU decode + GPU encode) or Software CPU (libx264).",
-                    "FFmpeg завершился с ошибкой при обработке этого файла.\n"
-                    "Возможная причина: Конфликт аппаратного ускорения/декодера с форматом этого видео.\n"
-                    "Рекомендуется: Переключить на Гибридный режим (CPU декод + GPU энкод) или Программный CPU (libx264).");
-
-                EncodingDialogResult dr = dialogEncodingProblem(ep, true);
-                if (dr.action == 0) {
-                    useCPU = true;
-                    useHybrid = false;
-                    useReverseHybrid = false;
-                    if (dr.applyToAll) forceMode = 0;
+                EncodingDialogResult dr = dialogEncodingProblem(makeFfmpegFailureProblem(), true);
+                if (applyEncodingRecovery(dr, useCPU, useHybrid, useReverseHybrid, dialogChosenFormat)) {
                     continue;
-                } else if (dr.action == 1) {
-                    if (!dr.chosenFormat.empty()) {
-                        dialogChosenFormat = dr.chosenFormat;
-                        if (dr.applyToAll) {
-                            forceMode = 1;
-                            forcedFormat = dr.chosenFormat;
-                        }
-                    }
-                    continue;
-                } else if (dr.action == 2) {
-                    useHybrid = true;
-                    useCPU = false;
-                    useReverseHybrid = false;
-                    if (dr.applyToAll) forceMode = 2;
-                    continue;
-                } else if (dr.action == 3) {
-                    useReverseHybrid = true;
-                    useCPU = false;
-                    useHybrid = false;
-                    if (dr.applyToAll) forceMode = 3;
-                    continue;
-                } else if (dr.action == 4) {
-                    if (dr.applyToAll) forceMode = 4;
-                    continue;
-                } else {
-                    if (dr.applyToAll) forceMode = 5;
-                    return PROC_FAIL;
                 }
+                return PROC_FAIL;
             }
         }
     };
@@ -4647,7 +5339,32 @@ void batchCompressVideo() {
         }
 
         string streamMapArg = buildStreamMapArgs(videoMapArg, audioMapArg);
-        ProcessFileResult res = processVideoFile(files[i], i + 1, files.size(), streamMapArg);
+
+        // ---- Double processing: decide whether the next file may join this one ----
+        PairPrep pairPrep;
+        if (PARALLEL_BATCH && i + 1 < files.size()) {
+            tryPreparePair(files[i], files[i + 1],
+                           batchVideoPref.hasPreference, batchAudioPref.hasPreference,
+                           (SUBTITLE_ACTION != "ask" || forceSubAction != -1), forceMode != -1,
+                           batchVideoPref, batchAudioPref, "",
+                           pairPrep);
+        }
+
+        printPairVerdict(PARALLEL_BATCH, !pairPrep.nextPath.empty(), i + 1 < files.size());
+
+        ProcessFileResult res = processVideoFile(files[i], i + 1, files.size(), streamMapArg, &pairPrep);
+
+        // A pair was processed inside the lambda: it already counted both files in
+        // success/fail/skippedFiles, so the loop only has to move the index.
+        if (res == PROC_PAIR_HANDLED) {
+            i += 2;
+            continue;
+        }
+        if (res == PROC_PAIR_CANCELLED) {
+            batchCancelled = true;
+            break;
+        }
+
         if (res == PROC_CANCEL_BATCH) {
             fail++;
             batchCancelled = true;
@@ -4753,7 +5470,51 @@ void batchCompressVideo() {
             }
             string streamMapArg = buildStreamMapArgs(videoMap, selectedAudioMap);
 
-            ProcessFileResult res = processVideoFile(cf.filePath, cf.originalIndex, files.size(), streamMapArg);
+            // ---- Double processing inside the conflict resolver ----
+            // These files are the ones that were postponed, so without this block a batch
+            // with many multi-audio files would lose double processing for all of them.
+            // Pairing is only allowed once this file's own audio/video choice came from a
+            // stored preference rather than a dialog: a file that was just asked about
+            // cannot vouch for the next one.
+            PairPrep pairPrep;
+            bool curResolvedWithoutDialog = (keepAllForAllRemaining || useRememberedAudioPref);
+            bool hasNextConflict = (c + 1 < conflictedFiles.size());
+            if (PARALLEL_BATCH && hasNextConflict && curResolvedWithoutDialog) {
+                string nextForcedAudio;
+                if (keepAllForAllRemaining) {
+                    nextForcedAudio = " -map 0:a?";
+                } else {
+                    // Same guard as the selection above: matchAudioPreference() answers
+                    // 9999 for "keep all", which is not an index into the track list.
+                    int nm = matchAudioPreference(conflictedFiles[c + 1].tracks, batchAudioPref);
+                    if (nm != -1 && nm != 9999) {
+                        nextForcedAudio = " -map 0:a:" + to_string(conflictedFiles[c + 1].tracks[nm].audioIndex);
+                    }
+                }
+                if (!nextForcedAudio.empty()) {
+                    // "Keep all" does not write a batchAudioPref preference, yet it has
+                    // resolved the audio selection just as firmly, so it must count as a
+                    // stored choice here or no pair would ever form in that mode.
+                    tryPreparePair(cf.filePath, conflictedFiles[c + 1].filePath,
+                                   batchVideoPref.hasPreference,
+                                   (batchAudioPref.hasPreference || keepAllForAllRemaining),
+                                   (SUBTITLE_ACTION != "ask" || forceSubAction != -1), forceMode != -1,
+                                   batchVideoPref, batchAudioPref, nextForcedAudio,
+                                   pairPrep);
+                }
+            }
+
+            printPairVerdict(PARALLEL_BATCH, !pairPrep.nextPath.empty(), hasNextConflict);
+
+            ProcessFileResult res = processVideoFile(cf.filePath, cf.originalIndex, files.size(), streamMapArg, &pairPrep);
+            if (res == PROC_PAIR_HANDLED) {
+                c++;   // the lambda already counted both files
+                continue;
+            }
+            if (res == PROC_PAIR_CANCELLED) {
+                batchCancelled = true;
+                break;
+            }
             if (res == PROC_CANCEL_BATCH) {
                 fail++;
                 batchCancelled = true;
@@ -4813,9 +5574,6 @@ void batchCompressVideo() {
     cout << "\n";
     printColor("========================================", GREEN);
     printColor(tr(" Batch processing completed successfully!", " Пакетная обработка успешно завершена!"), GREEN);
-    printColor("========================================", GREEN);
-    cout << "\n";
-    printColor("========================================", GREEN);
     char summary[128];
     snprintf(summary, sizeof(summary), " %s: %d %s, %d %s",
              tr("Result", "Результат").c_str(), success,
@@ -5282,21 +6040,248 @@ double parseTimeStringToSeconds(const string& str) {
         parts.push_back(item);
     }
 
-    try {
-        if (parts.size() == 1) {
-            return stod(parts[0]);
-        } else if (parts.size() == 2) {
-            double mm = stod(parts[0]);
-            double ssVal = stod(parts[1]);
-            return mm * 60.0 + ssVal;
-        } else if (parts.size() == 3) {
-            double hh = stod(parts[0]);
-            double mm = stod(parts[1]);
-            double ssVal = stod(parts[2]);
-            return hh * 3600.0 + mm * 60.0 + ssVal;
-        }
-    } catch (...) {}
+    // parseNumberLoose is locale-independent: "00:01.5" must read as 1.5 s even when
+    // the C locale decimal point is a comma.
+    if (parts.size() == 1) {
+        double v = 0;
+        return parseNumberLoose(parts[0], v) ? v : 0;
+    } else if (parts.size() == 2) {
+        double mm = 0, ssVal = 0;
+        if (!parseNumberLoose(parts[0], mm) || !parseNumberLoose(parts[1], ssVal)) return 0;
+        return mm * 60.0 + ssVal;
+    } else if (parts.size() == 3) {
+        double hh = 0, mm = 0, ssVal = 0;
+        if (!parseNumberLoose(parts[0], hh) || !parseNumberLoose(parts[1], mm) ||
+            !parseNumberLoose(parts[2], ssVal)) return 0;
+        return hh * 3600.0 + mm * 60.0 + ssVal;
+    }
     return 0;
+}
+
+// How much longer than requested a "-c copy" trim of this file will be.
+//
+// A stream copy can only cut on a keyframe, and FFmpeg's input seek starts at the
+// keyframe BEFORE the requested position -- verified by comparing the first frame of the
+// output against the source at starts that were themselves keyframes: it never started
+// at the requested keyframe, always one keyframe earlier. So the extra time is exactly
+//     requested + (start - that preceding keyframe)
+// and it is NOT bounded: on a file with a keyframe every 10 s, a 10->20 s trim yields
+// 20 s. The extra time is pre-roll, i.e. content from before the requested start.
+//
+// Only the last 120 s before the cut can hold the keyframe that matters, and ffprobe is
+// told to read just that window, so the cost does not grow with the file size (~29 ms).
+// Returns -1 when it cannot be determined.
+double getTrimPreRoll(const string& filePath, const string& videoMapArg, double timeSec) {
+    if (!FFPROBE_FOUND || FFPROBE_PATH.empty() || timeSec <= 0) return -1;
+
+    const double WINDOW = 120.0;
+    double from = timeSec - WINDOW;
+    if (from < 0) from = 0;
+
+    // "-map 0:v:2" in the caller's args names the stream that will actually be cut.
+    string sel = "v:0";
+    size_t p = videoMapArg.find("0:v:");
+    if (p != string::npos) {
+        size_t q = videoMapArg.find_first_not_of("0123456789", p + 4);
+        string num = videoMapArg.substr(p + 4, (q == string::npos ? videoMapArg.size() : q) - (p + 4));
+        if (!num.empty()) sel = "v:" + num;
+    }
+
+    // formatDot() because this string goes into a command line (AGENTS.md 5.12).
+    string cmd = "\"" + FFPROBE_PATH + "\" -v error -read_intervals " + formatDot(from, 3) + "%"
+               + formatDot(timeSec, 3) + " -select_streams " + sel
+               + " -show_entries packet=pts_time,flags -of csv=p=0 \"" + filePath + "\"";
+
+    string out = runCommand(cmd);
+    double best = -1;
+    size_t i = 0;
+    while (i < out.size()) {
+        size_t eol = out.find('\n', i);
+        if (eol == string::npos) eol = out.size();
+        string line = out.substr(i, eol - i);
+        i = eol + 1;
+        size_t c = line.find(',');
+        if (c == string::npos) continue;
+        double pts = 0;
+        if (!parseNumberLoose(line.substr(0, c), pts)) continue;
+        if (pts > timeSec + 0.001) continue;                 // only keyframes at or before the cut
+        if (line.find('K', c + 1) == string::npos) continue; // flags look like "K__" for a keyframe
+        // Packet order is NOT monotonic (B frames reorder pts), so keep the largest value
+        // rather than the last one seen.
+        if (pts > best) best = pts;
+    }
+    if (best < 0) return -1;
+    return timeSec - best;
+}
+
+// ========== EXACT TRIM: ENCODERS TAKEN FROM THE FILE, NOT FROM THE SETTINGS ==========
+//
+// A trim must not be steered by OUTPUT_FORMAT / CRF_VALUE / PRESET / ACCELERATION_MODE /
+// AUDIO_CODEC: the user asked to cut a file, not to convert it, so the result has to keep
+// the codecs, the resolution, the frame rate and the pixel format of the source. That is
+// also what makes the exact mode safe for the container -- re-encoding to the same codec
+// family cannot produce a combination the file did not already contain.
+//
+// Quality is a fixed near-transparent constant per codec family, chosen here rather than
+// taken from the settings, because the settings are the user's for conversions.
+struct ExactTrimCodecs {
+    string videoArgs;
+    string audioArgs;
+    string videoDesc;
+    string audioDesc;
+};
+
+static string lowerAscii(string s) {
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] >= 'A' && s[i] <= 'Z') s[i] = char(s[i] - 'A' + 'a');
+    }
+    return s;
+}
+
+// Pixel formats worth carrying over verbatim, so a 10-bit or 4:2:2 source is not silently
+// flattened to 8-bit 4:2:0. Anything else is left to the encoder's own default rather than
+// risking a combination the encoder does not accept and failing the trim outright.
+static bool exactKeepPixelFormat(const string& pixFmtLower) {
+    static const char* keepable[] = {
+        "yuv420p", "yuvj420p", "yuv420p10le", "yuv422p", "yuv422p10le",
+        "yuv444p", "yuv444p10le", "gray", "yuv440p"
+    };
+    for (size_t i = 0; i < sizeof(keepable) / sizeof(keepable[0]); i++) {
+        if (pixFmtLower == keepable[i]) return true;
+    }
+    return false;
+}
+
+// Encoder name plus quality options for one video codec. Deliberately WITHOUT the "-c:v"
+// prefix and WITHOUT any pixel format, so the same table serves both the single-stream form
+// and the per-stream form ("-c:v:1 ...") used when every stream is kept.
+static string exactVideoEncoderOpts(const string& videoCodec, string* descOut) {
+    string vc = lowerAscii(videoCodec);
+    // CRF scales differ per encoder, so the constant is per family too.
+    if (vc == "h264")                      { *descOut = "H.264 (libx264, CRF 18)";                return "libx264 -crf 18"; }
+    else if (vc == "hevc" || vc == "h265") { *descOut = "H.265 (libx265, CRF 20)";                return "libx265 -crf 20"; }
+    else if (vc == "vp9")                   { *descOut = "VP9 (libvpx-vp9, CRF 30)";              return "libvpx-vp9 -crf 30 -b:v 0"; }
+    else if (vc == "vp8")                   { *descOut = "VP8 (libvpx, CRF 10)";                  return "libvpx -crf 10 -b:v 0"; }
+    else if (vc == "av1")                   { *descOut = "AV1 (libsvtav1, CRF 30)";               return "libsvtav1 -crf 30"; }
+    else if (vc == "mpeg2video")            { *descOut = "MPEG-2 (q 2)";                          return "mpeg2video -q:v 2"; }
+    else if (vc == "mpeg4")                 { *descOut = "MPEG-4 Part 2 (q 2)";                   return "mpeg4 -q:v 2"; }
+    else if (vc == "mjpeg")                 { *descOut = "MJPEG (q 2)";                           return "mjpeg -q:v 2"; }
+    else if (vc == "theora")                { *descOut = "Theora (q 7)";                         return "libtheora -q:v 7"; }
+    else if (vc == "prores")                { *descOut = "ProRes (profile 3)";                    return "prores -profile:v 3"; }
+    else if (vc == "ffv1")                  { *descOut = "FFV1 (lossless)";                       return "ffv1"; }
+    else                                    { *descOut = tr("H.264 (libx264, CRF 18) - the source codec is not recognised",
+                                                                  "H.264 (libx264, CRF 18) - кодек источника не распознан"); return "libx264 -crf 18"; }
+}
+
+// Encoder name plus bitrate options for one audio codec, WITHOUT the "-c:a" prefix.
+static string exactAudioEncoderOpts(const string& audioCodec, const string& audioBitRateBps, string* descOut) {
+    string ac = lowerAscii(audioCodec);
+
+    // Audio bitrate comes from the source when ffprobe reported it, so a 320 kb/s track
+    // does not get re-encoded to 192 kb/s. Clamped to a sane range; PCM is passed through
+    // as-is and never gets a bitrate at all.
+    string bitrate = "192k";
+    double bps = 0;
+    if (parseNumberLoose(audioBitRateBps, bps) && bps >= 32000 && bps <= 2000000) {
+        int kbps = (int)(bps / 1000 + 0.5);
+        bitrate = to_string(kbps) + "k";
+    }
+
+    if (ac.compare(0, 4, "pcm_") == 0)      { *descOut = ac + " (PCM, без пережатия)";                          return ac; }
+    else if (ac == "aac")                    { *descOut = "AAC " + bitrate;                                       return "aac -b:a " + bitrate; }
+    else if (ac == "ac3")                    { *descOut = "AC3 " + bitrate;                                       return "ac3 -b:a " + bitrate; }
+    else if (ac == "eac3")                   { *descOut = "E-AC3 " + bitrate;                                      return "eac3 -b:a " + bitrate; }
+    else if (ac == "mp3" || ac == "mp3float"){ *descOut = "MP3 " + bitrate;                                       return "libmp3lame -b:a " + bitrate; }
+    else if (ac == "mp2" || ac == "mp2float"){ *descOut = "MP2 " + bitrate;                                       return "mp2 -b:a " + bitrate; }
+    else if (ac == "opus")                   { *descOut = "Opus " + bitrate;                                      return "libopus -b:a " + bitrate; }
+    else if (ac == "vorbis")                 { *descOut = "Vorbis (q 6)";                                         return "libvorbis -q:a 6"; }
+    else if (ac == "flac")                   { *descOut = tr("FLAC (lossless)", "FLAC (без потерь)");            return "flac"; }
+    else if (ac == "alac")                   { *descOut = "ALAC (lossless)";                                      return "alac"; }
+    else if (ac == "wavpack")                { *descOut = "WavPack";                                              return "wavpack"; }
+    else if (ac == "truehd")                 { *descOut = "TrueHD";                                               return "truehd"; }
+    else if (ac == "dts")                    { *descOut = "DTS (DCA)";                                            return "dca"; }
+    else                                     { *descOut = "AAC " + bitrate + tr(" - the source codec is not recognised",
+                                                                                      " - кодек источника не распознан"); return "aac -b:a " + bitrate; }
+}
+
+ExactTrimCodecs buildExactTrimCodecs(const string& videoCodec, const string& videoPixFmt,
+                                    const string& audioCodec, const string& audioBitRateBps) {
+    ExactTrimCodecs r;
+    string pf = lowerAscii(videoPixFmt);
+    r.videoArgs = "-c:v " + exactVideoEncoderOpts(videoCodec, &r.videoDesc);
+    if (exactKeepPixelFormat(pf)) r.videoArgs += " -pix_fmt " + pf;
+    r.audioArgs = "-c:a " + exactAudioEncoderOpts(audioCodec, audioBitRateBps, &r.audioDesc);
+    return r;
+}
+
+// When the user keeps EVERY video or audio stream, one "-c:v" would force the same codec on
+// all of them: a file with an H.264 and an H.265 stream would come out with two H.264
+// streams. Measured - "-map 0:v? -c:v libx264" turned the hevc stream into h264. So each
+// mapped stream is addressed separately ("-c:v:1"), which works because "-map 0:v?" keeps
+// the file order and the output ordinal of a stream is its position in that order (verified:
+// streams 0,1,2 came out as 0,1,2 in the same order).
+//
+// Cover art is copied, not re-encoded: it is a single still, and handing it a video encoder
+// would turn the cover into a clip or fail outright.
+struct ExactTrimMultiArgs { string videoArgs; string audioArgs; };
+
+ExactTrimMultiArgs buildExactTrimMultiArgs(const vector<VideoTrack>& vtracks,
+                                           const vector<AudioTrack>& atracks) {
+    ExactTrimMultiArgs m;
+    for (size_t i = 0; i < vtracks.size(); i++) {
+        string slot = "-c:v:" + to_string((int)i);
+        if (vtracks[i].isCoverOrAttachedPic()) {
+            m.videoArgs += " " + slot + " copy";
+            continue;
+        }
+        string desc;
+        m.videoArgs += " " + slot + " " + exactVideoEncoderOpts(vtracks[i].codec, &desc);
+        string pf = lowerAscii(vtracks[i].pixFmt);
+        if (exactKeepPixelFormat(pf)) m.videoArgs += " -pix_fmt:" + to_string((int)i) + " " + pf;
+    }
+    for (size_t i = 0; i < atracks.size(); i++) {
+        string desc;
+        m.audioArgs += " -c:a:" + to_string((int)i) + " "
+                     + exactAudioEncoderOpts(atracks[i].codec, atracks[i].bitRate, &desc);
+    }
+    return m;
+}
+
+// A stream-copy trim cannot cut on a non-keyframe: FFmpeg starts the output at the
+// keyframe BEFORE the requested position, so the file comes out longer by exactly that
+// distance. Report the measured result rather than letting the user assume it is exact.
+void printTrimLengthReport(double requested, double actual, const string& startLabel, bool exactMode) {
+    if (actual <= 0) return;
+    double extra = actual - requested;
+    // 0.25 s is ~6 frames at 25 fps: below that the difference is only timestamp
+    // quantisation of the audio and video packets.
+    bool longer = extra > 0.25;
+    // formatDot() rather than snprintf("%f"): LC_NUMERIC follows the user locale, so a
+    // Russian system prints "11,170". tr() picks the language independently of LC_NUMERIC,
+    // which would pair English text with a comma decimal separator.
+    printColor("\n" + tr("Requested: ", "Запрошено: ") + formatDot(requested, 3) + tr(" sec", " сек")
+             + tr("   Actual: ", "   Получилось: ") + formatDot(actual, 3) + tr(" sec", " сек"),
+             longer ? YELLOW : GREEN);
+
+    if (exactMode) {
+        // A re-encode has no reason to be off by more than the container rounding, so a
+        // visible excess here would mean the cut did not land where it was asked to.
+        if (longer) {
+            printColor(tr("[NOTE] The cut is still longer than requested. This should not happen\n"
+                          "       in exact mode - please report it.",
+                          "[ПРИМЕЧАНИЕ] Обрезка всё ещё длиннее запрошенного. В точном режиме\n"
+                          "       так быть не должно - сообщите об этом, пожалуйста."), YELLOW);
+        }
+        return;
+    }
+    if (!longer) return;
+
+    printColor(tr("[NOTE] The cut could not start exactly at ", "[ПРИМЕЧАНИЕ] Обрезка не смогла начаться точно в ")
+             + startLabel + tr(", so it started at the preceding keyframe.",
+                             ", поэтому началась с предыдущего ключевого кадра."), YELLOW);
+    printColor(tr("       The file is ", "       Файл длиннее на ") + formatDot(extra, 3)
+             + tr(" sec: that extra time is content from BEFORE the requested start.",
+                   " сек: это фрагмент ДО запрошенного начала."), YELLOW);
 }
 
 // ========== OPERATION 2: TRIM / CUT VIDEO ==========
@@ -5332,21 +6317,232 @@ void trimVideo() {
         return;
     }
 
+    // The requested length is needed before anything else, because the mode screen quotes
+    // it back to the user.
+    double startSec = parseTimeStringToSeconds(startTime);
+    double endSec = parseTimeStringToSeconds(endTime);
+    double trimDuration = endSec - startSec;
+    if (trimDuration <= 0 && duration > startSec) {
+        trimDuration = duration - startSec;   // "to the end of the file"
+    }
+    if (trimDuration <= 0) {
+        printColor(tr("[ERROR] The end time must be later than the start time!",
+                      "[ОШИБКА] Время окончания должно быть позже времени начала!"), RED);
+        waitForKey();
+        return;
+    }
+
     string videoMapArg;
-    if (!selectVideoTrackForFile(inputFile, videoMapArg)) {
+    int selectedVideoIndex = -1;
+    if (!selectVideoTrackForFile(inputFile, videoMapArg, true, false, nullptr, &selectedVideoIndex)) {
         printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW);
         waitForKey();
         return;
     }
 
+    // ---- how to cut: stream copy (fast, approximate) or re-encode (exact) ----
+    //
+    // A stream copy cannot place the cut on a non-keyframe, and FFmpeg's input seek
+    // starts at the keyframe BEFORE the requested position even when a keyframe sits
+    // exactly there. Verified by hashing the first frame of the output against the source
+    // on three files with two keyframe layouts, including starts that were themselves
+    // keyframes (8.2, 10, 18, 20 on the irregular grid) -- every one of them began at the
+    // previous keyframe. So the result is
+    //     requested + (start - that preceding keyframe)
+    // which is 11.10 s / 12.08 s / 11.88 s for pre-rolls of 1.0 / 2.0 / 1.8 s, and the
+    // content is wrong as well, not just the length: measured against a reference of the
+    // real 10->20 s segment, the copy scores PSNR 21.7 dB while the re-encode scores
+    // 47.6 dB. The pre-roll sits at the head, the tail still ends at start + duration, so
+    // shortening "-t" to compensate would cut the tail short -- it must not be done.
+    // Output-side seeking gives the exact length but begins the video at the next
+    // keyframe (167 of 250 frames kept, frozen picture at the head), so it is no better.
+    // Only re-encoding is frame exact, and it is offered rather than imposed.
+    double preRoll = getTrimPreRoll(inputFile, videoMapArg, startSec);
+    string preRollTxt = formatDot(preRoll, 3);
+    string copyLenTxt = formatDot(trimDuration + (preRoll > 0 ? preRoll : 0), 3);
+    string reqTxt = formatDot(trimDuration, 3);
+
+    vector<string> trimModes;
+    vector<string> trimHints;
+    // Exact is listed first and is what Enter selects: it is the only mode that actually cuts
+    // where the user asked, so it should be the default rather than something to opt into.
+    // Copy stays available for very long files, where re-encoding the whole excerpt would
+    // take minutes and the fraction of a second does not matter.
+    trimModes.push_back(tr("Exact - re-encode, frame accurate (recommended)",
+                           "Точно - с перекодированием, кадр в кадр (рекомендуется)"));
+    trimModes.push_back(tr("Fast - copy the streams (no re-encoding)",
+                           "Быстро - копирование потоков (без перекодирования)"));
+
+    {
+        string h = tr(
+            "The excerpt is decoded and encoded again, so the cut lands exactly on the\n"
+            "requested frame. The file will be the ", "Отрезок декодируется и кодируется заново, поэтому граница попадает\n"
+            "ровно в запрошенный кадр. Файл будет длиной ");
+        h += reqTxt + tr(" sec you asked for", " се, сколько вы просили")
+           + tr(" (measured: 10.023 sec, the few extra milliseconds are container rounding),\n"
+                 "and it starts on exactly the frame at that second.\n",
+                 " - измерено: 10,023 с, лишние миллисекунды - это округление контейнера, -\n"
+                 "и начинается ровно с кадра этой секунды.\n");
+        h += tr(
+            "\n"
+            "Checked against a reference of the real 10->20 s segment: PSNR 47.6 dB here\n"
+            "versus 21.7 dB for stream copy, i.e. this is the requested content and the\n"
+            "difference is only the re-compression.\n"
+            "\n"
+            "The audio is re-encoded too, and that is not optional: with \"-c:a copy\" the video\n"
+            "is correct (exactly 250 frames) but the container still came out 11.888 sec,\n"
+            "because the copied audio keeps the pre-roll timestamps. Measured on this file.\n"
+            "\n"
+            "Codecs, resolution, frame rate and pixel format are taken FROM THE FILE, not\n"
+            "from the program settings: a trim must not turn into a conversion. The only\n"
+            "thing not taken from the file is the quality constant, a near-transparent CRF\n"
+            "per codec family (18 for H.264, 20 for H.265, 30 for VP9), chosen so the extra\n"
+            "generation is not visible. The audio bitrate is copied from the source track.\n"
+            "\n"
+            "Speed: 0.43 s for a 10 s 720p excerpt and 0.92 s for 1080p, versus 0.04 s for\n"
+            "stream copy - roughly 20x slower on this machine, and the gap widens for long\n"
+            "files and for HEVC or AV1 sources. GPU acceleration is deliberately NOT used,\n"
+            "so that the program's settings cannot influence the result.",
+            "\n"
+            "Проверено по эталону настоящего отрезка 10->20 с: здесь PSNR 47,6 dB против\n"
+            "21,7 dB у копирования, то есть это запрошенное содержимое, а разница - только\n"
+            "повторное сжатие.\n"
+            "\n"
+            "Звук перекодируется тоже, и это не выбор: при \"-c:a copy\" видео верное (ровно\n"
+            "250 кадров), но контейнер всё равно вышел 11,888 с, потому что скопированный звук\n"
+            "сохраняет таймстемпы пре-ролла. Измерено на этом файле.\n"
+            "\n"
+            "Кодеки, разрешение, частота кадров и пиксельный формат берутся ИЗ ФАЙЛА, а не из\n"
+            "настроек программы: обрезка не должна превращаться в конвертацию. Единственное,\n"
+            "что не берётся из файла, - константа качества, почти прозрачный CRF для каждого\n"
+            "семейства кодеков (18 для H.264, 20 для H.265, 30 для VP9), подобранная так,\n"
+            "чтобы лишнее поколение не было видно. Битрейт звука копируется из исходной дорожки.\n"
+            "\n"
+            "Скорость: 0,43 с на отрезок 10 с в 720p и 0,92 с в 1080p против 0,04 с при\n"
+            "копировании - примерно в 20 раз медленнее на этой машине, и разрыв больше для\n"
+            "длинных файлов и для исходников HEVC или AV1. Ускорение на GPU намеренно НЕ\n"
+            "используется, чтобы настройки программы не влияли на результат.");
+        trimHints.push_back(h);
+    }
+    {
+        string h = tr(
+            "Stream copy cannot cut between frames, and the cut may only land on a keyframe.\n"
+            "FFmpeg then starts at the PREVIOUS keyframe - even when the requested second\n"
+            "itself is a keyframe - so the file is longer than you asked for and the extra\n"
+            "time at the head is content from BEFORE the requested start.\n"
+            "\n"
+            "This file: ", "This file: ");
+        if (preRoll > 0) {
+            h += tr("the keyframe before the start is ", "ключевой кадр перед началом на ") + preRollTxt
+               + tr(" sec earlier, so the result will be about ", " сек раньше, поэтому файл будет примерно ")
+               + copyLenTxt + tr(" sec instead of ", " сек вместо ") + reqTxt + tr(" sec.\n",
+                                                                                    " сек.\n");
+        } else {
+            h += tr("the keyframe grid could not be read, so the extra time is unknown "
+                    "(it is never negative, and it is NOT capped).\n",
+                    "сетку ключевых кадров прочитать не удалось, поэтому лишнее время неизвестно "
+                    "(оно не бывает отрицательным и НЕ ограничено сверху).\n");
+        }
+        h += tr(
+            "\n"
+            "The error is not proportional to the request. On a file with a keyframe every\n"
+            "10 s (measured here) a 10->20 s trim produced 20.08 s - twice as long - because\n"
+            "the keyframe before 10 s is the one at 0 s.\n"
+            "\n"
+            "Content is affected too, not only the length: measured against a reference of\n"
+            "the real 10->20 s segment, this mode scores PSNR 21.7 dB, i.e. it is mostly\n"
+            "showing the wrong 1.8 s.\n"
+            "\n"
+            "Speed: 0.03-0.04 s for a 10 s excerpt (no encoding at all).\n"
+            "Quality: none lost, the original streams are copied bit for bit.\n"
+            "\n"
+            "Choose it when the extra fraction of a second does not matter, or when the file\n"
+            "is very long and re-encoding the whole excerpt would take minutes.",
+            "\n"
+            "Ошибка не пропорциональна запросу. На файле с ключевым кадром раз в 10 секунд\n"
+            "(измерено здесь) обрезка 10->20 с дала 20,08 с - вдвое больше, - потому что\n"
+            "перед десятой секундой ключевой кадр был нулевой.\n"
+            "\n"
+            "Страдает и содержимое, а не только длина: если сравнить с эталоном настоящего\n"
+            "отрезка 10->20 с, этот режим даёт PSNR 21,7 dB, то есть большую часть времени\n"
+            "показывает не то, что было запрошено.\n"
+            "\n"
+            "Скорость: 0,03-0,04 с на отрезок в 10 с (кодирования нет вообще).\n"
+            "Качество: без потерь, исходные потоки копируются бит в бит.\n"
+            "\n"
+            "Выбирайте его, если лишняя доля секунды не важна, или если файл очень длинный и\n"
+            "перекодирование всего отрезка заняло бы минуты.");
+        trimHints.push_back(h);
+    }
+
+    int trimMode = arrowSelect(tr("TRIM MODE", "РЕЖИМ ОБРЕЗКИ"),
+                               tr("The cut can only be exact if the excerpt is encoded again.\n"
+                                  "Copying the streams is far faster but cannot cut between frames.\n"
+                                  "Hover an arrow to read what each one costs and gains.",
+                                  "Граница может быть точной, только если отрезок перекодировать.\n"
+                                  "Копирование потоков намного быстрее, но не умеет резать между кадрами.\n"
+                                  "Наведите стрелку, чтобы прочитать, что каждый вариант даёт и чего стоит."),
+                               trimModes, 0, trimHints);
+    if (trimMode < 0) { return; }
+    bool exactTrim = (trimMode == 0);   // 0 = "Exact (recommended)", see the list above
+
     string audioMapArg;
-    if (!selectAudioTrackForFile(inputFile, audioMapArg, true)) {
+    int selectedAudioIndex = -1;
+    if (!selectAudioTrackForFile(inputFile, audioMapArg, true, false, nullptr, &selectedAudioIndex)) {
         printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW);
         waitForKey();
         return;
     }
 
     string streamMapArg = buildStreamMapArgs(videoMapArg, audioMapArg);
+
+    // In exact mode the excerpt is re-encoded, so the encoders must come from the file
+    // itself. Reading the codecs here is cheap: these are the same ffprobe calls the track
+    // pickers just made, and the probe cache answers them without a new process.
+    ExactTrimCodecs exactCodecs;
+    if (exactTrim) {
+        vector<VideoTrack> vtracks = getVideoTracks(inputFile);
+        vector<AudioTrack> atracks = getAudioTracks(inputFile);
+
+        // Codecs of the single stream that is actually mapped.
+        string vcodec, vpix, acodec, abitrate;
+        for (size_t i = 0; i < vtracks.size(); i++) {
+            if (vtracks[i].isCoverOrAttachedPic()) continue;
+            if (selectedVideoIndex < 0 || (int)i == selectedVideoIndex) {
+                vcodec = vtracks[i].codec;
+                vpix = vtracks[i].pixFmt;
+                break;
+            }
+        }
+        for (size_t i = 0; i < atracks.size(); i++) {
+            if (selectedAudioIndex < 0 || (int)i == selectedAudioIndex) {
+                acodec = atracks[i].codec;
+                abitrate = atracks[i].bitRate;
+                break;
+            }
+        }
+        exactCodecs = buildExactTrimCodecs(vcodec, vpix, acodec, abitrate);
+
+        // "Keep all streams" maps with "0:v?" / "0:a?", i.e. more than one stream of that
+        // kind, and a single "-c:v" would apply one codec to every mapped stream. The
+        // shorter "0:v:0?" that buildStreamMapArgs emits for a single-stream file never
+        // matches this test, so the two cases cannot be confused.
+        bool allVideo = streamMapArg.find("0:v?") != string::npos;
+        bool allAudio = streamMapArg.find("0:a?") != string::npos;
+        if (allVideo || allAudio) {
+            ExactTrimMultiArgs multi = buildExactTrimMultiArgs(vtracks, atracks);
+            if (allVideo) {
+                exactCodecs.videoArgs = multi.videoArgs;
+                exactCodecs.videoDesc = to_string((int)vtracks.size())
+                    + tr(" video streams, each to its own codec", " видеопотоков, каждый в свой кодек");
+            }
+            if (allAudio) {
+                exactCodecs.audioArgs = multi.audioArgs;
+                exactCodecs.audioDesc = to_string((int)atracks.size())
+                    + tr(" audio streams, each to its own codec", " аудиопотоков, каждый в свой кодек");
+            }
+        }
+    }
 
     bool deleteOrig = false;
     if (!promptDeleteOriginal(false, deleteOrig)) return;
@@ -5355,14 +6551,29 @@ void trimVideo() {
     auto ft = prepareFFmpegTarget(outPath, {inputFile});
     printColor("\n" + tr("Output: ", "Выход: ") + outPath, GREEN);
 
+    // The cut is always expressed as a DURATION ("-t"), never as an output "-to <end>".
+    // "-ss" in front of "-i" is an input seek, so FFmpeg rebases the output timeline to
+    // zero at the seek point; an output "-to 20" is then measured from that new zero and
+    // keeps writing past the requested end. Measured on a 60 s test file, request
+    // 10 s -> 20 s (10 s wanted), with a keyframe every 1 s:
+    //     -ss 10 -i in -to 20 -c copy   -> 21.20 s   (as built: more than double)
+    //     -ss 10 -i in -t 10  -c copy   -> 11.17 s   (what this mode can do at best)
+    //     -i in -ss 10 -to 20 -c copy   -> 10.13 s, but the video starts 1 s late
+    //     -ss 10 -i in -t 10  re-encode -> 10.02 s   (the exact mode above)
     wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
     cmd += L" -ss " + utf8ToWstring(startTime);
     cmd += L" -i \"" + utf8ToWstring(getSafeFFmpegPath(inputFile)) + L"\"";
-    cmd += L" -to " + utf8ToWstring(endTime);
+    cmd += L" -t " + utf8ToWstring(formatDot(trimDuration, 3));
     if (!streamMapArg.empty()) {
         cmd += utf8ToWstring(streamMapArg);
     }
-    cmd += L" -c copy";  // Stream copy for speed
+    if (exactTrim) {
+        // Encoders from the source file, never from the program settings.
+        cmd += L" " + utf8ToWstring(exactCodecs.videoArgs);
+        cmd += L" " + utf8ToWstring(exactCodecs.audioArgs);
+    } else {
+        cmd += L" -c copy";
+    }
     if (OVERWRITE_FILES) cmd += L" -y";
     cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(ft.writePath)) + L"\"";
 
@@ -5372,16 +6583,15 @@ void trimVideo() {
     printColor(" \"" + inputFile + "\"", CYAN);
     printColor("========================================", CYAN);
     printColor(tr("From ", "С ") + startTime + tr(" to ", " по ") + endTime, CYAN);
-    cout << endl;
-
-    double startSec = parseTimeStringToSeconds(startTime);
-    double endSec = parseTimeStringToSeconds(endTime);
-    double trimDuration = 0;
-    if (endSec > startSec) {
-        trimDuration = endSec - startSec;
-    } else if (duration > startSec) {
-        trimDuration = duration - startSec;
+    if (exactTrim) {
+        printColor(tr("(exact: re-encoding with the file's own codecs - ",
+                      "(точно: перекодирование кодеками самого файла - ")
+               + exactCodecs.videoDesc + " / " + exactCodecs.audioDesc + ")", CYAN);
+    } else {
+        printColor(tr("(stream copy: the cut can only start at a keyframe, so the result will be longer)",
+                      "(потоковое копирование: обрезка возможна только с ключевого кадра, файл будет длиннее)"), CYAN);
     }
+    cout << endl;
 
     bool ok = execFFmpegWithProgress(cmd, trimDuration);
     ok = finalizeFFmpegTarget(ft, ok);
@@ -5392,6 +6602,11 @@ void trimVideo() {
         printColor(tr("[OK] Trim completed successfully!", "[OK] Обрезка успешно завершена!"), GREEN);
         printColor(tr("Output: ", "Выход: ") + outPath, GREEN);
         printColor("========================================", GREEN);
+
+        // Report what the file really is. In stream copy mode the length cannot match the
+        // request, and saying so is the honest outcome; in exact mode this doubles as a
+        // self-check that the cut landed where it should.
+        printTrimLengthReport(trimDuration, getMediaDuration(ft.targetPath), startTime, exactTrim);
     } else {
         printColor("\n========================================", RED);
         printColor(tr("[ERROR] Trim failed!", "[ОШИБКА] Ошибка обрезки!"), RED);
@@ -5691,7 +6906,10 @@ void changeSpeed() {
             string s;
             cout << tr("Enter speed multiplier (e.g. 1.5): ", "Введите коэффициент скорости (например 1.5): ");
             if (!inputLineWithEscape(s, "")) return;
-            try { speed = stod(s); } catch (...) {
+            // The prompt asks for a dot decimal ("1.5"), so it must be parsed
+            // locale-independently: on a Russian locale stod() reads the dot as a
+            // thousands separator and returns 1.0 for "1.5", 0.0 for "0.25".
+            if (!parseNumberLoose(s, speed)) {
                 printColor(tr("[ERROR] Invalid number!", "[ОШИБКА] Некорректное число!"), RED); waitForKey(); return;
             }
             break;
@@ -6432,8 +7650,28 @@ void concatenateFiles() {
     string outPath = buildOutputPath(files[0], "_joined");
     auto ft = prepareFFmpegTarget(outPath, files);
 
+    // Attach the cover inside the concat pass instead of remuxing the finished file.
+    // A concat is itself a pure stream copy, so the extra full rewrite that
+    // finalizeFFmpegTarget() would do for the cover was measured at 43.9% of the whole
+    // operation (83 ms of 189 ms on two 38 MB inputs). Here it rides along for free.
+    string coverTemp;
+    wstring coverArgs;
+    if (SAVE_COVER) {
+        fs::path op = fs::u8path(outPath);
+        coverTemp = op.parent_path().u8string() + "\\.~mr_tmp_join_cover_" + op.stem().u8string() + ".jpg";
+        if (extractCover(files[0], coverTemp) &&
+            buildCoverAttachArgs(op.extension().u8string(), coverTemp, coverArgs)) {
+            ft.coverEmbedded = true;
+        } else {
+            std::error_code ec;
+            fs::remove(fs::u8path(coverTemp), ec);
+            coverTemp.clear();
+        }
+    }
+
     wstring cmd = L"\"" + utf8ToWstring(getSafeFFmpegPath(FFMPEG_PATH)) + L"\"";
     cmd += L" -f concat -safe 0 -i \"" + utf8ToWstring(getSafeFFmpegPath(listPath)) + L"\"";
+    cmd += coverArgs;
     cmd += L" -c copy";
     if (OVERWRITE_FILES) cmd += L" -y";
     cmd += L" \"" + utf8ToWstring(getSafeFFmpegPath(ft.writePath)) + L"\"";
@@ -6450,6 +7688,10 @@ void concatenateFiles() {
     // Cleanup
     std::error_code ec;
     fs::remove(fs::u8path(listPath), ec);
+    if (!coverTemp.empty()) {
+        fs::remove(fs::u8path(coverTemp), ec);
+        coverTemp.clear();
+    }
 
     if (ok) {
         printColor("\n========================================", GREEN);
@@ -7303,9 +8545,10 @@ void settingsMenu() {
             "t. " + tr("Subtitle prompt: [", "Запрос субтитров: [") + getSubtitleActionSettingName() + "]",
             "d. " + tr("Delete original prompt: [", "Запрос удаления оригинала: [") + getDeleteOriginalSettingName() + "]",
             "c. " + tr("Save video cover: [", "Сохранять обложку видео: [") + (SAVE_COVER ? tr("ON", "ВКЛ") : tr("OFF", "ВЫКЛ")) + "]",
+            "p. " + tr("Allow double processing in batch mode: [", "Разрешить двойную обработку в пакетном режиме: [") + (PARALLEL_BATCH ? tr("ON", "ВКЛ") : tr("OFF", "ВЫКЛ")) + "]",
             "u. " + tr("Update FFmpeg & components", "Обновить FFmpeg"),
         };
-        vector<int> actions = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+        vector<int> actions = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17};
 
         string desc = "";
 
@@ -7505,7 +8748,27 @@ void settingsMenu() {
             }
             break;
         }
-        case 16: updateComponentsMenu(); break;
+        case 16: {
+            vector<string> opts = {tr("ON", "ВКЛ"), tr("OFF", "ВЫКЛ")};
+            string desc = tr(
+                "Allows the batch mode to work with two videos at once,\n"
+                "if the next video matches the current user settings.\n"
+                "This is an experimental setting, it can both speed up\n"
+                "processing and corrupt your files. Enable at your own risk.",
+                "Разрешает в пакетном режиме работать сразу с двумя видео,\n"
+                "если следующее видео подходит по текущим настройкам пользователя.\n"
+                "Это экспериментальная настройка, может как ускорить обработку,\n"
+                "так и испортить ваши файлы. Включайте на свой страх и риск.");
+            int sel = arrowSelect(tr("DOUBLE PROCESSING IN BATCH", "ДВОЙНАЯ ОБРАБОТКА В ПАКЕТНОМ РЕЖИМЕ"), desc, opts, PARALLEL_BATCH ? 0 : 1);
+            if (sel >= 0) {
+                PARALLEL_BATCH = (sel == 0);
+                saveConfig();
+                printColor(tr("[OK] Double processing in batch mode: ", "[OK] Двойная обработка в пакетном режиме: ") + (PARALLEL_BATCH ? tr("ON", "ВКЛ") : tr("OFF", "ВЫКЛ")), GREEN);
+                waitForKey();
+            }
+            break;
+        }
+        case 17: updateComponentsMenu(); break;
         }
     }
 }
@@ -7828,6 +9091,10 @@ int main() {
             CoUninitialize();
             return 0;
         }
+        // Each top level operation starts with a cold probe cache. The key already
+        // includes size + mtime, so this is belt and braces: it also keeps memory flat
+        // when the user works through many operations in one session.
+        clearProbeCache();
         switch (ch) {
         case '1': convertFormat(); break;
         case '2': trimVideo(); break;

@@ -29,7 +29,7 @@ BEGIN
             VALUE "FileDescription", "MR CLI FOR FFMPEG - Video Editor & Converter"
             VALUE "FileVersion", "1.1.6.0"
             VALUE "InternalName", "mr-cli-ffmpeg.exe"
-            VALUE "LegalCopyright", "Copyright (C) 2026 MR. All rights reserved."
+            VALUE "LegalCopyright", "Copyright 2026 Mr712. Licensed under the Apache License, Version 2.0."
             VALUE "OriginalFilename", "mr-cli-ffmpeg.exe"
             VALUE "ProductName", "MR CLI FOR FFMPEG"
             VALUE "ProductVersion", "1.1.6.0"
