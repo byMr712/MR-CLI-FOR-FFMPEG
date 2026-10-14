@@ -48,6 +48,7 @@ public:
         print(text, c, newline);
     }
     static void clearScreen();
+    static void flushInput() noexcept;
     static void waitForKey() noexcept;
     static char getMenuChoice() noexcept;
     static wint_t getWChar() noexcept;

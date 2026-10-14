@@ -43,11 +43,32 @@ void BatchVideoOperation::execute() {
     Console::printColor("========================================", Console::Color::CYAN);
 
     cout << "\n" << TR("Select folder with video files...", "Выберите папку с видеофайлами...") << "\n";
+    Console::flushInput();
     string folder = ShellDialogs::openFolderDialog(StringUtil::utf8ToWstring(TR("Select folder with video files", "Выберите папку с видеофайлами")).c_str());
     if (folder.empty()) {
-        Console::printColor(TR("[INFO] Cancelled", "[ИНФО] Отменено"), Console::Color::YELLOW);
-        Console::waitForKey();
-        return;
+        cout << TR("Or enter/drag-and-drop folder path manually (Enter to cancel): ",
+                   "Или введите/перетащите путь к папке вручную (Enter для отмены): ");
+        folder = "";
+        if (!Console::inputLineWithEscape(folder) || folder.empty()) {
+            Console::printColor(TR("[INFO] Cancelled", "[ИНФО] Отменено"), Console::Color::YELLOW);
+            Console::waitForKey();
+            return;
+        }
+        while (!folder.empty() && (folder.front() == '\"' || folder.front() == '\'')) folder.erase(folder.begin());
+        while (!folder.empty() && (folder.back() == '\"' || folder.back() == '\'')) folder.pop_back();
+        if (folder.empty()) {
+            Console::printColor(TR("[INFO] Cancelled", "[ИНФО] Отменено"), Console::Color::YELLOW);
+            Console::waitForKey();
+            return;
+        }
+        if (!PathProvider::dirExists(folder)) {
+            Console::printColor(TR("[ERROR] Directory does not exist!", "[ОШИБКА] Папка не существует!"), Console::Color::RED);
+            Console::waitForKey();
+            return;
+        }
+        if (folder.back() != '\\' && folder.back() != '/') {
+            folder += '\\';
+        }
     }
 
     vector<string> videoExts = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".ts", ".m4v"};
@@ -122,11 +143,6 @@ void BatchVideoOperation::execute() {
         string inPath = files[i];
         string fileName = fs::u8path(inPath).filename().u8string();
 
-        cout << "\n";
-        Console::printColor("----------------------------------------", Console::Color::CYAN);
-        Console::printColor(TR("Processing video ", "Обработка видео ") + to_string(i + 1) + "/" + to_string(files.size()) + ": " + fileName, Console::Color::CYAN);
-        Console::printColor("----------------------------------------", Console::Color::CYAN);
-
         // Check if we can do double processing with the next file
         bool paired = false;
         PairPrep prep;
@@ -141,6 +157,17 @@ void BatchVideoOperation::execute() {
                                                        batchVideoPref, batchAudioPref, "", cfg, ctx.ffprobeService, ctx.hardware, prep);
         }
 
+        PairProcessingService::printVerdict(cfg.parallelBatch, paired, i + 1 < files.size());
+
+        cout << "\n";
+        Console::printColor("----------------------------------------", Console::Color::CYAN);
+        Console::printColor(TR("Processing video ", "Обработка видео ") + to_string(i + 1) + "/" + to_string(files.size()) + ": " + fileName, Console::Color::CYAN);
+        if (paired) {
+            string nextFileName = fs::u8path(prep.nextPath).filename().u8string();
+            Console::printColor(TR("Processing video ", "Обработка видео ") + to_string(i + 2) + "/" + to_string(files.size()) + ": " + nextFileName, Console::Color::CYAN);
+        }
+        Console::printColor("----------------------------------------", Console::Color::CYAN);
+
         if (paired) {
             string nextPath = prep.nextPath;
             double durA = ctx.ffprobeService.getMediaDuration(inPath);
@@ -152,8 +179,26 @@ void BatchVideoOperation::execute() {
             auto targetA = FfmpegCommandBuilder::prepareTarget(outPathA, {inPath});
             auto targetB = FfmpegCommandBuilder::prepareTarget(outPathB, {nextPath});
 
+            string videoMapArgA, audioMapArgA;
+            if (batchVideoPref.hasPreference) {
+                auto vTracksA = ctx.ffprobeService.getVideoTracks(inPath);
+                int matchIdx = ctx.ffprobeService.matchVideoPreference(vTracksA, batchVideoPref);
+                if (matchIdx == 9999) videoMapArgA = " -map 0:v";
+                else if (matchIdx >= 0) videoMapArgA = " -map 0:v:" + to_string(matchIdx);
+                else videoMapArgA = " -map 0:v:0";
+            }
+            if (batchAudioPref.hasPreference) {
+                auto aTracksA = ctx.ffprobeService.getAudioTracks(inPath);
+                int matchIdx = ctx.ffprobeService.matchAudioPreference(aTracksA, batchAudioPref);
+                if (matchIdx == 9999) audioMapArgA = " -map 0:a";
+                else if (matchIdx >= 0) audioMapArgA = " -map 0:a:" + to_string(matchIdx);
+                else audioMapArgA = " -map 0:a:0";
+            }
+            string streamMapArgA = FfprobeService::buildStreamMapArgs(videoMapArgA, audioMapArgA);
+
             wstring cmdA = L"\"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ctx.installer.getFfmpegPath())) + L"\"";
             cmdA += L" -i \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(inPath)) + L"\"";
+            if (!streamMapArgA.empty()) cmdA += StringUtil::utf8ToWstring(streamMapArgA);
             cmdA += L" " + StringUtil::utf8ToWstring(FfmpegCommandBuilder::getVideoCodecArgs(cfg.accelMode, cfg.hybridGpuChoice, cfg.outputFormat));
             cmdA += L" " + StringUtil::utf8ToWstring(FfmpegCommandBuilder::getVideoPresetArgs(cfg.preset, cfg.accelMode, cfg.hybridGpuChoice, cfg.outputFormat));
             cmdA += L" " + StringUtil::utf8ToWstring(FfmpegCommandBuilder::getVideoQualityArgs(cfg.crfValue, cfg.accelMode, cfg.hybridGpuChoice, cfg.outputFormat));
@@ -186,12 +231,43 @@ void BatchVideoOperation::execute() {
                     FfmpegCommandBuilder::finalizeTarget(targetB, true, &ctx.coverService, cfg.saveCover);
                     Dialogs::handleOriginalDeletion(inPath, targetA.targetPath, targetA.isTemp, deleteOrig);
                     Dialogs::handleOriginalDeletion(nextPath, targetB.targetPath, targetB.isTemp, deleteOrig);
+                    Console::printColor(TR("[OK] Processed: ", "[OK] Обработан: ") + fileName, Console::Color::GREEN);
+                    Console::printColor(TR("[OK] Processed: ", "[OK] Обработан: ") + fs::u8path(nextPath).filename().u8string(), Console::Color::GREEN);
                     i += 2;
                     continue;
                 }
+                if (escaped) {
+                    FfmpegCommandBuilder::finalizeTarget(targetA, false);
+                    FfmpegCommandBuilder::finalizeTarget(targetB, false);
+                    PairProcessingService::releaseJob(jobA);
+                    PairProcessingService::releaseJob(jobB);
+                    string pairLabel = fileName + " + " + fs::u8path(nextPath).filename().u8string();
+                    int pauseAct = Dialogs::askBatchPauseAction(pairLabel);
+                    if (pauseAct == 2) {
+                        Console::printColor(TR("[INFO] Batch cancelled by user.", "[ИНФО] Пакетная обработка отменена пользователем."), Console::Color::YELLOW);
+                        fail += 2;
+                        break;
+                    } else if (pauseAct == 3) {
+                        continue;
+                    } else {
+                        skippedFiles.push_back(inPath);
+                        skippedFiles.push_back(nextPath);
+                        fail += 2;
+                        i += 2;
+                        continue;
+                    }
+                }
             }
+            FfmpegCommandBuilder::finalizeTarget(targetA, false);
+            FfmpegCommandBuilder::finalizeTarget(targetB, false);
             PairProcessingService::releaseJob(jobA);
             PairProcessingService::releaseJob(jobB);
+            Console::printColor(TR("[INFO] Parallel processing failed, falling back to single file mode.",
+                                   "[ИНФО] Параллельная обработка не удалась, переключение на одиночный режим."), Console::Color::YELLOW);
+            cout << "\n";
+            Console::printColor("----------------------------------------", Console::Color::CYAN);
+            Console::printColor(TR("Processing video ", "Обработка видео ") + to_string(i + 1) + "/" + to_string(files.size()) + ": " + fileName, Console::Color::CYAN);
+            Console::printColor("----------------------------------------", Console::Color::CYAN);
         }
 
         // Fallback or single file processing

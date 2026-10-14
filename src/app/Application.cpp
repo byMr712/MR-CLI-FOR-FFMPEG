@@ -32,6 +32,9 @@ Application::~Application() {
 bool Application::initialize() {
     if (m_initialized) return true;
 
+    // Initialize COM for Windows Shell and Dialogs (STA model)
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+
     Console::initConsole();
     Console::setConsoleTitle(L"MR CLI FOR FFMPEG v1.2.0");
 
@@ -74,6 +77,7 @@ bool Application::initialize() {
 void Application::shutdown() {
     if (!m_initialized) return;
     Console::cleanupConsole();
+    CoUninitialize();
     m_initialized = false;
 }
 

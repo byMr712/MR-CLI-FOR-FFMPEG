@@ -58,7 +58,15 @@ void Console::clearScreen() {
     SetConsoleCursorPosition(hOut, homeCoords);
 }
 
+void Console::flushInput() noexcept {
+    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+    if (hIn != INVALID_HANDLE_VALUE && hIn != NULL) {
+        FlushConsoleInputBuffer(hIn);
+    }
+}
+
 void Console::waitForKey() noexcept {
+    flushInput();
     _getwch();
 }
 

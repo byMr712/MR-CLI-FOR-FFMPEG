@@ -8,42 +8,75 @@ namespace mr {
 namespace core {
 
 std::string ShellDialogs::openFolderDialog(const std::wstring& title) {
+    HRESULT hrCom = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool needUninit = SUCCEEDED(hrCom);
+
+    HWND hwndOwner = GetConsoleWindow();
+    if (hwndOwner) {
+        SetForegroundWindow(hwndOwner);
+    }
+
     IFileDialog* pfd = nullptr;
     HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
                                   IID_PPV_ARGS(&pfd));
-    if (FAILED(hr)) return "";
+    if (SUCCEEDED(hr) && pfd) {
+        DWORD dwOptions = 0;
+        pfd->GetOptions(&dwOptions);
+        pfd->SetOptions(dwOptions | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+        pfd->SetTitle(title.c_str());
 
-    DWORD dwOptions = 0;
-    pfd->GetOptions(&dwOptions);
-    pfd->SetOptions(dwOptions | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
-    pfd->SetTitle(title.c_str());
+        hr = pfd->Show(hwndOwner);
+        if (SUCCEEDED(hr)) {
+            IShellItem* psi = nullptr;
+            hr = pfd->GetResult(&psi);
+            if (SUCCEEDED(hr) && psi) {
+                wchar_t* pPath = nullptr;
+                hr = psi->GetDisplayName(SIGDN_FILESYSPATH, &pPath);
+                psi->Release();
+                pfd->Release();
 
-    hr = pfd->Show(nullptr);
-    if (FAILED(hr)) {
+                if (SUCCEEDED(hr) && pPath) {
+                    std::wstring result(pPath);
+                    CoTaskMemFree(pPath);
+                    if (needUninit) CoUninitialize();
+                    if (!result.empty() && result.back() != L'\\' && result.back() != L'/') {
+                        result += L'\\';
+                    }
+                    return StringUtil::wstringToUtf8(result);
+                }
+            }
+        }
         pfd->Release();
-        return "";
+
+        // If user explicitly clicked Cancel in IFileDialog, return empty
+        if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED) || hr == (HRESULT)0x800704C7) {
+            if (needUninit) CoUninitialize();
+            return "";
+        }
     }
 
-    IShellItem* psi = nullptr;
-    hr = pfd->GetResult(&psi);
-    if (FAILED(hr)) {
-        pfd->Release();
-        return "";
+    // Fallback: classic Windows folder browser (SHBrowseForFolderW)
+    BROWSEINFOW bi = { 0 };
+    bi.hwndOwner = hwndOwner;
+    bi.lpszTitle = title.c_str();
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_USENEWUI;
+    PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
+    if (pidl) {
+        wchar_t path[MAX_PATH] = { 0 };
+        if (SHGetPathFromIDListW(pidl, path)) {
+            CoTaskMemFree(pidl);
+            if (needUninit) CoUninitialize();
+            std::wstring result(path);
+            if (!result.empty() && result.back() != L'\\' && result.back() != L'/') {
+                result += L'\\';
+            }
+            return StringUtil::wstringToUtf8(result);
+        }
+        CoTaskMemFree(pidl);
     }
 
-    wchar_t* pPath = nullptr;
-    hr = psi->GetDisplayName(SIGDN_FILESYSPATH, &pPath);
-    psi->Release();
-    pfd->Release();
-
-    if (FAILED(hr) || !pPath) return "";
-
-    std::wstring result(pPath);
-    CoTaskMemFree(pPath);
-    if (!result.empty() && result.back() != L'\\' && result.back() != L'/') {
-        result += L'\\';
-    }
-    return StringUtil::wstringToUtf8(result);
+    if (needUninit) CoUninitialize();
+    return "";
 }
 
 std::string ShellDialogs::openFileDialogMedia(bool isRussian, const std::wstring& title) {

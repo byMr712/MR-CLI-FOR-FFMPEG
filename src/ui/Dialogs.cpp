@@ -645,6 +645,7 @@ void Dialogs::handleOriginalDeletion(const std::string& srcPath, const std::stri
 }
 
 int Dialogs::askBatchPauseAction(const std::string& fileLabel) {
+    core::Console::flushInput();
     std::cout << "\n";
     core::Console::print("========================================", core::ConsoleColor::YELLOW);
     core::Console::print(" " + services::tr("PAUSED - Batch Processing Interrupted", "ПАУЗА - Пакетная обработка прервана") + "\n", core::ConsoleColor::YELLOW);

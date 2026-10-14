@@ -465,6 +465,10 @@ void clearScreen() {
 
 void waitForKey() {
     cout << "\n" << tr("Press any key...", "Нажмите любую клавишу...") << flush;
+    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+    if (hIn != INVALID_HANDLE_VALUE && hIn != NULL) {
+        FlushConsoleInputBuffer(hIn);
+    }
     (void)_getch();
     while (_kbhit()) (void)_getch();
     cout << "\n";
@@ -510,7 +514,7 @@ string getClipboard() {
 }
 
 // ========== KEYBOARD INPUT (WITH ESCAPE TO CANCEL, CTRL+V, BACKSPACE) ==========
-bool inputLineWithEscape(string& result, const string& prompt) {
+bool inputLineWithEscape(string& result, const string& prompt = "") {
     if (!prompt.empty()) cout << prompt << flush;
     result.clear();
 
@@ -3227,34 +3231,68 @@ bool execFFmpegPair(PairJob& a, PairJob& b, bool& escaped) {
 
 // ========== DIALOGS ==========
 string openFolderDialog(const wchar_t* title = L"Select folder") {
+    HRESULT hrCom = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool needUninit = SUCCEEDED(hrCom);
+
+    HWND hwndOwner = GetConsoleWindow();
+    if (hwndOwner) SetForegroundWindow(hwndOwner);
+
     IFileDialog* pfd = nullptr;
     HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
                                   IID_PPV_ARGS(&pfd));
-    if (FAILED(hr)) return "";
+    if (SUCCEEDED(hr) && pfd) {
+        DWORD dwOptions = 0;
+        pfd->GetOptions(&dwOptions);
+        pfd->SetOptions(dwOptions | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+        pfd->SetTitle(title);
 
-    DWORD dwOptions;
-    pfd->GetOptions(&dwOptions);
-    pfd->SetOptions(dwOptions | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
-    pfd->SetTitle(title);
+        hr = pfd->Show(hwndOwner);
+        if (SUCCEEDED(hr)) {
+            IShellItem* psi = nullptr;
+            hr = pfd->GetResult(&psi);
+            if (SUCCEEDED(hr) && psi) {
+                wchar_t* pPath = nullptr;
+                hr = psi->GetDisplayName(SIGDN_FILESYSPATH, &pPath);
+                psi->Release();
+                pfd->Release();
 
-    hr = pfd->Show(nullptr);
-    if (FAILED(hr)) { pfd->Release(); return ""; }
+                if (SUCCEEDED(hr) && pPath) {
+                    wstring result(pPath);
+                    CoTaskMemFree(pPath);
+                    if (needUninit) CoUninitialize();
+                    if (!result.empty() && result.back() != L'\\' && result.back() != L'/') result += L'\\';
+                    return wstringToUtf8(result);
+                }
+            }
+        }
+        pfd->Release();
 
-    IShellItem* psi = nullptr;
-    hr = pfd->GetResult(&psi);
-    if (FAILED(hr)) { pfd->Release(); return ""; }
+        if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED) || hr == (HRESULT)0x800704C7) {
+            if (needUninit) CoUninitialize();
+            return "";
+        }
+    }
 
-    wchar_t* pPath = nullptr;
-    hr = psi->GetDisplayName(SIGDN_FILESYSPATH, &pPath);
-    psi->Release();
-    pfd->Release();
+    // Fallback: classic Windows folder browser
+    BROWSEINFOW bi = { 0 };
+    bi.hwndOwner = hwndOwner;
+    bi.lpszTitle = title;
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_USENEWUI;
+    PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
+    if (pidl) {
+        wchar_t path[MAX_PATH] = { 0 };
+        if (SHGetPathFromIDListW(pidl, path)) {
+            CoTaskMemFree(pidl);
+            if (needUninit) CoUninitialize();
+            wstring result(path);
+            if (!result.empty() && result.back() != L'\\' && result.back() != L'/') result += L'\\';
+            return wstringToUtf8(result);
+        }
+        CoTaskMemFree(pidl);
+    }
 
-    if (FAILED(hr) || !pPath) return "";
-
-    wstring result(pPath);
-    CoTaskMemFree(pPath);
-    if (result.back() != L'\\' && result.back() != L'/') result += L'\\';
-    return wstringToUtf8(result);
+    if (needUninit) CoUninitialize();
+    return "";
 }
 
 string openFileDialogMedia(const wchar_t* title = nullptr) {
@@ -4696,7 +4734,17 @@ void batchCompressVideo() {
 
     cout << "\n" << tr("Select folder with video files...", "Выберите папку с видеофайлами...") << "\n";
     string folder = openFolderDialog(utf8ToWstring(tr("Select folder with video files", "Выберите папку с видеофайлами")).c_str());
-    if (folder.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+    if (folder.empty()) {
+        cout << tr("Or enter/drag-and-drop folder path manually (Enter to cancel): ",
+                   "Или введите/перетащите путь к папке вручную (Enter для отмены): ");
+        folder = "";
+        if (!inputLineWithEscape(folder) || folder.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+        while (!folder.empty() && (folder.front() == '\"' || folder.front() == '\'')) folder.erase(folder.begin());
+        while (!folder.empty() && (folder.back() == '\"' || folder.back() == '\'')) folder.pop_back();
+        if (folder.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+        if (!dirExists(folder)) { printColor(tr("[ERROR] Directory does not exist!", "[ОШИБКА] Папка не существует!"), RED); waitForKey(); return; }
+        if (folder.back() != '\\' && folder.back() != '/') folder += '\\';
+    }
 
     vector<string> videoExts = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".ts", ".m4v"};
     vector<string> files;
@@ -4879,6 +4927,13 @@ void batchCompressVideo() {
                            fs::u8path(filePath).filename().u8string();
             printColor(label, CYAN);
             printColor(" \"" + filePath + "\"", CYAN);
+            if (pairPrep && !pairPrep->nextPath.empty()) {
+                string nextLabel = " " + tr("Processing", "Обработка") + " " +
+                                   to_string(currentNum + 1) + " / " + to_string(totalNum) + " - " +
+                                   fs::u8path(pairPrep->nextPath).filename().u8string();
+                printColor(nextLabel, CYAN);
+                printColor(" \"" + pairPrep->nextPath + "\"", CYAN);
+            }
             printColor("========================================", CYAN);
 
             double duration = getMediaDuration(filePath);
@@ -5661,7 +5716,17 @@ void batchCompressAudio() {
 
     cout << "\n" << tr("Select folder with audio files...", "Выберите папку с аудиофайлами...") << "\n";
     string folder = openFolderDialog(utf8ToWstring(tr("Select folder with audio files", "Выберите папку с аудиофайлами")).c_str());
-    if (folder.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+    if (folder.empty()) {
+        cout << tr("Or enter/drag-and-drop folder path manually (Enter to cancel): ",
+                   "Или введите/перетащите путь к папке вручную (Enter для отмены): ");
+        folder = "";
+        if (!inputLineWithEscape(folder) || folder.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+        while (!folder.empty() && (folder.front() == '\"' || folder.front() == '\'')) folder.erase(folder.begin());
+        while (!folder.empty() && (folder.back() == '\"' || folder.back() == '\'')) folder.pop_back();
+        if (folder.empty()) { printColor(tr("[INFO] Cancelled", "[ИНФО] Отменено"), YELLOW); waitForKey(); return; }
+        if (!dirExists(folder)) { printColor(tr("[ERROR] Directory does not exist!", "[ОШИБКА] Папка не существует!"), RED); waitForKey(); return; }
+        if (folder.back() != '\\' && folder.back() != '/') folder += '\\';
+    }
 
     vector<string> audioExts = {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".flac", ".opus", ".wma"};
     vector<string> files;

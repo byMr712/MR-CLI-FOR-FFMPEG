@@ -41,11 +41,32 @@ void BatchAudioOperation::execute() {
     Console::printColor("========================================", Console::Color::CYAN);
 
     cout << "\n" << TR("Select folder with audio files...", "Выберите папку с аудиофайлами...") << "\n";
+    Console::flushInput();
     string folder = ShellDialogs::openFolderDialog(StringUtil::utf8ToWstring(TR("Select folder with audio files", "Выберите папку с аудиофайлами")).c_str());
     if (folder.empty()) {
-        Console::printColor(TR("[INFO] Cancelled", "[ИНФО] Отменено"), Console::Color::YELLOW);
-        Console::waitForKey();
-        return;
+        cout << TR("Or enter/drag-and-drop folder path manually (Enter to cancel): ",
+                   "Или введите/перетащите путь к папке вручную (Enter для отмены): ");
+        folder = "";
+        if (!Console::inputLineWithEscape(folder) || folder.empty()) {
+            Console::printColor(TR("[INFO] Cancelled", "[ИНФО] Отменено"), Console::Color::YELLOW);
+            Console::waitForKey();
+            return;
+        }
+        while (!folder.empty() && (folder.front() == '\"' || folder.front() == '\'')) folder.erase(folder.begin());
+        while (!folder.empty() && (folder.back() == '\"' || folder.back() == '\'')) folder.pop_back();
+        if (folder.empty()) {
+            Console::printColor(TR("[INFO] Cancelled", "[ИНФО] Отменено"), Console::Color::YELLOW);
+            Console::waitForKey();
+            return;
+        }
+        if (!PathProvider::dirExists(folder)) {
+            Console::printColor(TR("[ERROR] Directory does not exist!", "[ОШИБКА] Папка не существует!"), Console::Color::RED);
+            Console::waitForKey();
+            return;
+        }
+        if (folder.back() != '\\' && folder.back() != '/') {
+            folder += '\\';
+        }
     }
 
     vector<string> audioExts = {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".flac", ".opus", ".wma"};

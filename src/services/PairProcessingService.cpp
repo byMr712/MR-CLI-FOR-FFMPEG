@@ -321,12 +321,12 @@ void PairProcessingService::printVerdict(bool enabled, bool paired, bool hasNext
     if (!enabled || !hasNext) return;
     std::cout << "\n";
     if (paired) {
-        core::Console::print(tr(" Next video qualifies for double processing, two videos will be processed at once.\n",
-                                " Следующее видео подходит для двойной обработки, обрабатываются сразу два видео.\n"),
+        core::Console::print(tr(" Next video qualifies for double processing, two videos will be processed at once.",
+                                " Следующее видео подходит для двойной обработки, обрабатываются сразу два видео."),
                              core::ConsoleColor::CYAN);
     } else {
-        core::Console::print(tr(" Next video requires individual settings, processed one by one.\n",
-                                " Следующее видео требует индивидуальных настроек, обработка по одному.\n"),
+        core::Console::print(tr(" Next video does NOT qualify for double processing, only the current video is being processed, please wait.",
+                                " Следующее видео НЕ подходит для двойной обработки, обрабатывается только текущее видео, ожидайте."),
                              core::ConsoleColor::YELLOW);
     }
 }
