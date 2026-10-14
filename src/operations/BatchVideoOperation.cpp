@@ -157,9 +157,10 @@ void BatchVideoOperation::execute() {
                                                        batchVideoPref, batchAudioPref, "", cfg, ctx.ffprobeService, ctx.hardware, prep);
         }
 
-        PairProcessingService::printVerdict(cfg.parallelBatch, paired, i + 1 < files.size());
-
-        cout << "\n";
+        bool hasVerdict = PairProcessingService::printVerdict(cfg.parallelBatch, paired, i + 1 < files.size());
+        if (!hasVerdict) {
+            cout << "\n";
+        }
         Console::printColor("----------------------------------------", Console::Color::CYAN);
         Console::printColor(TR("Processing video ", "Обработка видео ") + to_string(i + 1) + "/" + to_string(files.size()) + ": " + fileName, Console::Color::CYAN);
         if (paired) {
@@ -231,8 +232,21 @@ void BatchVideoOperation::execute() {
                     FfmpegCommandBuilder::finalizeTarget(targetB, true, &ctx.coverService, cfg.saveCover);
                     Dialogs::handleOriginalDeletion(inPath, targetA.targetPath, targetA.isTemp, deleteOrig);
                     Dialogs::handleOriginalDeletion(nextPath, targetB.targetPath, targetB.isTemp, deleteOrig);
-                    Console::printColor(TR("[OK] Processed: ", "[OK] Обработан: ") + fileName, Console::Color::GREEN);
-                    Console::printColor(TR("[OK] Processed: ", "[OK] Обработан: ") + fs::u8path(nextPath).filename().u8string(), Console::Color::GREEN);
+                    fs::path dirA = fs::u8path(targetA.targetPath).parent_path().make_preferred();
+                    if (dirA.empty()) {
+                        std::error_code ec;
+                        dirA = fs::current_path(ec).make_preferred();
+                    }
+                    fs::path dirB = fs::u8path(targetB.targetPath).parent_path().make_preferred();
+                    if (dirB.empty()) {
+                        std::error_code ec;
+                        dirB = fs::current_path(ec).make_preferred();
+                    }
+                    Console::printColor(TR("[OK] Videos processed and saved to:", "[OK] Видео обработаны и сохранены по пути:"), Console::Color::GREEN);
+                    Console::printColor("\"" + dirA.u8string() + "\"", Console::Color::WHITE);
+                    if (dirA != dirB) {
+                        Console::printColor("\"" + dirB.u8string() + "\"", Console::Color::WHITE);
+                    }
                     i += 2;
                     continue;
                 }

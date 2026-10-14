@@ -44,7 +44,7 @@ public:
                            const HardwareInfo& hw,
                            domain::PairPrep& outPrep);
 
-    static void printVerdict(bool enabled, bool paired, bool hasNext);
+    static bool printVerdict(bool enabled, bool paired, bool hasNext);
 };
 
 } // namespace services

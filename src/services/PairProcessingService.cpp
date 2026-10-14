@@ -179,15 +179,23 @@ bool PairProcessingService::executePair(domain::PairJob& a, domain::PairJob& b, 
     outEscaped = false;
     s_pairRenderedLines = 0;
 
+    ULONGLONG lastRenderTime = 0;
+    renderStatus(a, b);
+    lastRenderTime = GetTickCount64();
+
     while (a.running || b.running) {
-        if (_kbhit()) {
+        while (_kbhit()) {
             int key = _getch();
-            if (key == 27) { // ESC
+            if (key == 0 || key == 0xE0) {
+                if (_kbhit()) _getch();
+            } else if (key == 27) { // ESC
                 outEscaped = true;
                 if (a.running) TerminateProcess(a.pi.hProcess, 1);
                 if (b.running) TerminateProcess(b.pi.hProcess, 1);
+                break;
             }
         }
+        if (outEscaped) break;
 
         consumeOutput(a);
         consumeOutput(b);
@@ -195,14 +203,20 @@ bool PairProcessingService::executePair(domain::PairJob& a, domain::PairJob& b, 
         bool doneB = tryFinishJob(b);
 
         if (!doneA || !doneB) {
-            renderStatus(a, b);
-            Sleep(80);
+            ULONGLONG now = GetTickCount64();
+            if (now - lastRenderTime >= 1000) {
+                renderStatus(a, b);
+                lastRenderTime = now;
+            }
+            Sleep(25);
         } else {
             break;
         }
     }
 
-    renderStatus(a, b);
+    if (!outEscaped) {
+        renderStatus(a, b);
+    }
     std::cout << std::endl;
 
     bool okA = (a.exitCode == 0);
@@ -317,18 +331,19 @@ bool PairProcessingService::tryPrepare(const std::string& curPath,
     return true;
 }
 
-void PairProcessingService::printVerdict(bool enabled, bool paired, bool hasNext) {
-    if (!enabled || !hasNext) return;
+bool PairProcessingService::printVerdict(bool enabled, bool paired, bool hasNext) {
+    if (!enabled || !hasNext) return false;
     std::cout << "\n";
     if (paired) {
-        core::Console::print(tr(" Next video qualifies for double processing, two videos will be processed at once.",
-                                " Следующее видео подходит для двойной обработки, обрабатываются сразу два видео."),
+        core::Console::print(tr("Next video qualifies for double processing, two videos will be processed at once:",
+                                "Следующее видео подходит для двойной обработки, обрабатываются сразу два видео:"),
                              core::ConsoleColor::CYAN);
     } else {
-        core::Console::print(tr(" Next video does NOT qualify for double processing, only the current video is being processed, please wait.",
-                                " Следующее видео НЕ подходит для двойной обработки, обрабатывается только текущее видео, ожидайте."),
+        core::Console::print(tr("Next video does NOT qualify for double processing, only the current video is being processed, please wait.",
+                                "Следующее видео НЕ подходит для двойной обработки, обрабатывается только текущее видео, ожидайте."),
                              core::ConsoleColor::YELLOW);
     }
+    return true;
 }
 
 } // namespace services

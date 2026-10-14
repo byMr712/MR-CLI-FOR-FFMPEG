@@ -113,11 +113,14 @@ bool FfmpegRunner::executeWithProgress(const std::wstring& cmdLine, double total
     bool progressActive = false;
     char buffer[4096];
     DWORD bytesRead = 0;
+    ULONGLONG lastRenderTime = 0;
 
     while (true) {
-        if (_kbhit()) {
+        while (_kbhit()) {
             int key = _getch();
-            if (key == 27) { // ESC
+            if (key == 0 || key == 0xE0) {
+                if (_kbhit()) _getch();
+            } else if (key == 27) { // ESC
                 if (progressActive) {
                     std::cout << std::endl;
                     progressActive = false;
@@ -127,10 +130,11 @@ bool FfmpegRunner::executeWithProgress(const std::wstring& cmdLine, double total
                 break;
             }
         }
+        if (outEscaped) break;
 
         DWORD avail = 0;
         if (!PeekNamedPipe(hReadPipe, NULL, 0, NULL, &avail, NULL) || avail == 0) {
-            if (WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0) {
+            if (WaitForSingleObject(pi.hProcess, 25) == WAIT_OBJECT_0) {
                 PeekNamedPipe(hReadPipe, NULL, 0, NULL, &avail, NULL);
                 if (avail == 0) break;
             }
@@ -148,8 +152,12 @@ bool FfmpegRunner::executeWithProgress(const std::wstring& cmdLine, double total
                     std::string timeStr, speed;
                     if (parseFFmpegProgress(line, timeStr, speed)) {
                         double cur = timeToSeconds(timeStr);
-                        renderProgressBar(cur, totalDuration, speed);
-                        progressActive = true;
+                        ULONGLONG now = GetTickCount64();
+                        if (now - lastRenderTime >= 1000 || cur >= totalDuration) {
+                            renderProgressBar(cur, totalDuration, speed);
+                            lastRenderTime = now;
+                            progressActive = true;
+                        }
                     } else if (line.find("Error") != std::string::npos || line.find("error") != std::string::npos) {
                         if (line.find("encoder") == std::string::npos) {
                             if (progressActive) {
