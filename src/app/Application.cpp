@@ -36,7 +36,7 @@ bool Application::initialize() {
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
     Console::initConsole();
-    Console::setConsoleTitle(L"MR CLI FOR FFMPEG v1.2.0");
+    Console::setConsoleTitle(L"MR CLI FOR FFMPEG v1.2.1");
 
     // Base directories setup in User Documents
     wchar_t docPath[MAX_PATH];
@@ -129,7 +129,7 @@ char Application::showMainMenu() {
     while (true) {
         Console::clearScreen();
         Console::printColor("========================================", Console::Color::CYAN);
-        Console::printColor(" MR CLI FOR FFMPEG v1.2.0", Console::Color::CYAN);
+        Console::printColor(" MR CLI FOR FFMPEG v1.2.1", Console::Color::CYAN);
         Console::printColor("========================================", Console::Color::CYAN);
         Console::printColor("========================================", Console::Color::GREEN);
         Console::printColor(" FFMPEG:  " + string(ffmpegFound ? TR("[OK] installed", "[OK] установлен") : TR("[ERROR] not found", "[ОШИБКА] не найден")), ffmpegFound ? Console::Color::GREEN : Console::Color::RED);

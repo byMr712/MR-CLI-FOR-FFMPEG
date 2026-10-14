@@ -159,17 +159,38 @@ std::string PairProcessingService::statusLine(const domain::PairJob& job, int sl
     return out;
 }
 
-void PairProcessingService::renderStatus(const domain::PairJob& a, const domain::PairJob& b) {
+void PairProcessingService::clearRenderedLines() {
+    if (std::cout.fail() || std::cout.bad()) {
+        std::cout.clear();
+    }
+    if (s_pairRenderedLines > 0) {
+        std::cout << "\033[" << s_pairRenderedLines << "A\r\033[J" << std::flush;
+        s_pairRenderedLines = 0;
+    }
+}
+
+void PairProcessingService::renderActiveSlots(const domain::PairJob* a, const domain::PairJob* b) {
     if (std::cout.fail() || std::cout.bad()) {
         std::cout.clear();
     }
     if (s_pairRenderedLines > 0) {
         std::cout << "\033[" << s_pairRenderedLines << "A\r\033[J";
     }
-    std::cout << statusLine(a, 1) << "\n";
-    std::cout << statusLine(b, 2) << "\n";
+    int rendered = 0;
+    if (a) {
+        std::cout << statusLine(*a, 1) << "\n";
+        rendered++;
+    }
+    if (b) {
+        std::cout << statusLine(*b, 2) << "\n";
+        rendered++;
+    }
     std::cout << std::flush;
-    s_pairRenderedLines = 2;
+    s_pairRenderedLines = rendered;
+}
+
+void PairProcessingService::renderStatus(const domain::PairJob& a, const domain::PairJob& b) {
+    renderActiveSlots(&a, &b);
 }
 
 bool PairProcessingService::executePair(domain::PairJob& a, domain::PairJob& b, bool& outEscaped) {

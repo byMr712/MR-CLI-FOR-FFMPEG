@@ -19,6 +19,8 @@ public:
     static std::string timeLabel(double seconds);
     static std::string statusLine(const domain::PairJob& job, int slot);
     static void renderStatus(const domain::PairJob& a, const domain::PairJob& b);
+    static void renderActiveSlots(const domain::PairJob* a, const domain::PairJob* b);
+    static void clearRenderedLines();
     static bool executePair(domain::PairJob& a, domain::PairJob& b, bool& outEscaped);
 
     static domain::PairFingerprint buildFingerprint(const std::string& filePath,

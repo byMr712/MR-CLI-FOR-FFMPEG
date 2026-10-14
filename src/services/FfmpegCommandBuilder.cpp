@@ -54,11 +54,21 @@ FFmpegTarget FfmpegCommandBuilder::prepareTarget(const std::string& targetPath, 
 }
 
 bool FfmpegCommandBuilder::finalizeTarget(const FFmpegTarget& ft, bool success, const CoverService* coverService, bool saveCover) {
+    if (!success) {
+        std::wstring wWrite = core::StringUtil::utf8ToWstring(ft.writePath);
+        for (int retry = 0; retry < 20; ++retry) {
+            if (!core::PathProvider::fileExists(ft.writePath)) break;
+            if (DeleteFileW(wWrite.c_str())) break;
+            Sleep(50);
+        }
+        return false;
+    }
+
     if (!ft.isTemp) {
-        if (success && !ft.coverEmbedded && coverService) {
+        if (!ft.coverEmbedded && coverService) {
             coverService->processCover(ft.inputPath, ft.targetPath, saveCover);
         }
-        return success;
+        return true;
     }
 
     std::wstring wTemp = core::StringUtil::utf8ToWstring(ft.writePath);
