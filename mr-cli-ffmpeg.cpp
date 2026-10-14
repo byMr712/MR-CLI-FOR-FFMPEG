@@ -18,6 +18,10 @@
 // them without pulling in <initguid.h>.
 #include <bits.h>
 
+#if defined(MR_MODULAR_APP)
+#include "src/app/Application.hpp"
+#endif
+
 #pragma comment(lib, "Shell32.lib")
 #pragma comment(lib, "Ole32.lib")
 #pragma comment(lib, "OleAut32.lib")
@@ -106,6 +110,55 @@ wstring utf8ToWstring(const string& str) {
     return result;
 }
 
+// Returns the number of Unicode code points in a UTF-8 string.
+size_t utf8Length(const string& str) {
+    size_t count = 0;
+    for (size_t i = 0; i < str.size(); ) {
+        unsigned char c = (unsigned char)str[i];
+        if ((c & 0x80) == 0) i += 1;
+        else if ((c & 0xE0) == 0xC0) i += 2;
+        else if ((c & 0xF0) == 0xE0) i += 3;
+        else if ((c & 0xF8) == 0xF0) i += 4;
+        else i += 1;
+        count++;
+    }
+    return count;
+}
+
+// Truncates a UTF-8 string to at most maxChars characters, appending "..." if truncated.
+// Always cuts on complete UTF-8 character boundaries to avoid producing malformed sequences.
+string truncateUtf8(const string& str, size_t maxChars) {
+    if (maxChars == 0) return "";
+    size_t chars = 0;
+    size_t targetChars = (maxChars > 3) ? (maxChars - 3) : maxChars;
+    size_t targetByte = 0;
+
+    for (size_t i = 0; i < str.size(); ) {
+        unsigned char c = (unsigned char)str[i];
+        size_t len = 1;
+        if ((c & 0x80) == 0) len = 1;
+        else if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+
+        if (i + len > str.size()) break;
+
+        chars++;
+        if (chars == targetChars) {
+            targetByte = i + len;
+        }
+        if (chars > maxChars) {
+            break;
+        }
+        i += len;
+    }
+
+    if (chars > maxChars && targetByte > 0) {
+        return str.substr(0, targetByte) + "...";
+    }
+    return str;
+}
+
 // ========== SAFE PATH HELPERS ==========
 wstring getShortPathName(const wstring& longPath) {
     if (longPath.empty()) return longPath;
@@ -132,6 +185,9 @@ void setColor(int c) {
 }
 
 void printColor(const string& t, int c = WHITE, bool nl = true) {
+    if (cout.fail() || cout.bad()) {
+        cout.clear();
+    }
     setColor(c);
     cout << t;
     setColor(WHITE);
@@ -382,10 +438,13 @@ void setUTF8() {
         dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
         SetConsoleMode(hOut, dwMode);
     }
-    SetConsoleTitleW(L"MR CLI FOR FFMPEG v1.1.6");
+    SetConsoleTitleW(L"MR CLI FOR FFMPEG v1.2.0");
 }
 
 void clearScreen() {
+    if (cout.fail() || cout.bad()) {
+        cout.clear();
+    }
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
     if (hOut == INVALID_HANDLE_VALUE) {
         cout << "\033[2J\033[H" << flush;
@@ -2846,6 +2905,9 @@ string formatMediaPropertiesDisplay(const MediaProperties& mp) {
 
 // ========== EXECUTE FFMPEG WITH LIVE PROGRESS ==========
 bool execFFmpegWithProgress(const wstring& cmdLine, double totalDuration = 0) {
+    if (cout.fail() || cout.bad()) {
+        cout.clear();
+    }
     g_ffmpegEscaped = false;
     SECURITY_ATTRIBUTES sa = {};
     sa.nLength = sizeof(SECURITY_ATTRIBUTES);
@@ -3080,7 +3142,7 @@ string pairStatusLine(const PairJob& job, int slot) {
     size_t dot = name.find_last_of('.');
     if (dot != string::npos && dot > 0) name = name.substr(0, dot);
     const size_t maxName = 40;
-    if (name.size() > maxName) name = name.substr(0, maxName - 3) + "...";
+    name = truncateUtf8(name, maxName);
 
     char head[16];
     snprintf(head, sizeof(head), "[%d] ", slot);
@@ -3110,6 +3172,9 @@ string pairStatusLine(const PairJob& job, int slot) {
 int g_pairRenderedLines = 0;
 
 void renderPairStatus(const PairJob& a, const PairJob& b) {
+    if (cout.fail() || cout.bad()) {
+        cout.clear();
+    }
     if (g_pairRenderedLines > 0) {
         cout << "\033[" << g_pairRenderedLines << "A\r\033[J";
     }
@@ -3122,6 +3187,9 @@ void renderPairStatus(const PairJob& a, const PairJob& b) {
 // Runs both jobs to completion, repainting the two status lines in place.
 // Returns true only if BOTH finished with exit code 0.
 bool execFFmpegPair(PairJob& a, PairJob& b, bool& escaped) {
+    if (cout.fail() || cout.bad()) {
+        cout.clear();
+    }
     escaped = false;
     g_pairRenderedLines = 0;
     bool okA = false, okB = false;
@@ -4806,10 +4874,9 @@ void batchCompressVideo() {
         while (true) {
             cout << "\n";
             printColor("========================================", CYAN);
-            char label[128];
-            snprintf(label, sizeof(label), " %s %zu / %zu - %s",
-                     tr("Processing", "Обработка").c_str(), currentNum, totalNum,
-                     fs::u8path(filePath).filename().u8string().c_str());
+            string label = " " + tr("Processing", "Обработка") + " " +
+                           to_string(currentNum) + " / " + to_string(totalNum) + " - " +
+                           fs::u8path(filePath).filename().u8string();
             printColor(label, CYAN);
             printColor(" \"" + filePath + "\"", CYAN);
             printColor("========================================", CYAN);
@@ -5543,12 +5610,9 @@ void batchCompressVideo() {
              << " | " << left << setw(21) << tr("Used Track", "Использованная") << " |\n";
         cout << " +------------------------------------------+-----------------------+-----------------------+\n";
         for (const auto& bw : batchAudioWarnings) {
-            string shortFile = bw.fileName;
-            if (shortFile.length() > 40) shortFile = shortFile.substr(0, 37) + "...";
-            string shortPref = bw.preferredTrack;
-            if (shortPref.length() > 21) shortPref = shortPref.substr(0, 18) + "...";
-            string shortAct = bw.actualTrack;
-            if (shortAct.length() > 21) shortAct = shortAct.substr(0, 18) + "...";
+            string shortFile = truncateUtf8(bw.fileName, 40);
+            string shortPref = truncateUtf8(bw.preferredTrack, 21);
+            string shortAct = truncateUtf8(bw.actualTrack, 21);
 
             cout << " | " << left << setw(40) << shortFile
                  << " | " << left << setw(21) << shortPref
@@ -5665,10 +5729,9 @@ void batchCompressAudio() {
     while (i < files.size()) {
         cout << "\n";
         printColor("========================================", CYAN);
-        char label[128];
-        snprintf(label, sizeof(label), " %s %zu / %zu - %s",
-                 tr("Processing", "Обработка").c_str(), i + 1, files.size(),
-                 fs::u8path(files[i]).filename().u8string().c_str());
+        string label = " " + tr("Processing", "Обработка") + " " +
+                       to_string(i + 1) + " / " + to_string(files.size()) + " - " +
+                       fs::u8path(files[i]).filename().u8string();
         printColor(label, CYAN);
         printColor(" \"" + files[i] + "\"", CYAN);
         printColor("========================================", CYAN);
@@ -9000,7 +9063,7 @@ char mainMenuSelect() {
     while (true) {
         clearScreen();
         printColor("========================================", CYAN);
-        printColor(" MR CLI FOR FFMPEG v1.1.6", CYAN);
+        printColor(" MR CLI FOR FFMPEG v1.2.0", CYAN);
         printColor("========================================", CYAN);
         printColor("========================================", GREEN);
         printColor(" FFMPEG:  " + string(FFMPEG_FOUND ? tr("[OK] installed", "[OK] установлен") : tr("[ERROR] not found", "[ОШИБКА] не найден")), FFMPEG_FOUND ? GREEN : RED);
@@ -9050,6 +9113,9 @@ char mainMenuSelect() {
 }
 
 int main() {
+#if defined(MR_MODULAR_APP)
+    return mr::app::Application::instance().run();
+#else
     // Initialize COM for Windows Shell, Folder Dialogs, and Shell Zip extraction
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
@@ -9128,4 +9194,5 @@ int main() {
 
     CoUninitialize();
     return 0;
+#endif
 }

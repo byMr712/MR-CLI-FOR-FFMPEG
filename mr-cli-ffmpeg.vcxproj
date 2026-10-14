@@ -74,7 +74,7 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;MR_MODULAR_APP;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
@@ -92,7 +92,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;MR_MODULAR_APP;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
@@ -125,7 +125,7 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;MR_MODULAR_APP;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
@@ -143,7 +143,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;MR_MODULAR_APP;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
@@ -174,9 +174,76 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="mr-cli-ffmpeg.cpp" />
+    <ClCompile Include="src\core\BitsDownloader.cpp" />
+    <ClCompile Include="src\core\Console.cpp" />
+    <ClCompile Include="src\core\PathProvider.cpp" />
+    <ClCompile Include="src\core\ProcessRunner.cpp" />
+    <ClCompile Include="src\core\ShellDialogs.cpp" />
+    <ClCompile Include="src\core\ZipInflate.cpp" />
+    <ClCompile Include="src\services\ComponentInstaller.cpp" />
+    <ClCompile Include="src\services\ConfigService.cpp" />
+    <ClCompile Include="src\services\CoverService.cpp" />
+    <ClCompile Include="src\services\EncodingProblemDetector.cpp" />
+    <ClCompile Include="src\services\ExactTrimService.cpp" />
+    <ClCompile Include="src\services\FfmpegCommandBuilder.cpp" />
+    <ClCompile Include="src\services\FfmpegRunner.cpp" />
+    <ClCompile Include="src\services\FfprobeService.cpp" />
+    <ClCompile Include="src\services\GpuDetector.cpp" />
+    <ClCompile Include="src\services\LocalizationService.cpp" />
+    <ClCompile Include="src\services\PairProcessingService.cpp" />
+    <ClCompile Include="src\services\ProbeCacheService.cpp" />
+    <ClCompile Include="src\ui\Dialogs.cpp" />
+    <ClCompile Include="src\ui\Menu.cpp" />
+    <ClCompile Include="src\operations\OperationRegistry.cpp" />
+    <ClCompile Include="src\operations\SingleOperations.cpp" />
+    <ClCompile Include="src\operations\BatchVideoOperation.cpp" />
+    <ClCompile Include="src\operations\BatchAudioOperation.cpp" />
+    <ClCompile Include="src\operations\SettingsOperation.cpp" />
+    <ClCompile Include="src\app\Application.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="resource.h" />
+    <ClInclude Include="src\core\BitsDownloader.hpp" />
+    <ClInclude Include="src\core\Clipboard.hpp" />
+    <ClInclude Include="src\core\Console.hpp" />
+    <ClInclude Include="src\core\NumberFormat.hpp" />
+    <ClInclude Include="src\core\PathProvider.hpp" />
+    <ClInclude Include="src\core\ProcessRunner.hpp" />
+    <ClInclude Include="src\core\Result.hpp" />
+    <ClInclude Include="src\core\ShellDialogs.hpp" />
+    <ClInclude Include="src\core\StringUtil.hpp" />
+    <ClInclude Include="src\core\UniqueHandle.hpp" />
+    <ClInclude Include="src\core\WinLibs.hpp" />
+    <ClInclude Include="src\core\ZipInflate.hpp" />
+    <ClInclude Include="src\domain\AppConfig.hpp" />
+    <ClInclude Include="src\domain\EncodingProblem.hpp" />
+    <ClInclude Include="src\domain\Enums.hpp" />
+    <ClInclude Include="src\domain\MediaProperties.hpp" />
+    <ClInclude Include="src\domain\PairProcessing.hpp" />
+    <ClInclude Include="src\domain\TrackInfo.hpp" />
+    <ClInclude Include="src\domain\TrackPreference.hpp" />
+    <ClInclude Include="src\services\ComponentInstaller.hpp" />
+    <ClInclude Include="src\services\ConfigService.hpp" />
+    <ClInclude Include="src\services\CoverService.hpp" />
+    <ClInclude Include="src\services\EncodingProblemDetector.hpp" />
+    <ClInclude Include="src\services\ExactTrimService.hpp" />
+    <ClInclude Include="src\services\FfmpegCommandBuilder.hpp" />
+    <ClInclude Include="src\services\FfmpegRunner.hpp" />
+    <ClInclude Include="src\services\FfprobeService.hpp" />
+    <ClInclude Include="src\services\GpuDetector.hpp" />
+    <ClInclude Include="src\services\LocalizationService.hpp" />
+    <ClInclude Include="src\services\PairProcessingService.hpp" />
+    <ClInclude Include="src\services\ProbeCacheService.hpp" />
+    <ClInclude Include="src\ui\Dialogs.hpp" />
+    <ClInclude Include="src\ui\Menu.hpp" />
+    <ClInclude Include="src\operations\IOperation.hpp" />
+    <ClInclude Include="src\operations\OperationRegistry.hpp" />
+    <ClInclude Include="src\operations\SingleOperations.hpp" />
+    <ClInclude Include="src\operations\BatchVideoOperation.hpp" />
+    <ClInclude Include="src\operations\BatchAudioOperation.hpp" />
+    <ClInclude Include="src\operations\SettingsOperation.hpp" />
+    <ClInclude Include="src\app\AppContext.hpp" />
+    <ClInclude Include="src\app\Application.hpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="mr-cli-ffmpeg.rc" />
