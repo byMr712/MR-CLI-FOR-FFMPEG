@@ -173,6 +173,7 @@ void BatchVideoOperation::execute() {
             string streamMapArg = FfprobeService::buildStreamMapArgs(videoMapArg, audioMapArg);
 
             wstring cmd = L"\"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ctx.installer.getFfmpegPath())) + L"\"";
+            cmd += L" -nostdin";
             cmd += L" -i \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(filePath)) + L"\"";
             if (!streamMapArg.empty()) cmd += StringUtil::utf8ToWstring(streamMapArg);
             cmd += L" " + StringUtil::utf8ToWstring(FfmpegCommandBuilder::getVideoCodecArgs(cfg.accelMode, cfg.hybridGpuChoice, cfg.outputFormat));
@@ -232,18 +233,12 @@ void BatchVideoOperation::execute() {
                 bool conveyorEscaped = false;
 
                 while (slot1.active || slot2.active) {
-                    while (_kbhit()) {
-                        int key = _getch();
-                        if (key == 0 || key == 0xE0) {
-                            if (_kbhit()) _getch();
-                        } else if (key == 27) { // ESC
-                            conveyorEscaped = true;
-                            if (slot1.active && slot1.job.running) TerminateProcess(slot1.job.pi.hProcess, 1);
-                            if (slot2.active && slot2.job.running) TerminateProcess(slot2.job.pi.hProcess, 1);
-                            break;
-                        }
+                    if (Console::isEscapePressed()) {
+                        conveyorEscaped = true;
+                        if (slot1.active && slot1.job.running) TerminateProcess(slot1.job.pi.hProcess, 1);
+                        if (slot2.active && slot2.job.running) TerminateProcess(slot2.job.pi.hProcess, 1);
+                        break;
                     }
-                    if (conveyorEscaped) break;
 
                     if (slot1.active) PairProcessingService::consumeOutput(slot1.job);
                     if (slot2.active) PairProcessingService::consumeOutput(slot2.job);

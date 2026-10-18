@@ -18,6 +18,14 @@ void Console::initUTF8() noexcept {
         dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
         SetConsoleMode(hOut, dwMode);
     }
+
+    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD inMode = 0;
+    if (GetConsoleMode(hIn, &inMode)) {
+        inMode &= ~ENABLE_QUICK_EDIT_MODE;
+        inMode |= ENABLE_EXTENDED_FLAGS;
+        SetConsoleMode(hIn, inMode);
+    }
 }
 
 void Console::setColor(ConsoleColor c) noexcept {
@@ -130,6 +138,53 @@ bool Console::inputLineWithEscape(std::string& result, const std::string& prompt
 
     result = StringUtil::wstringToUtf8(buffer);
     return true;
+}
+
+bool Console::isEscapePressed() noexcept {
+    HWND hConsole = GetConsoleWindow();
+    HWND hForeground = GetForegroundWindow();
+
+    bool isWindowActive = false;
+    if (hConsole != NULL && hForeground != NULL) {
+        if (hConsole == hForeground) {
+            isWindowActive = true;
+        } else {
+            DWORD fgPid = 0;
+            GetWindowThreadProcessId(hForeground, &fgPid);
+            DWORD curPid = GetCurrentProcessId();
+            if (fgPid == curPid) {
+                isWindowActive = true;
+            } else {
+                HWND parent = hConsole;
+                while (parent != NULL) {
+                    if (parent == hForeground) { isWindowActive = true; break; }
+                    parent = GetParent(parent);
+                }
+            }
+        }
+    } else {
+        isWindowActive = true;
+    }
+
+    if (isWindowActive) {
+        SHORT state = GetAsyncKeyState(VK_ESCAPE);
+        if ((state & 0x8000) != 0 || (state & 0x0001) != 0) {
+            flushInput();
+            return true;
+        }
+    }
+
+    while (_kbhit()) {
+        int key = _getch();
+        if (key == 0 || key == 0xE0) {
+            if (_kbhit()) _getch();
+        } else if (key == 27) {
+            flushInput();
+            return true;
+        }
+    }
+
+    return false;
 }
 
 } // namespace core

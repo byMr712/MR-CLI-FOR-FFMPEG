@@ -93,15 +93,24 @@ bool FfmpegRunner::executeWithProgress(const std::wstring& cmdLine, double total
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = hWritePipe;
     si.hStdError = hWritePipe;
+    HANDLE hNul = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+    si.hStdInput = (hNul != INVALID_HANDLE_VALUE) ? hNul : NULL;
 
     PROCESS_INFORMATION pi = {};
     std::wstring mutableCmd = cmdLine;
+    if (mutableCmd.find(L"-nostdin") == std::wstring::npos) {
+        size_t firstSpace = mutableCmd.find(L' ');
+        if (firstSpace != std::wstring::npos) {
+            mutableCmd.insert(firstSpace, L" -nostdin");
+        }
+    }
 
     BOOL success = CreateProcessW(
         NULL, &mutableCmd[0], NULL, NULL,
         TRUE, 0, NULL, NULL, &si, &pi
     );
     CloseHandle(hWritePipe);
+    if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
 
     if (!success) {
         CloseHandle(hReadPipe);
@@ -116,21 +125,15 @@ bool FfmpegRunner::executeWithProgress(const std::wstring& cmdLine, double total
     ULONGLONG lastRenderTime = 0;
 
     while (true) {
-        while (_kbhit()) {
-            int key = _getch();
-            if (key == 0 || key == 0xE0) {
-                if (_kbhit()) _getch();
-            } else if (key == 27) { // ESC
-                if (progressActive) {
-                    std::cout << std::endl;
-                    progressActive = false;
-                }
-                outEscaped = true;
-                TerminateProcess(pi.hProcess, 1);
-                break;
+        if (core::Console::isEscapePressed()) {
+            if (progressActive) {
+                std::cout << std::endl;
+                progressActive = false;
             }
+            outEscaped = true;
+            TerminateProcess(pi.hProcess, 1);
+            break;
         }
-        if (outEscaped) break;
 
         DWORD avail = 0;
         if (!PeekNamedPipe(hReadPipe, NULL, 0, NULL, &avail, NULL) || avail == 0) {

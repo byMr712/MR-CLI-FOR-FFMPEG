@@ -15,6 +15,8 @@ namespace services {
 static int s_pairRenderedLines = 0;
 
 bool PairProcessingService::spawnJob(domain::PairJob& job, const std::wstring& cmdLine, const std::string& fileName, double duration) {
+    job = domain::PairJob();
+
     SECURITY_ATTRIBUTES sa = {};
     sa.nLength = sizeof(SECURITY_ATTRIBUTES);
     sa.bInheritHandle = TRUE;
@@ -28,15 +30,27 @@ bool PairProcessingService::spawnJob(domain::PairJob& job, const std::wstring& c
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = hWrite;
     si.hStdError = hWrite;
+    HANDLE hNul = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+    si.hStdInput = (hNul != INVALID_HANDLE_VALUE) ? hNul : NULL;
 
     std::wstring mutableCmd = cmdLine;
+    if (mutableCmd.find(L"-nostdin") == std::wstring::npos) {
+        size_t firstSpace = mutableCmd.find(L' ');
+        if (firstSpace != std::wstring::npos) {
+            mutableCmd.insert(firstSpace, L" -nostdin");
+        }
+    }
+
     if (!CreateProcessW(NULL, &mutableCmd[0], NULL, NULL, TRUE, 0, NULL, NULL, &si, &job.pi)) {
         CloseHandle(job.hRead);
         job.hRead = INVALID_HANDLE_VALUE;
         CloseHandle(hWrite);
+        if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
         return false;
     }
     CloseHandle(hWrite);
+    if (hNul != INVALID_HANDLE_VALUE) CloseHandle(hNul);
+
     job.fileName = fileName;
     job.duration = duration;
     job.running = true;
@@ -205,18 +219,12 @@ bool PairProcessingService::executePair(domain::PairJob& a, domain::PairJob& b, 
     lastRenderTime = GetTickCount64();
 
     while (a.running || b.running) {
-        while (_kbhit()) {
-            int key = _getch();
-            if (key == 0 || key == 0xE0) {
-                if (_kbhit()) _getch();
-            } else if (key == 27) { // ESC
-                outEscaped = true;
-                if (a.running) TerminateProcess(a.pi.hProcess, 1);
-                if (b.running) TerminateProcess(b.pi.hProcess, 1);
-                break;
-            }
+        if (core::Console::isEscapePressed()) {
+            outEscaped = true;
+            if (a.running) TerminateProcess(a.pi.hProcess, 1);
+            if (b.running) TerminateProcess(b.pi.hProcess, 1);
+            break;
         }
-        if (outEscaped) break;
 
         consumeOutput(a);
         consumeOutput(b);

@@ -148,6 +148,7 @@ void BatchAudioOperation::execute() {
         string codecArgs = FfmpegCommandBuilder::getAudioCodecArgs(effCodec, cfg.audioBitrate, "");
 
         wstring cmd = L"\"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ctx.installer.getFfmpegPath())) + L"\"";
+        cmd += L" -nostdin";
         cmd += L" -i \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(inPath)) + L"\"";
         cmd += L" -vn " + StringUtil::utf8ToWstring(codecArgs);
         if (!cfg.keepMetadata) cmd += L" -map_metadata -1";
