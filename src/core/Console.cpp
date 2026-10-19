@@ -71,6 +71,9 @@ void Console::flushInput() noexcept {
     if (hIn != INVALID_HANDLE_VALUE && hIn != NULL) {
         FlushConsoleInputBuffer(hIn);
     }
+    while (_kbhit()) {
+        _getch();
+    }
 }
 
 void Console::waitForKey() noexcept {
@@ -141,36 +144,22 @@ bool Console::inputLineWithEscape(std::string& result, const std::string& prompt
 }
 
 bool Console::isEscapePressed() noexcept {
-    HWND hConsole = GetConsoleWindow();
-    HWND hForeground = GetForegroundWindow();
-
-    bool isWindowActive = false;
-    if (hConsole != NULL && hForeground != NULL) {
-        if (hConsole == hForeground) {
-            isWindowActive = true;
-        } else {
-            DWORD fgPid = 0;
-            GetWindowThreadProcessId(hForeground, &fgPid);
-            DWORD curPid = GetCurrentProcessId();
-            if (fgPid == curPid) {
-                isWindowActive = true;
-            } else {
-                HWND parent = hConsole;
-                while (parent != NULL) {
-                    if (parent == hForeground) { isWindowActive = true; break; }
-                    parent = GetParent(parent);
+    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+    if (hIn != INVALID_HANDLE_VALUE && hIn != NULL) {
+        DWORD numEvents = 0;
+        if (GetNumberOfConsoleInputEvents(hIn, &numEvents) && numEvents > 0) {
+            INPUT_RECORD records[32];
+            DWORD eventsRead = 0;
+            if (PeekConsoleInputW(hIn, records, 32, &eventsRead) && eventsRead > 0) {
+                for (DWORD i = 0; i < eventsRead; ++i) {
+                    if (records[i].EventType == KEY_EVENT && records[i].Event.KeyEvent.bKeyDown) {
+                        if (records[i].Event.KeyEvent.wVirtualKeyCode == VK_ESCAPE) {
+                            flushInput();
+                            return true;
+                        }
+                    }
                 }
             }
-        }
-    } else {
-        isWindowActive = true;
-    }
-
-    if (isWindowActive) {
-        SHORT state = GetAsyncKeyState(VK_ESCAPE);
-        if ((state & 0x8000) != 0 || (state & 0x0001) != 0) {
-            flushInput();
-            return true;
         }
     }
 
