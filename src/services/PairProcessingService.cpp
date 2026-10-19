@@ -72,7 +72,7 @@ void PairProcessingService::consumeOutput(domain::PairJob& job) {
                         std::string timeStr, spd;
                         if (FfmpegRunner::parseFFmpegProgress(job.pending, timeStr, spd)) {
                             job.currentSec = FfmpegRunner::timeToSeconds(timeStr);
-                            if (!spd.empty()) job.speed = spd;
+                            if (!spd.empty() && spd != "N/A") job.speed = spd;
                         } else if (job.pending.find("rror") != std::string::npos &&
                                    job.pending.find("encoder") == std::string::npos) {
                             job.errorSeen = true;
@@ -139,7 +139,7 @@ std::string PairProcessingService::statusLine(const domain::PairJob& job, int sl
         percent = (job.exitCode == 0) ? 100 : percent;
     }
 
-    const int barWidth = 22;
+    const int barWidth = 16;
     int filled = static_cast<int>(static_cast<long long>(barWidth) * percent / 100);
     if (filled < 0) filled = 0;
     if (filled > barWidth) filled = barWidth;
@@ -147,7 +147,7 @@ std::string PairProcessingService::statusLine(const domain::PairJob& job, int sl
     std::string name = job.fileName;
     size_t dot = name.find_last_of('.');
     if (dot != std::string::npos && dot > 0) name = name.substr(0, dot);
-    const size_t maxName = 40;
+    const size_t maxName = 22;
     name = core::StringUtil::truncateUtf8(name, maxName);
 
     char head[16];
@@ -160,7 +160,7 @@ std::string PairProcessingService::statusLine(const domain::PairJob& job, int sl
     char pct[16];
     snprintf(pct, sizeof(pct), "%3d%%", percent);
     out += pct;
-    if (!job.speed.empty()) out += "  " + job.speed;
+    if (!job.speed.empty() && job.speed != "N/A") out += "  " + job.speed;
     out += "  " + timeLabel(job.currentSec) + "/" + timeLabel(job.duration);
 
     if (!job.running) {
@@ -348,8 +348,9 @@ bool PairProcessingService::tryPrepare(const std::string& curPath,
         }
     }
 
-    if (FfmpegCommandBuilder::buildOutputPath(nextPath, cfg.outputPath, cfg.overwriteFiles, cfg.outputFormat, "_compressed") ==
-        FfmpegCommandBuilder::buildOutputPath(curPath, cfg.outputPath, cfg.overwriteFiles, cfg.outputFormat, "_compressed")) {
+    bool delOrig = (cfg.deleteOriginal == "yes" || cfg.deleteOriginal == "always");
+    if (FfmpegCommandBuilder::buildOutputPath(nextPath, cfg.outputPath, delOrig, cfg.outputFormat, "_compressed") ==
+        FfmpegCommandBuilder::buildOutputPath(curPath, cfg.outputPath, delOrig, cfg.outputFormat, "_compressed")) {
         nextResolvable = false;
     }
 

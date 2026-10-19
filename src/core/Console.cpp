@@ -187,5 +187,18 @@ bool Console::isEscapePressed() noexcept {
     return false;
 }
 
+int Console::getConsoleWidth() noexcept {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut != INVALID_HANDLE_VALUE && hOut != NULL) {
+        CONSOLE_SCREEN_BUFFER_INFO csbi;
+        if (GetConsoleScreenBufferInfo(hOut, &csbi)) {
+            int w = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+            if (w > 0) return w;
+            if (csbi.dwSize.X > 0) return csbi.dwSize.X;
+        }
+    }
+    return 80;
+}
+
 } // namespace core
 } // namespace mr

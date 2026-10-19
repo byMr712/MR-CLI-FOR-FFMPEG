@@ -71,8 +71,6 @@ void ConvertVideoOperation::execute() {
     }
 
     double duration = ctx.ffprobeService.getMediaDuration(inputFile);
-    string outPath = FfmpegCommandBuilder::buildOutputPath(inputFile, cfg.outputPath, cfg.overwriteFiles, cfg.outputFormat, "_converted");
-    auto ft = FfmpegCommandBuilder::prepareTarget(outPath, {inputFile});
 
     bool useCPU = false;
     bool useHybrid = false;
@@ -161,6 +159,9 @@ void ConvertVideoOperation::execute() {
     bool deleteOrig = false;
     if (!Dialogs::promptDeleteOriginal(false, cfg.deleteOriginal, deleteOrig)) return;
 
+    string outPath = FfmpegCommandBuilder::buildOutputPath(inputFile, cfg.outputPath, deleteOrig, currentFmt, "_converted");
+    auto ft = FfmpegCommandBuilder::prepareTarget(outPath, {inputFile});
+
     AccelMode effectiveMode = cfg.accelMode;
     if (useCPU) effectiveMode = AccelMode::CPU_ONLY;
     else if (useHybrid) effectiveMode = AccelMode::CPU_DEC_GPU_ENC;
@@ -169,19 +170,8 @@ void ConvertVideoOperation::execute() {
     wstring cmd = L"\"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ctx.installer.getFfmpegPath())) + L"\"";
     cmd += L" -i \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(inputFile)) + L"\"";
 
-    wstring coverAttachArgs;
-    bool hasCoverAttach = false;
-    string outExt = FfmpegCommandBuilder::getOutputExtension(currentFmt);
-    if (cfg.saveCover && !outExt.empty()) {
-        hasCoverAttach = ctx.coverService.buildCoverAttachArgs(outExt, inputFile, coverAttachArgs);
-        if (hasCoverAttach) {
-            cmd += coverAttachArgs;
-            ft.coverEmbedded = true;
-        }
-    }
-
-    if (!videoMapArg.empty()) cmd += StringUtil::utf8ToWstring(videoMapArg);
-    if (!audioMapArg.empty()) cmd += StringUtil::utf8ToWstring(audioMapArg);
+    string streamMapArg = FfprobeService::buildStreamMapArgs(videoMapArg, audioMapArg);
+    if (!streamMapArg.empty()) cmd += StringUtil::utf8ToWstring(streamMapArg);
 
     string vf = FfmpegCommandBuilder::buildVideoFilterSpec(inputFile, ctx.ffprobeService, cfg.outputResolution, useAutoAlign, useDownscale4K, subHardsubFilter);
     if (!vf.empty()) cmd += L" " + StringUtil::utf8ToWstring(vf);
@@ -194,7 +184,7 @@ void ConvertVideoOperation::execute() {
     if (!cfg.customFfmpegArgs.empty()) cmd += L" " + StringUtil::utf8ToWstring(cfg.customFfmpegArgs);
     if (!subExtraArgs.empty()) cmd += L" " + StringUtil::utf8ToWstring(subExtraArgs);
     if (!cfg.keepMetadata) cmd += L" -map_metadata -1";
-    if (cfg.overwriteFiles) cmd += L" -y";
+    cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     Console::clearScreen();
@@ -309,14 +299,18 @@ void TrimVideoOperation::execute() {
     if (modeChoice < 0) return;
     bool isExactMode = (modeChoice == 1);
 
-    string outPath = FfmpegCommandBuilder::buildOutputPath(inputFile, cfg.outputPath, cfg.overwriteFiles, cfg.outputFormat, "_trimmed");
+    bool deleteOrig = false;
+    if (!Dialogs::promptDeleteOriginal(false, cfg.deleteOriginal, deleteOrig)) return;
+
+    string outPath = FfmpegCommandBuilder::buildOutputPath(inputFile, cfg.outputPath, deleteOrig, cfg.outputFormat, "_trimmed");
     auto ft = FfmpegCommandBuilder::prepareTarget(outPath, {inputFile});
 
     wstring cmd = L"\"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ctx.installer.getFfmpegPath())) + L"\"";
     cmd += L" -ss " + StringUtil::utf8ToWstring(startTime);
     cmd += L" -i \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(inputFile)) + L"\"";
     cmd += L" -t " + StringUtil::utf8ToWstring(NumberFormat::formatDot(trimDuration, 3));
-    if (!videoMapArg.empty()) cmd += StringUtil::utf8ToWstring(videoMapArg);
+    string streamMapArg = FfprobeService::buildStreamMapArgs(videoMapArg, "");
+    if (!streamMapArg.empty()) cmd += StringUtil::utf8ToWstring(streamMapArg);
 
     if (isExactMode) {
         ExactTrimCodecs etc = ExactTrimService::buildExactTrimCodecs(inputFile, selectedVideoIndex, cfg.audioCodec, ctx.ffprobeService);
@@ -327,7 +321,7 @@ void TrimVideoOperation::execute() {
         cmd += L" -c copy";
     }
 
-    if (cfg.overwriteFiles) cmd += L" -y";
+    cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     Console::clearScreen();
@@ -342,6 +336,7 @@ void TrimVideoOperation::execute() {
     ok = FfmpegCommandBuilder::finalizeTarget(ft, ok, &ctx.coverService, cfg.saveCover);
 
     if (ok) {
+        Dialogs::handleOriginalDeletion(inputFile, outPath, ft.isTemp, deleteOrig);
         double actualDur = ctx.ffprobeService.getMediaDuration(outPath);
         Console::printColor("\n========================================", Console::Color::GREEN);
         Console::printColor(TR("[OK] Video trimmed successfully!", "[OK] Видео успешно обрезано!"), Console::Color::GREEN);
@@ -422,15 +417,16 @@ void ChangeResolutionOperation::execute() {
     bool deleteOrig = false;
     if (!Dialogs::promptDeleteOriginal(false, cfg.deleteOriginal, deleteOrig)) return;
 
-    string outPath = FfmpegCommandBuilder::buildOutputPath(inputFile, cfg.outputPath, cfg.overwriteFiles, cfg.outputFormat, "_res");
+    string outPath = FfmpegCommandBuilder::buildOutputPath(inputFile, cfg.outputPath, deleteOrig, cfg.outputFormat, "_res");
     auto ft = FfmpegCommandBuilder::prepareTarget(outPath, {inputFile});
 
     wstring cmd = L"\"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ctx.installer.getFfmpegPath())) + L"\"";
     cmd += L" -i \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(inputFile)) + L"\"";
-    if (!videoMapArg.empty()) cmd += StringUtil::utf8ToWstring(videoMapArg);
+    string streamMapArg = FfprobeService::buildStreamMapArgs(videoMapArg, "");
+    if (!streamMapArg.empty()) cmd += StringUtil::utf8ToWstring(streamMapArg);
     cmd += L" -vf \"scale=" + StringUtil::utf8ToWstring(targetScale) + L":force_original_aspect_ratio=decrease,pad=" + StringUtil::utf8ToWstring(targetScale) + L":(ow-iw)/2:(oh-ih)/2\"";
     cmd += L" -c:a copy";
-    if (cfg.overwriteFiles) cmd += L" -y";
+    cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     Console::clearScreen();
@@ -517,9 +513,12 @@ void ChangeSpeedOperation::execute() {
         }
     }
 
+    bool deleteOrig = false;
+    if (!Dialogs::promptDeleteOriginal(false, cfg.deleteOriginal, deleteOrig)) return;
+
     double ptsFactor = 1.0 / speed;
     string speedTag = "_speed" + NumberFormat::formatDot(speed, 2);
-    string outPath = FfmpegCommandBuilder::buildOutputPath(inputFile, cfg.outputPath, cfg.overwriteFiles, cfg.outputFormat, speedTag);
+    string outPath = FfmpegCommandBuilder::buildOutputPath(inputFile, cfg.outputPath, deleteOrig, cfg.outputFormat, speedTag);
     auto ft = FfmpegCommandBuilder::prepareTarget(outPath, {inputFile});
 
     // Audio tempo chain (atempo is restricted to 0.5-2.0 per filter instance)
@@ -542,7 +541,7 @@ void ChangeSpeedOperation::execute() {
     cmd += L" -i \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(inputFile)) + L"\"";
     cmd += L" -filter_complex \"[0:v]setpts=" + StringUtil::utf8ToWstring(NumberFormat::formatDot(ptsFactor, 4)) + L"*PTS[v];[0:a]" + StringUtil::utf8ToWstring(atempoFilter) + L"[a]\"";
     cmd += L" -map \"[v]\" -map \"[a]\"";
-    if (cfg.overwriteFiles) cmd += L" -y";
+    cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     Console::clearScreen();
@@ -558,6 +557,7 @@ void ChangeSpeedOperation::execute() {
     ok = FfmpegCommandBuilder::finalizeTarget(ft, ok, &ctx.coverService, cfg.saveCover);
 
     if (ok) {
+        Dialogs::handleOriginalDeletion(inputFile, outPath, ft.isTemp, deleteOrig);
         Console::printColor("\n========================================", Console::Color::GREEN);
         Console::printColor(TR("[OK] Speed changed successfully!", "[OK] Скорость успешно изменена!"), Console::Color::GREEN);
         Console::printColor(TR("Output: ", "Выход: ") + outPath, Console::Color::GREEN);
@@ -616,13 +616,16 @@ void RotateVideoOperation::execute() {
         case 4: filter = "vflip"; break;
     }
 
-    string outPath = FfmpegCommandBuilder::buildOutputPath(inputFile, cfg.outputPath, cfg.overwriteFiles, cfg.outputFormat, "_rotated");
+    bool deleteOrig = false;
+    if (!Dialogs::promptDeleteOriginal(false, cfg.deleteOriginal, deleteOrig)) return;
+
+    string outPath = FfmpegCommandBuilder::buildOutputPath(inputFile, cfg.outputPath, deleteOrig, cfg.outputFormat, "_rotated");
     auto ft = FfmpegCommandBuilder::prepareTarget(outPath, {inputFile});
 
     wstring cmd = L"\"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ctx.installer.getFfmpegPath())) + L"\"";
     cmd += L" -i \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(inputFile)) + L"\"";
     cmd += L" -vf \"" + StringUtil::utf8ToWstring(filter) + L"\" -c:a copy";
-    if (cfg.overwriteFiles) cmd += L" -y";
+    cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     Console::clearScreen();
@@ -637,6 +640,7 @@ void RotateVideoOperation::execute() {
     ok = FfmpegCommandBuilder::finalizeTarget(ft, ok, &ctx.coverService, cfg.saveCover);
 
     if (ok) {
+        Dialogs::handleOriginalDeletion(inputFile, outPath, ft.isTemp, deleteOrig);
         Console::printColor("\n========================================", Console::Color::GREEN);
         Console::printColor(TR("[OK] Video rotated successfully!", "[OK] Видео успешно повернуто!"), Console::Color::GREEN);
         Console::printColor(TR("Output: ", "Выход: ") + outPath, Console::Color::GREEN);
@@ -685,7 +689,10 @@ void CompressVideoOperation::execute() {
     int sel = Menu::arrowSelect(TR("SELECT COMPRESSION METHOD", "ВЫБЕРИТЕ МЕТОД СЖАТИЯ"), "", compOpts, 2);
     if (sel < 0) return;
 
-    string outPath = FfmpegCommandBuilder::buildOutputPath(inputFile, cfg.outputPath, cfg.overwriteFiles, cfg.outputFormat, "_compressed");
+    bool deleteOrig = false;
+    if (!Dialogs::promptDeleteOriginal(false, cfg.deleteOriginal, deleteOrig)) return;
+
+    string outPath = FfmpegCommandBuilder::buildOutputPath(inputFile, cfg.outputPath, deleteOrig, cfg.outputFormat, "_compressed");
     auto ft = FfmpegCommandBuilder::prepareTarget(outPath, {inputFile});
 
     wstring cmd = L"\"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ctx.installer.getFfmpegPath())) + L"\"";
@@ -716,7 +723,7 @@ void CompressVideoOperation::execute() {
         cmd += L" -c:a aac -b:a 128k";
     }
 
-    if (cfg.overwriteFiles) cmd += L" -y";
+    cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     Console::clearScreen();
@@ -731,6 +738,7 @@ void CompressVideoOperation::execute() {
     ok = FfmpegCommandBuilder::finalizeTarget(ft, ok, &ctx.coverService, cfg.saveCover);
 
     if (ok) {
+        Dialogs::handleOriginalDeletion(inputFile, outPath, ft.isTemp, deleteOrig);
         Console::printColor("\n========================================", Console::Color::GREEN);
         Console::printColor(TR("[OK] Video compressed successfully!", "[OK] Видео успешно сжато!"), Console::Color::GREEN);
         Console::printColor(TR("Output: ", "Выход: ") + outPath, Console::Color::GREEN);
@@ -796,7 +804,10 @@ void AddWatermarkOperation::execute() {
         case 4: overlayPos = "(main_w-overlay_w)/2:(main_h-overlay_h)/2"; break;
     }
 
-    string outPath = FfmpegCommandBuilder::buildOutputPath(videoFile, cfg.outputPath, cfg.overwriteFiles, cfg.outputFormat, "_watermarked");
+    bool deleteOrig = false;
+    if (!Dialogs::promptDeleteOriginal(false, cfg.deleteOriginal, deleteOrig)) return;
+
+    string outPath = FfmpegCommandBuilder::buildOutputPath(videoFile, cfg.outputPath, deleteOrig, cfg.outputFormat, "_watermarked");
     auto ft = FfmpegCommandBuilder::prepareTarget(outPath, {videoFile});
 
     wstring cmd = L"\"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ctx.installer.getFfmpegPath())) + L"\"";
@@ -804,7 +815,7 @@ void AddWatermarkOperation::execute() {
     cmd += L" -i \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(imageFile)) + L"\"";
     cmd += L" -filter_complex \"overlay=" + StringUtil::utf8ToWstring(overlayPos) + L"\"";
     cmd += L" -c:a copy";
-    if (cfg.overwriteFiles) cmd += L" -y";
+    cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     Console::clearScreen();
@@ -819,6 +830,7 @@ void AddWatermarkOperation::execute() {
     ok = FfmpegCommandBuilder::finalizeTarget(ft, ok, &ctx.coverService, cfg.saveCover);
 
     if (ok) {
+        Dialogs::handleOriginalDeletion(videoFile, outPath, ft.isTemp, deleteOrig);
         Console::printColor("\n========================================", Console::Color::GREEN);
         Console::printColor(TR("[OK] Watermark added successfully!", "[OK] Водяной знак успешно добавлен!"), Console::Color::GREEN);
         Console::printColor(TR("Output: ", "Выход: ") + outPath, Console::Color::GREEN);
@@ -866,8 +878,11 @@ void AddSubtitlesOperation::execute() {
         return;
     }
 
+    bool deleteOrig = false;
+    if (!Dialogs::promptDeleteOriginal(false, cfg.deleteOriginal, deleteOrig)) return;
+
     double duration = ctx.ffprobeService.getMediaDuration(videoFile);
-    string outPath = FfmpegCommandBuilder::buildOutputPath(videoFile, cfg.outputPath, cfg.overwriteFiles, cfg.outputFormat, (mode == 0 ? "_softsub" : "_hardsub"));
+    string outPath = FfmpegCommandBuilder::buildOutputPath(videoFile, cfg.outputPath, deleteOrig, cfg.outputFormat, (mode == 0 ? "_softsub" : "_hardsub"));
     auto ft = FfmpegCommandBuilder::prepareTarget(outPath, {videoFile});
 
     wstring cmd = L"\"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ctx.installer.getFfmpegPath())) + L"\"";
@@ -884,7 +899,7 @@ void AddSubtitlesOperation::execute() {
         cmd += L" -vf \"subtitles='" + StringUtil::utf8ToWstring(safeSub) + L"'\" -c:a copy";
     }
 
-    if (cfg.overwriteFiles) cmd += L" -y";
+    cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     Console::clearScreen();
@@ -899,6 +914,7 @@ void AddSubtitlesOperation::execute() {
     ok = FfmpegCommandBuilder::finalizeTarget(ft, ok, &ctx.coverService, cfg.saveCover);
 
     if (ok) {
+        Dialogs::handleOriginalDeletion(videoFile, outPath, ft.isTemp, deleteOrig);
         Console::printColor("\n========================================", Console::Color::GREEN);
         Console::printColor(TR("[OK] Subtitles processed successfully!", "[OK] Субтитры успешно обработаны!"), Console::Color::GREEN);
         Console::printColor(TR("Output: ", "Выход: ") + outPath, Console::Color::GREEN);
@@ -967,14 +983,14 @@ void ExtractAudioOperation::execute() {
     bool deleteOrig = false;
     if (!Dialogs::promptDeleteOriginal(false, cfg.deleteOriginal, deleteOrig)) return;
 
-    string outPath = FfmpegCommandBuilder::buildOutputPath(inputFile, cfg.outputPath, cfg.overwriteFiles, cfg.outputFormat, "_audio", ext);
+    string outPath = FfmpegCommandBuilder::buildOutputPath(inputFile, cfg.outputPath, deleteOrig, cfg.outputFormat, "_audio", ext);
     auto ft = FfmpegCommandBuilder::prepareTarget(outPath, {inputFile});
 
     wstring cmd = L"\"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ctx.installer.getFfmpegPath())) + L"\"";
     cmd += L" -i \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(inputFile)) + L"\"";
     if (!audioMapArg.empty()) cmd += StringUtil::utf8ToWstring(audioMapArg);
     cmd += L" -vn " + StringUtil::utf8ToWstring(codecArgs);
-    if (cfg.overwriteFiles) cmd += L" -y";
+    cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     Console::clearScreen();
@@ -1037,15 +1053,18 @@ void MergeVideoAudioOperation::execute() {
         return;
     }
 
+    bool deleteOrig = false;
+    if (!Dialogs::promptDeleteOriginal(false, cfg.deleteOriginal, deleteOrig)) return;
+
     double duration = ctx.ffprobeService.getMediaDuration(videoFile);
-    string outPath = FfmpegCommandBuilder::buildOutputPath(videoFile, cfg.outputPath, cfg.overwriteFiles, cfg.outputFormat, "_merged");
+    string outPath = FfmpegCommandBuilder::buildOutputPath(videoFile, cfg.outputPath, deleteOrig, cfg.outputFormat, "_merged");
     auto ft = FfmpegCommandBuilder::prepareTarget(outPath, {videoFile, audioFile});
 
     wstring cmd = L"\"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ctx.installer.getFfmpegPath())) + L"\"";
     cmd += L" -i \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(videoFile)) + L"\"";
     cmd += L" -i \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(audioFile)) + L"\"";
     cmd += L" -c:v copy -c:a " + StringUtil::utf8ToWstring(opAudioCodec.empty() ? "aac" : opAudioCodec) + L" -shortest";
-    if (cfg.overwriteFiles) cmd += L" -y";
+    cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     Console::clearScreen();
@@ -1060,6 +1079,7 @@ void MergeVideoAudioOperation::execute() {
     ok = FfmpegCommandBuilder::finalizeTarget(ft, ok, &ctx.coverService, cfg.saveCover);
 
     if (ok) {
+        Dialogs::handleOriginalDeletion(videoFile, outPath, ft.isTemp, deleteOrig);
         Console::printColor("\n========================================", Console::Color::GREEN);
         Console::printColor(TR("[OK] Merged successfully!", "[OK] Успешно объединено!"), Console::Color::GREEN);
         Console::printColor(TR("Output: ", "Выход: ") + outPath, Console::Color::GREEN);
@@ -1102,13 +1122,13 @@ void StripAudioOperation::execute() {
     bool deleteOrig = false;
     if (!Dialogs::promptDeleteOriginal(false, cfg.deleteOriginal, deleteOrig)) return;
 
-    string outPath = FfmpegCommandBuilder::buildOutputPath(inputFile, cfg.outputPath, cfg.overwriteFiles, cfg.outputFormat, "_muted");
+    string outPath = FfmpegCommandBuilder::buildOutputPath(inputFile, cfg.outputPath, deleteOrig, cfg.outputFormat, "_muted");
     auto ft = FfmpegCommandBuilder::prepareTarget(outPath, {inputFile});
 
     wstring cmd = L"\"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ctx.installer.getFfmpegPath())) + L"\"";
     cmd += L" -i \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(inputFile)) + L"\"";
     cmd += L" -c:v copy -an";
-    if (cfg.overwriteFiles) cmd += L" -y";
+    cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     Console::clearScreen();
@@ -1182,13 +1202,13 @@ void ConcatenateFilesOperation::execute() {
     }
     lf.close();
 
-    string outPath = FfmpegCommandBuilder::buildOutputPath(files[0], cfg.outputPath, cfg.overwriteFiles, cfg.outputFormat, "_joined");
+    string outPath = FfmpegCommandBuilder::buildOutputPath(files[0], cfg.outputPath, false, cfg.outputFormat, "_joined");
     auto ft = FfmpegCommandBuilder::prepareTarget(outPath, files);
 
     wstring cmd = L"\"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ctx.installer.getFfmpegPath())) + L"\"";
     cmd += L" -f concat -safe 0 -i \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(listPath)) + L"\"";
     cmd += L" -c copy";
-    if (cfg.overwriteFiles) cmd += L" -y";
+    cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     Console::clearScreen();
@@ -1267,7 +1287,7 @@ void CreateGifOperation::execute() {
     Console::inputLineWithEscape(width, "");
     if (width.empty()) width = "480";
 
-    string outPath = FfmpegCommandBuilder::buildOutputPath(inputFile, cfg.outputPath, cfg.overwriteFiles, cfg.outputFormat, "_anim", "gif");
+    string outPath = FfmpegCommandBuilder::buildOutputPath(inputFile, cfg.outputPath, false, cfg.outputFormat, "_anim", "gif");
     auto ft = FfmpegCommandBuilder::prepareTarget(outPath, {inputFile});
 
     wstring cmd = L"\"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ctx.installer.getFfmpegPath())) + L"\"";
@@ -1277,7 +1297,7 @@ void CreateGifOperation::execute() {
     cmd += L" -filter_complex \"[0:v]fps=" + StringUtil::utf8ToWstring(NumberFormat::sanitizeNumberArg(fps)) +
            L",scale=" + StringUtil::utf8ToWstring(NumberFormat::sanitizeNumberArg(width)) +
            L":-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse[out]\" -map \"[out]\"";
-    if (cfg.overwriteFiles) cmd += L" -y";
+    cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
     Console::clearScreen();
@@ -1361,7 +1381,7 @@ void ExtractFramesOperation::execute() {
         cmd += L" -i \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(inputFile)) + L"\"";
         if (!videoMapArg.empty()) cmd += StringUtil::utf8ToWstring(videoMapArg);
         cmd += L" -vframes 1 -q:v 2";
-        if (cfg.overwriteFiles) cmd += L" -y";
+        cmd += L" -y";
         cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(framesDir + "frame.png")) + L"\"";
     } else {
         cmd += L" -i \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(inputFile)) + L"\"";
@@ -1379,7 +1399,7 @@ void ExtractFramesOperation::execute() {
             if (!Console::inputLineWithEscape(nth, "")) return;
             cmd += L" -vf \"select=not(mod(n\\," + StringUtil::utf8ToWstring(nth) + L"))\" -vsync vfr -q:v 2";
         }
-        if (cfg.overwriteFiles) cmd += L" -y";
+        cmd += L" -y";
         cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(framesDir + "frame_%04d.png")) + L"\"";
     }
 

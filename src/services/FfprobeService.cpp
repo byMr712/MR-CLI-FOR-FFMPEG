@@ -316,7 +316,7 @@ domain::MediaProperties FfprobeService::parseMediaProperties(const std::string& 
 
     const domain::VideoTrack* mainVideo = nullptr;
     for (const auto& vt : mp.videoTracks) {
-        if (!vt.isAttachedPic) {
+        if (!vt.isCoverOrAttachedPic()) {
             mainVideo = &vt;
             break;
         }
@@ -385,10 +385,27 @@ std::string FfprobeService::formatMediaPropertiesDisplay(const domain::MediaProp
         res += (isRu ? "  Размер: " : "  Size: ") + mp.sizeStr + "\n";
     }
 
-    if (!mp.videoTracks.empty()) {
+    std::vector<const domain::VideoTrack*> realVideos;
+    std::vector<const domain::VideoTrack*> covers;
+    for (const auto& vt : mp.videoTracks) {
+        if (vt.isCoverOrAttachedPic()) {
+            covers.push_back(&vt);
+        } else {
+            realVideos.push_back(&vt);
+        }
+    }
+
+    if (!realVideos.empty()) {
         res += "\n" + std::string(isRu ? "  [Видеопотоки]" : "  [Video Streams]") + "\n";
-        for (size_t i = 0; i < mp.videoTracks.size(); ++i) {
-            res += "    " + std::string(isRu ? "Поток " : "Stream ") + std::to_string(i + 1) + ": " + mp.videoTracks[i].getDisplayString(lang) + "\n";
+        for (size_t i = 0; i < realVideos.size(); ++i) {
+            res += "    " + std::string(isRu ? "Поток " : "Stream ") + std::to_string(i + 1) + ": " + realVideos[i]->getDisplayString(lang) + "\n";
+        }
+    }
+
+    if (!covers.empty()) {
+        res += "\n" + std::string(isRu ? "  [Обложка]" : "  [Cover Art]") + "\n";
+        for (size_t i = 0; i < covers.size(); ++i) {
+            res += "    " + std::string(isRu ? "Встроенная обложка: " : "Embedded cover: ") + covers[i]->getDisplayString(lang) + "\n";
         }
     }
 

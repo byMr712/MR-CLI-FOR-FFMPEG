@@ -201,7 +201,6 @@ void SettingsOperation::execute() {
             "6. " + TR("CRF value: [", "Значение CRF: [") + cfg.crfValue + "]",
             "7. " + TR("Audio bitrate: [", "Битрейт аудио: [") + cfg.audioBitrate + " kbps]",
             "8. " + TR("Program acceleration: [", "Программное ускорение: [") + ctx.hardware.getAccelerationModeName(cfg.accelMode) + "]",
-            "9. " + TR("Add suffixes to files: [", "Добавлять суффиксы в конец файлов: [") + (!cfg.overwriteFiles ? TR("ON", "ВКЛ") : TR("OFF", "ВЫКЛ")) + "]",
             "m. " + TR("Keep metadata: [", "Сохранять метаданные: [") + (cfg.keepMetadata ? TR("ON", "ВКЛ") : TR("OFF", "ВЫКЛ")) + "]",
             "v. " + TR("Video codec prompt: [", "Запрос видеокодека: [") + (cfg.videoCodecAsk ? TR("Always Ask", "Всегда спрашивать") : TR("Always use configured settings", "Всегда как задано моими настройками")) + "]",
             "a. " + TR("Audio codec prompt: [", "Запрос аудиокодека: [") + FfmpegCommandBuilder::getAudioCodecSettingName(cfg.audioCodec) + "]",
@@ -211,7 +210,7 @@ void SettingsOperation::execute() {
             "p. " + TR("Allow double processing in batch mode: [", "Разрешить двойную обработку в пакетном режиме: [") + (cfg.parallelBatch ? TR("ON", "ВКЛ") : TR("OFF", "ВЫКЛ")) + "]",
             "u. " + TR("Update FFmpeg & components", "Обновить FFmpeg")
         };
-        vector<int> actions = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17};
+        vector<int> actions = {1,2,3,4,5,6,7,8,10,11,12,13,14,15,16,17};
 
         int sel = Menu::arrowSelect(TR("SETTINGS", "НАСТРОЙКИ"), "", opts, 0);
         if (sel < 0) return;
@@ -272,11 +271,6 @@ void SettingsOperation::execute() {
                 }
                 break;
             }
-            case 9: {
-                cfg.overwriteFiles = !cfg.overwriteFiles;
-                ctx.configService.saveConfig(cfg);
-                break;
-            }
             case 10: {
                 cfg.keepMetadata = !cfg.keepMetadata;
                 ctx.configService.saveConfig(cfg);
@@ -307,7 +301,18 @@ void SettingsOperation::execute() {
             }
             case 14: {
                 vector<string> dopts = {"ask", "always", "never"};
-                int dsel = Menu::arrowSelect(TR("DELETE ORIGINAL", "УДАЛЕНИЕ ОРИГИНАЛА"), "", dopts, 0);
+                vector<string> dhints = {
+                    TR("Ask every time before processing. If 'N', preserves original and adds suffix.",
+                       "Спрашивать перед обработкой. При 'N' сохраняет оригинал и добавляет суффикс."),
+                    TR("Always delete original and replace it with the processed file (no suffix).",
+                       "Всегда удалять оригинал и заменять его обработанным файлом (без суффикса)."),
+                    TR("Never delete original, always preserve it and add suffix to the new file.",
+                       "Никогда не удалять оригинал, всегда сохранять его и добавлять суффикс к новому файлу.")
+                };
+                int curD = 0;
+                if (cfg.deleteOriginal == "always" || cfg.deleteOriginal == "yes") curD = 1;
+                else if (cfg.deleteOriginal == "never" || cfg.deleteOriginal == "no") curD = 2;
+                int dsel = Menu::arrowSelect(TR("DELETE ORIGINAL", "УДАЛЕНИЕ ОРИГИНАЛА"), "", dopts, curD, dhints);
                 if (dsel >= 0) {
                     cfg.deleteOriginal = dopts[dsel];
                     ctx.configService.saveConfig(cfg);

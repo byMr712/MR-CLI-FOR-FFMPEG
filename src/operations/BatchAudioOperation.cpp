@@ -142,7 +142,7 @@ void BatchAudioOperation::execute() {
         Console::printColor("----------------------------------------", Console::Color::CYAN);
 
         double duration = ctx.ffprobeService.getMediaDuration(inPath);
-        string outPath = FfmpegCommandBuilder::buildOutputPath(inPath, cfg.outputPath, cfg.overwriteFiles, cfg.outputFormat, "_compressed", targetExt);
+        string outPath = FfmpegCommandBuilder::buildOutputPath(inPath, cfg.outputPath, deleteOrig, cfg.outputFormat, "_compressed", targetExt);
         auto ft = FfmpegCommandBuilder::prepareTarget(outPath, {inPath});
 
         string codecArgs = FfmpegCommandBuilder::getAudioCodecArgs(effCodec, cfg.audioBitrate, "");
@@ -152,7 +152,7 @@ void BatchAudioOperation::execute() {
         cmd += L" -i \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(inPath)) + L"\"";
         cmd += L" -vn " + StringUtil::utf8ToWstring(codecArgs);
         if (!cfg.keepMetadata) cmd += L" -map_metadata -1";
-        if (cfg.overwriteFiles) cmd += L" -y";
+        cmd += L" -y";
         cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
         bool escaped = false;

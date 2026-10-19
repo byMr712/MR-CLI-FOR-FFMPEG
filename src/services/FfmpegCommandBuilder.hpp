@@ -24,7 +24,7 @@ public:
     static std::string getOutputExtension(const std::string& outputFormat);
     static std::string buildOutputPath(const std::string& inputPath,
                                        const std::string& outputBaseDir,
-                                       bool overwriteFiles,
+                                       bool deleteOriginal,
                                        const std::string& outputFormat,
                                        const std::string& suffix = "",
                                        const std::string& forceExt = "");

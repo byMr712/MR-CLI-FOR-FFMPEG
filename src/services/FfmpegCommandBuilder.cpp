@@ -165,14 +165,14 @@ std::string FfmpegCommandBuilder::getOutputExtension(const std::string& outputFo
 
 std::string FfmpegCommandBuilder::buildOutputPath(const std::string& inputPath,
                                                  const std::string& outputBaseDir,
-                                                 bool overwriteFiles,
+                                                 bool deleteOriginal,
                                                  const std::string& outputFormat,
                                                  const std::string& suffix,
                                                  const std::string& forceExt) {
     fs::path inPath = fs::u8path(inputPath);
     std::string stem = inPath.stem().u8string();
     std::string ext = forceExt.empty() ? getOutputExtension(outputFormat) : forceExt;
-    std::string usedSuffix = (!overwriteFiles) ? suffix : "";
+    std::string usedSuffix = (!deleteOriginal) ? suffix : "";
     std::string outName = stem + usedSuffix + "." + ext;
 
     std::string dir = outputBaseDir;
@@ -181,7 +181,7 @@ std::string FfmpegCommandBuilder::buildOutputPath(const std::string& inputPath,
     }
     std::string outPath = dir + outName;
 
-    if (!overwriteFiles) {
+    if (!deleteOriginal) {
         std::error_code ec;
         auto absOut = fs::weakly_canonical(fs::absolute(fs::u8path(outPath), ec), ec);
         auto absIn = fs::weakly_canonical(fs::absolute(fs::u8path(inputPath), ec), ec);

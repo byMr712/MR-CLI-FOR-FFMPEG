@@ -182,7 +182,7 @@ void BatchVideoOperation::execute() {
             cmd += L" " + StringUtil::utf8ToWstring(FfmpegCommandBuilder::getAudioCodecArgs(batchAudioCodec.empty() ? cfg.audioCodec : batchAudioCodec, cfg.audioBitrate, cfg.outputFormat));
             if (!cfg.customFfmpegArgs.empty()) cmd += L" " + StringUtil::utf8ToWstring(cfg.customFfmpegArgs);
             if (!cfg.keepMetadata) cmd += L" -map_metadata -1";
-            if (cfg.overwriteFiles) cmd += L" -y";
+            cmd += L" -y";
             cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(writePath)) + L"\"";
             return cmd;
         };
@@ -201,7 +201,7 @@ void BatchVideoOperation::execute() {
             PairProcessingService::printVerdict(true, true, true);
 
             PipelineSlot slot1, slot2;
-            string outPath1 = FfmpegCommandBuilder::buildOutputPath(inPath, cfg.outputPath, cfg.overwriteFiles, cfg.outputFormat, "_compressed");
+            string outPath1 = FfmpegCommandBuilder::buildOutputPath(inPath, cfg.outputPath, deleteOrig, cfg.outputFormat, "_compressed");
             slot1.target = FfmpegCommandBuilder::prepareTarget(outPath1, {inPath});
             slot1.inPath = inPath;
             slot1.fileIdx = i;
@@ -211,7 +211,7 @@ void BatchVideoOperation::execute() {
 
             string path2 = files[i + 1];
             string name2 = fs::u8path(path2).filename().u8string();
-            string outPath2 = FfmpegCommandBuilder::buildOutputPath(path2, cfg.outputPath, cfg.overwriteFiles, cfg.outputFormat, "_compressed");
+            string outPath2 = FfmpegCommandBuilder::buildOutputPath(path2, cfg.outputPath, deleteOrig, cfg.outputFormat, "_compressed");
             slot2.target = FfmpegCommandBuilder::prepareTarget(outPath2, {path2});
             slot2.inPath = path2;
             slot2.fileIdx = i + 1;
@@ -265,7 +265,7 @@ void BatchVideoOperation::execute() {
                             string curPath = files[curIdx];
                             string curName = fs::u8path(curPath).filename().u8string();
                             double curDur = ctx.ffprobeService.getMediaDuration(curPath);
-                            string curOut = FfmpegCommandBuilder::buildOutputPath(curPath, cfg.outputPath, cfg.overwriteFiles, cfg.outputFormat, "_compressed");
+                            string curOut = FfmpegCommandBuilder::buildOutputPath(curPath, cfg.outputPath, deleteOrig, cfg.outputFormat, "_compressed");
                             slot1.target = FfmpegCommandBuilder::prepareTarget(curOut, {curPath});
                             slot1.inPath = curPath;
                             slot1.fileIdx = curIdx;
@@ -304,7 +304,7 @@ void BatchVideoOperation::execute() {
                             string curPath = files[curIdx];
                             string curName = fs::u8path(curPath).filename().u8string();
                             double curDur = ctx.ffprobeService.getMediaDuration(curPath);
-                            string curOut = FfmpegCommandBuilder::buildOutputPath(curPath, cfg.outputPath, cfg.overwriteFiles, cfg.outputFormat, "_compressed");
+                            string curOut = FfmpegCommandBuilder::buildOutputPath(curPath, cfg.outputPath, deleteOrig, cfg.outputFormat, "_compressed");
                             slot2.target = FfmpegCommandBuilder::prepareTarget(curOut, {curPath});
                             slot2.inPath = curPath;
                             slot2.fileIdx = curIdx;
@@ -426,7 +426,7 @@ void BatchVideoOperation::execute() {
 
         string currentFmt = chosenFmt.empty() ? cfg.outputFormat : chosenFmt;
         double duration = ctx.ffprobeService.getMediaDuration(inPath);
-        string outPath = FfmpegCommandBuilder::buildOutputPath(inPath, cfg.outputPath, cfg.overwriteFiles, currentFmt, "_compressed");
+        string outPath = FfmpegCommandBuilder::buildOutputPath(inPath, cfg.outputPath, deleteOrig, currentFmt, "_compressed");
         auto ft = FfmpegCommandBuilder::prepareTarget(outPath, {inPath});
 
         string videoMapArg;
@@ -489,17 +489,8 @@ void BatchVideoOperation::execute() {
         wstring cmd = L"\"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ctx.installer.getFfmpegPath())) + L"\"";
         cmd += L" -i \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(inPath)) + L"\"";
 
-        wstring coverAttachArgs;
-        string outExt = FfmpegCommandBuilder::getOutputExtension(currentFmt);
-        if (cfg.saveCover && !outExt.empty()) {
-            if (ctx.coverService.buildCoverAttachArgs(outExt, inPath, coverAttachArgs)) {
-                cmd += coverAttachArgs;
-                ft.coverEmbedded = true;
-            }
-        }
-
-        if (!videoMapArg.empty()) cmd += StringUtil::utf8ToWstring(videoMapArg);
-        if (!audioMapArg.empty()) cmd += StringUtil::utf8ToWstring(audioMapArg);
+        string streamMapArg = FfprobeService::buildStreamMapArgs(videoMapArg, audioMapArg);
+        if (!streamMapArg.empty()) cmd += StringUtil::utf8ToWstring(streamMapArg);
 
         string vf = FfmpegCommandBuilder::buildVideoFilterSpec(inPath, ctx.ffprobeService, cfg.outputResolution, useAutoAlign, useDownscale4K);
         if (!vf.empty()) cmd += L" " + StringUtil::utf8ToWstring(vf);
@@ -511,7 +502,7 @@ void BatchVideoOperation::execute() {
 
         if (!cfg.customFfmpegArgs.empty()) cmd += L" " + StringUtil::utf8ToWstring(cfg.customFfmpegArgs);
         if (!cfg.keepMetadata) cmd += L" -map_metadata -1";
-        if (cfg.overwriteFiles) cmd += L" -y";
+        cmd += L" -y";
         cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
         bool escaped = false;

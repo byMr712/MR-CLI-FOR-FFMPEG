@@ -54,6 +54,7 @@ public:
     static wint_t getWChar() noexcept;
     static bool inputLineWithEscape(std::string& result, const std::string& prompt = "");
     static bool isEscapePressed() noexcept;
+    static int getConsoleWidth() noexcept;
 };
 
 } // namespace core

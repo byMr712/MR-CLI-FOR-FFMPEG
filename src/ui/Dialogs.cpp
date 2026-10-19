@@ -24,24 +24,22 @@ bool Dialogs::selectVideoTrackForFile(const std::string& filePath,
     if (outApplyToAllBatch) *outApplyToAllBatch = false;
     if (outSelectedTrackIndex) *outSelectedTrackIndex = -1;
 
-    std::vector<domain::VideoTrack> tracks = probe.getVideoTracks(filePath);
-    if (tracks.empty()) return true;
+    std::vector<domain::VideoTrack> allTracks = probe.getVideoTracks(filePath);
+    if (allTracks.empty()) return true;
 
     std::vector<int> realIndices;
-    for (size_t i = 0; i < tracks.size(); ++i) {
-        if (!tracks[i].isCoverOrAttachedPic()) {
+    for (size_t i = 0; i < allTracks.size(); ++i) {
+        if (!allTracks[i].isCoverOrAttachedPic()) {
+            realIndices.push_back(static_cast<int>(i));
+        }
+    }
+    if (realIndices.empty()) {
+        for (size_t i = 0; i < allTracks.size(); ++i) {
             realIndices.push_back(static_cast<int>(i));
         }
     }
 
-    if (realIndices.size() <= 1 && tracks.size() > 1) {
-        int realIdx = realIndices.empty() ? 0 : realIndices[0];
-        mapArgs = " -map 0:v:" + std::to_string(tracks[realIdx].videoIndex);
-        if (outSelectedTrackIndex) *outSelectedTrackIndex = realIdx;
-        return true;
-    }
-
-    if (tracks.size() <= 1) {
+    if (realIndices.size() <= 1) {
         return true;
     }
 
@@ -49,7 +47,7 @@ bool Dialogs::selectVideoTrackForFile(const std::string& filePath,
     std::vector<std::string> opts;
     std::vector<std::string> hints;
 
-    int primaryIdx = realIndices.empty() ? 0 : realIndices[0];
+    int primaryIdx = realIndices[0];
     if (allowAllTracks) {
         opts.push_back(services::tr("Keep all video streams", "Сохранить все видеопотоки"));
         hints.push_back(services::tr("Preserves every video stream of this file.", "Сохраняет все видеопотоки этого файла."));
@@ -57,13 +55,14 @@ bool Dialogs::selectVideoTrackForFile(const std::string& filePath,
         opts.push_back(services::tr("Use primary video stream", "Использовать основной видеопоток"));
         hints.push_back(services::tr("Selects the first real video stream, ignoring cover art.", "Выбирает первый основной видеопоток, игнорируя обложку."));
     }
-    for (size_t i = 0; i < tracks.size(); ++i) {
-        opts.push_back(services::tr("Stream ", "Поток ") + std::to_string(i + 1) + ": " + tracks[i].getDisplayString(services::LocalizationService::instance().getLanguage()));
+    for (size_t i = 0; i < realIndices.size(); ++i) {
+        int idx = realIndices[i];
+        opts.push_back(services::tr("Stream ", "Поток ") + std::to_string(i + 1) + ": " + allTracks[idx].getDisplayString(services::LocalizationService::instance().getLanguage()));
         hints.push_back(services::tr("Select this video stream for processing.", "Выбрать этот видеопоток для обработки."));
     }
 
-    std::string desc = services::tr("This file contains multiple video streams (" + std::to_string(tracks.size()) + ").\n\"" + filePath + "\"\n\nSelect which video stream to process:",
-                                    "В этом файле обнаружено несколько видеопотоков (" + std::to_string(tracks.size()) + ").\n\"" + filePath + "\"\n\nВыберите, какой видеопоток обработать:");
+    std::string desc = services::tr("This file contains multiple video streams (" + std::to_string(realIndices.size()) + ").\n\"" + filePath + "\"\n\nSelect which video stream to process:",
+                                    "В этом файле обнаружено несколько видеопотоков (" + std::to_string(realIndices.size()) + ").\n\"" + filePath + "\"\n\nВыберите, какой видеопоток обработать:");
 
     int sel = Menu::arrowSelect(services::tr("VIDEO STREAM SELECTION", "ВЫБОР ВИДЕОПОТОКА"), desc, opts, 0, hints, true);
     if (sel < 0) {
@@ -101,13 +100,13 @@ bool Dialogs::selectVideoTrackForFile(const std::string& filePath,
             mapArgs = " -map 0:v?";
             if (outSelectedTrackIndex) *outSelectedTrackIndex = (isBatchMode && !applyToAll) ? -4 : -3;
         } else {
-            mapArgs = " -map 0:v:" + std::to_string(tracks[primaryIdx].videoIndex);
+            mapArgs = " -map 0:v:" + std::to_string(allTracks[primaryIdx].videoIndex);
             if (outSelectedTrackIndex) *outSelectedTrackIndex = applyToAll ? -1 : -2;
         }
     } else {
-        int trackIdx = sel - FIRST_STREAM_CHOICE;
-        mapArgs = " -map 0:v:" + std::to_string(tracks[trackIdx].videoIndex);
-        if (outSelectedTrackIndex) *outSelectedTrackIndex = trackIdx;
+        int chosenRealIdx = realIndices[sel - FIRST_STREAM_CHOICE];
+        mapArgs = " -map 0:v:" + std::to_string(allTracks[chosenRealIdx].videoIndex);
+        if (outSelectedTrackIndex) *outSelectedTrackIndex = chosenRealIdx;
     }
 
     return true;
@@ -610,11 +609,11 @@ bool Dialogs::promptAudioCodecSettings(const domain::AppConfig& cfg, std::string
 }
 
 bool Dialogs::promptDeleteOriginal(bool isBatch, const std::string& deleteOriginalSetting, bool& outDelete) {
-    if (deleteOriginalSetting == "yes") {
+    if (deleteOriginalSetting == "yes" || deleteOriginalSetting == "always") {
         outDelete = true;
         return true;
     }
-    if (deleteOriginalSetting == "no") {
+    if (deleteOriginalSetting == "no" || deleteOriginalSetting == "never") {
         outDelete = false;
         return true;
     }
