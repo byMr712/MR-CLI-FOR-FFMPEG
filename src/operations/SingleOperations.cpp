@@ -187,8 +187,7 @@ void ConvertVideoOperation::execute() {
     cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
-    Console::clearScreen();
-    Console::printColor("========================================", Console::Color::CYAN);
+    Console::printColor("\n========================================", Console::Color::CYAN);
     Console::printColor(TR(" CONVERTING...", " КОНВЕРТАЦИЯ..."), Console::Color::CYAN);
     Console::printColor(" \"" + inputFile + "\"", Console::Color::CYAN);
     Console::printColor("========================================", Console::Color::CYAN);
@@ -295,7 +294,7 @@ void TrimVideoOperation::execute() {
            "Перекодирует видео, гарантируя начало с указанного кадра.")
     };
 
-    int modeChoice = Menu::arrowSelect(TR("TRIM MODE", "РЕЖИМ ОБРЕЗКИ"), "", trimModes, 0, trimHints);
+    int modeChoice = Menu::arrowSelect(TR("TRIM MODE", "РЕЖИМ ОБРЕЗКИ"), "", trimModes, 0, trimHints, true);
     if (modeChoice < 0) return;
     bool isExactMode = (modeChoice == 1);
 
@@ -324,8 +323,7 @@ void TrimVideoOperation::execute() {
     cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
-    Console::clearScreen();
-    Console::printColor("========================================", Console::Color::CYAN);
+    Console::printColor("\n========================================", Console::Color::CYAN);
     Console::printColor(TR(" TRIMMING VIDEO...", " ОБРЕЗКА ВИДЕО..."), Console::Color::CYAN);
     Console::printColor(" \"" + inputFile + "\"", Console::Color::CYAN);
     Console::printColor("========================================", Console::Color::CYAN);
@@ -396,7 +394,7 @@ void ChangeResolutionOperation::execute() {
         "6. 360p (640x360)",
         "7. " + TR("Custom resolution...", "Своё разрешение...")
     };
-    int sel = Menu::arrowSelect(TR("SELECT RESOLUTION", "ВЫБЕРИТЕ РАЗРЕШЕНИЕ"), "", resOpts, 2);
+    int sel = Menu::arrowSelect(TR("SELECT RESOLUTION", "ВЫБЕРИТЕ РАЗРЕШЕНИЕ"), "", resOpts, 2, {}, true);
     if (sel < 0) return;
 
     string targetScale;
@@ -429,8 +427,7 @@ void ChangeResolutionOperation::execute() {
     cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
-    Console::clearScreen();
-    Console::printColor("========================================", Console::Color::CYAN);
+    Console::printColor("\n========================================", Console::Color::CYAN);
     Console::printColor(TR(" RESCALING VIDEO...", " ИЗМЕНЕНИЕ РАЗРЕШЕНИЯ..."), Console::Color::CYAN);
     Console::printColor(" \"" + inputFile + "\"", Console::Color::CYAN);
     Console::printColor("========================================", Console::Color::CYAN);
@@ -489,7 +486,7 @@ void ChangeSpeedOperation::execute() {
         "5. 2.0x (" + TR("Fast motion", "Ускорение") + ")",
         "6. " + TR("Custom speed...", "Своя скорость...")
     };
-    int sel = Menu::arrowSelect(TR("SELECT SPEED MULTIPLIER", "ВЫБЕРИТЕ КОЭФФИЦИЕНТ СКОРОСТИ"), "", speedOpts, 2);
+    int sel = Menu::arrowSelect(TR("SELECT SPEED MULTIPLIER", "ВЫБЕРИТЕ КОЭФФИЦИЕНТ СКОРОСТИ"), "", speedOpts, 2, {}, true);
     if (sel < 0) return;
 
     double speed = 1.0;
@@ -544,8 +541,7 @@ void ChangeSpeedOperation::execute() {
     cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
-    Console::clearScreen();
-    Console::printColor("========================================", Console::Color::CYAN);
+    Console::printColor("\n========================================", Console::Color::CYAN);
     Console::printColor(TR(" CHANGING SPEED...", " ИЗМЕНЕНИЕ СКОРОСТИ..."), Console::Color::CYAN);
     Console::printColor(" \"" + inputFile + "\"", Console::Color::CYAN);
     Console::printColor("========================================", Console::Color::CYAN);
@@ -604,7 +600,7 @@ void RotateVideoOperation::execute() {
         "4. " + TR("Flip horizontally", "Отразить по горизонтали"),
         "5. " + TR("Flip vertically", "Отразить по вертикали")
     };
-    int sel = Menu::arrowSelect(TR("SELECT ROTATION", "ВЫБЕРИТЕ ОПЕРАЦИЮ"), "", rotOpts, 0);
+    int sel = Menu::arrowSelect(TR("SELECT ROTATION", "ВЫБЕРИТЕ ОПЕРАЦИЮ"), "", rotOpts, 0, {}, true);
     if (sel < 0) return;
 
     string filter;
@@ -628,8 +624,7 @@ void RotateVideoOperation::execute() {
     cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
-    Console::clearScreen();
-    Console::printColor("========================================", Console::Color::CYAN);
+    Console::printColor("\n========================================", Console::Color::CYAN);
     Console::printColor(TR(" ROTATING VIDEO...", " ПОВОРОТ ВИДЕО..."), Console::Color::CYAN);
     Console::printColor(" \"" + inputFile + "\"", Console::Color::CYAN);
     Console::printColor("========================================", Console::Color::CYAN);
@@ -686,7 +681,7 @@ void CompressVideoOperation::execute() {
         "3. " + TR("Balanced compression (CRF 24, Medium preset)", "Сбалансированное (CRF 24, Medium)"),
         "4. " + TR("Light compression (CRF 20, Fast preset)", "Лёгкое сжатие (CRF 20, Fast)")
     };
-    int sel = Menu::arrowSelect(TR("SELECT COMPRESSION METHOD", "ВЫБЕРИТЕ МЕТОД СЖАТИЯ"), "", compOpts, 2);
+    int sel = Menu::arrowSelect(TR("SELECT COMPRESSION METHOD", "ВЫБЕРИТЕ МЕТОД СЖАТИЯ"), "", compOpts, 2, {}, true);
     if (sel < 0) return;
 
     bool deleteOrig = false;
@@ -726,8 +721,7 @@ void CompressVideoOperation::execute() {
     cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
-    Console::clearScreen();
-    Console::printColor("========================================", Console::Color::CYAN);
+    Console::printColor("\n========================================", Console::Color::CYAN);
     Console::printColor(TR(" COMPRESSING VIDEO...", " СЖАТИЕ ВИДЕО..."), Console::Color::CYAN);
     Console::printColor(" \"" + inputFile + "\"", Console::Color::CYAN);
     Console::printColor("========================================", Console::Color::CYAN);
@@ -792,7 +786,7 @@ void AddWatermarkOperation::execute() {
         "4. " + TR("Bottom Right", "Снизу справа"),
         "5. " + TR("Center", "По центру")
     };
-    int sel = Menu::arrowSelect(TR("WATERMARK POSITION", "ПОЛОЖЕНИЕ ВОДЯНОГО ЗНАКА"), "", posOpts, 3);
+    int sel = Menu::arrowSelect(TR("WATERMARK POSITION", "ПОЛОЖЕНИЕ ВОДЯНОГО ЗНАКА"), "", posOpts, 3, {}, true);
     if (sel < 0) return;
 
     string overlayPos;
@@ -818,8 +812,7 @@ void AddWatermarkOperation::execute() {
     cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
-    Console::clearScreen();
-    Console::printColor("========================================", Console::Color::CYAN);
+    Console::printColor("\n========================================", Console::Color::CYAN);
     Console::printColor(TR(" ADDING WATERMARK...", " НАЛОЖЕНИЕ ВОДЯНОГО ЗНАКА..."), Console::Color::CYAN);
     Console::printColor(" \"" + videoFile + "\"", Console::Color::CYAN);
     Console::printColor("========================================", Console::Color::CYAN);
@@ -854,14 +847,18 @@ void AddSubtitlesOperation::execute() {
     auto& ctx = AppContext::instance();
     auto& cfg = ctx.config();
 
+    Console::clearScreen();
+    Console::printColor("========================================", Console::Color::CYAN);
+    Console::printColor(TR(" ADD SUBTITLES", " ДОБАВЛЕНИЕ СУБТИТРОВ"), Console::Color::CYAN);
+    Console::printColor("========================================", Console::Color::CYAN);
+
     vector<string> opts = {
         "1. " + TR("Add subtitles to video (Softsub track)", "Добавить субтитры к видео (Отключаемая дорожка)"),
         "2. " + TR("Burn subtitles into video (Hardsub)", "Вшить субтитры в видео (Хардсаб / Наложение)")
     };
-    int mode = Menu::arrowSelect(TR("SUBTITLE MODE", "РЕЖИМ СУБТИТРОВ"), "", opts, 0);
+    int mode = Menu::arrowSelect(TR("SUBTITLE MODE", "РЕЖИМ СУБТИТРОВ"), "", opts, 0, {}, true);
     if (mode < 0) return;
 
-    Console::clearScreen();
     cout << "\n" << TR("Select VIDEO file...", "Выберите ВИДЕОФАЙЛ...") << "\n";
     string videoFile = ShellDialogs::openFileDialogMedia(cfg.currentLang == Language::RU ? L"Выберите видеофайл" : L"Select video file");
     if (videoFile.empty()) {
@@ -902,8 +899,7 @@ void AddSubtitlesOperation::execute() {
     cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
-    Console::clearScreen();
-    Console::printColor("========================================", Console::Color::CYAN);
+    Console::printColor("\n========================================", Console::Color::CYAN);
     Console::printColor(TR(" PROCESSING SUBTITLES...", " ОБРАБОТКА СУБТИТРОВ..."), Console::Color::CYAN);
     Console::printColor(" \"" + videoFile + "\"", Console::Color::CYAN);
     Console::printColor("========================================", Console::Color::CYAN);
@@ -968,7 +964,7 @@ void ExtractAudioOperation::execute() {
         "4. FLAC",
         "5. OGG (Vorbis)"
     };
-    int sel = Menu::arrowSelect(TR("SELECT AUDIO FORMAT", "ВЫБЕРИТЕ ФОРМАТ АУДИО"), "", audioFmtOpts, 0);
+    int sel = Menu::arrowSelect(TR("SELECT AUDIO FORMAT", "ВЫБЕРИТЕ ФОРМАТ АУДИО"), "", audioFmtOpts, 0, {}, true);
     if (sel < 0) return;
 
     string ext, codecArgs;
@@ -993,8 +989,7 @@ void ExtractAudioOperation::execute() {
     cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
-    Console::clearScreen();
-    Console::printColor("========================================", Console::Color::CYAN);
+    Console::printColor("\n========================================", Console::Color::CYAN);
     Console::printColor(TR(" EXTRACTING AUDIO...", " ИЗВЛЕЧЕНИЕ АУДИО..."), Console::Color::CYAN);
     Console::printColor(" \"" + inputFile + "\"", Console::Color::CYAN);
     Console::printColor("========================================", Console::Color::CYAN);
@@ -1067,8 +1062,7 @@ void MergeVideoAudioOperation::execute() {
     cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
-    Console::clearScreen();
-    Console::printColor("========================================", Console::Color::CYAN);
+    Console::printColor("\n========================================", Console::Color::CYAN);
     Console::printColor(TR(" MERGING VIDEO + AUDIO...", " ОБЪЕДИНЕНИЕ ВИДЕО И АУДИО..."), Console::Color::CYAN);
     Console::printColor(" \"" + videoFile + "\" + \"" + audioFile + "\"", Console::Color::CYAN);
     Console::printColor("========================================", Console::Color::CYAN);
@@ -1131,8 +1125,7 @@ void StripAudioOperation::execute() {
     cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
-    Console::clearScreen();
-    Console::printColor("========================================", Console::Color::CYAN);
+    Console::printColor("\n========================================", Console::Color::CYAN);
     Console::printColor(TR(" STRIPPING AUDIO...", " УДАЛЕНИЕ ЗВУКА..."), Console::Color::CYAN);
     Console::printColor(" \"" + inputFile + "\"", Console::Color::CYAN);
     Console::printColor("========================================", Console::Color::CYAN);
@@ -1211,8 +1204,7 @@ void ConcatenateFilesOperation::execute() {
     cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
-    Console::clearScreen();
-    Console::printColor("========================================", Console::Color::CYAN);
+    Console::printColor("\n========================================", Console::Color::CYAN);
     Console::printColor(TR(" JOINING FILES...", " СКЛЕИВАНИЕ ФАЙЛОВ..."), Console::Color::CYAN);
     Console::printColor("========================================", Console::Color::CYAN);
     cout << endl;
@@ -1300,8 +1292,7 @@ void CreateGifOperation::execute() {
     cmd += L" -y";
     cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(ft.writePath)) + L"\"";
 
-    Console::clearScreen();
-    Console::printColor("========================================", Console::Color::CYAN);
+    Console::printColor("\n========================================", Console::Color::CYAN);
     Console::printColor(TR(" CREATING GIF...", " СОЗДАНИЕ GIF..."), Console::Color::CYAN);
     Console::printColor(" \"" + inputFile + "\"", Console::Color::CYAN);
     Console::printColor("========================================", Console::Color::CYAN);
@@ -1365,7 +1356,7 @@ void ExtractFramesOperation::execute() {
         "3. " + TR("One frame per N seconds", "Один кадр каждые N секунд"),
         "4. " + TR("Every Nth frame", "Каждый N-й кадр")
     };
-    int sel = Menu::arrowSelect(TR("EXTRACTION MODE", "РЕЖИМ ИЗВЛЕЧЕНИЯ"), "", modeOpts, 0);
+    int sel = Menu::arrowSelect(TR("EXTRACTION MODE", "РЕЖИМ ИЗВЛЕЧЕНИЯ"), "", modeOpts, 0, {}, true);
     if (sel < 0) return;
 
     fs::path inPath = fs::u8path(inputFile);
@@ -1403,8 +1394,7 @@ void ExtractFramesOperation::execute() {
         cmd += L" \"" + StringUtil::utf8ToWstring(PathProvider::getSafeFFmpegPath(framesDir + "frame_%04d.png")) + L"\"";
     }
 
-    Console::clearScreen();
-    Console::printColor("========================================", Console::Color::CYAN);
+    Console::printColor("\n========================================", Console::Color::CYAN);
     Console::printColor(TR(" EXTRACTING FRAMES...", " ИЗВЛЕЧЕНИЕ КАДРОВ..."), Console::Color::CYAN);
     Console::printColor(" \"" + inputFile + "\"", Console::Color::CYAN);
     Console::printColor("========================================", Console::Color::CYAN);
@@ -1450,8 +1440,7 @@ void ShowFileInfoOperation::execute() {
         return;
     }
 
-    Console::clearScreen();
-    Console::printColor("========================================", Console::Color::CYAN);
+    Console::printColor("\n========================================", Console::Color::CYAN);
     Console::printColor(TR(" MEDIA FILE INFORMATION", " ИНФОРМАЦИЯ О МЕДИАФАЙЛЕ"), Console::Color::CYAN);
     Console::printColor(" \"" + inputFile + "\"", Console::Color::CYAN);
     Console::printColor("========================================", Console::Color::CYAN);
@@ -1505,8 +1494,7 @@ void CompareFilesOperation::execute() {
     MediaProperties mp1 = ctx.ffprobeService.parseMediaProperties(file1);
     MediaProperties mp2 = ctx.ffprobeService.parseMediaProperties(file2);
 
-    Console::clearScreen();
-    Console::printColor("========================================", Console::Color::CYAN);
+    Console::printColor("\n========================================", Console::Color::CYAN);
     Console::printColor(TR(" COMPARISON TABLE", " ТАБЛИЦА СРАВНЕНИЯ"), Console::Color::CYAN);
     Console::printColor(" 1: \"" + file1 + "\"", Console::Color::CYAN);
     Console::printColor(" 2: \"" + file2 + "\"", Console::Color::CYAN);

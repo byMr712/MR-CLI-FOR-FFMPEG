@@ -592,7 +592,7 @@ std::string Dialogs::selectAudioCodecForOperation() {
 
     int sel = Menu::arrowSelect(services::tr("SELECT AUDIO CODEC", "ВЫБОР АУДИОКОДЕКА"),
                                 services::tr("Choose audio codec for this operation:", "Выберите аудиокодек для этой операции:"),
-                                options, 0, hints);
+                                options, 0, hints, true);
     if (sel < 0) return "";
     return keys[sel];
 }
